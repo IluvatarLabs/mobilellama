@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Arbitrary user-selected LAN hosts cannot be enumerated statically. -->
+    <!-- Application code must gate every HTTP endpoint on explicit acknowledgement. -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
