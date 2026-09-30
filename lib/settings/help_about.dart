@@ -6,7 +6,8 @@ import '../ui/design.dart';
 
 /// Release configuration input: the owner's privacy policy URL. The Privacy
 /// policy row stays hidden while this is empty.
-const kPrivacyPolicyUrl = '';
+const kPrivacyPolicyUrl =
+    'https://github.com/IluvatarLabs/mobilellama/blob/main/PRIVACY.md';
 
 const kIssuesUrl = 'https://github.com/IluvatarLabs/mobilellama/issues';
 
