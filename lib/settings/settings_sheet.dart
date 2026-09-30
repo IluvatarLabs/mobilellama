@@ -6,10 +6,11 @@ import '../chat/model_management_page.dart';
 import '../chat/presets_page.dart';
 import '../data/settings_store.dart';
 import '../domain/generation_options.dart';
+import '../ui/design.dart';
+import 'connection_form.dart';
 
-const _settingsFieldBorder = OutlineInputBorder(
-  borderRadius: BorderRadius.all(Radius.circular(10)),
-);
+export 'connection_form.dart' show showConnectionForm, confirmServerDestination;
+
 const _settingsControlShape = RoundedRectangleBorder(
   borderRadius: BorderRadius.all(Radius.circular(10)),
 );
@@ -32,10 +33,7 @@ class SettingsSheet extends StatefulWidget {
 
 class _SettingsSheetState extends State<SettingsSheet> {
   final _conversationFormKey = GlobalKey<FormState>();
-  final TextEditingController _profileNameController = TextEditingController();
-  final TextEditingController _serverController = TextEditingController();
   final TextEditingController _promptController = TextEditingController();
-  final TextEditingController _serverKeyController = TextEditingController();
   final TextEditingController _webKeyController = TextEditingController();
   final TextEditingController _temperatureController = TextEditingController();
   final TextEditingController _seedController = TextEditingController();
@@ -53,33 +51,23 @@ class _SettingsSheetState extends State<SettingsSheet> {
   final TextEditingController _mirostatEtaController = TextEditingController();
   final TextEditingController _mirostatTauController = TextEditingController();
 
-  ServerProtocol _protocol = ServerProtocol.ollama;
-  String? _editingProfileId;
+  String? _selectedProfileId;
   String? _loadedConversationId;
-  String? _acknowledgedOrigin;
   bool _saving = false;
   bool _advancedExpanded = false;
-  bool _profileEditorOpen = false;
 
   @override
   void initState() {
     super.initState();
-    _loadProfile(widget.controller.conversationProfile);
+    _selectedProfileId = widget.controller.conversationProfile.id;
     _loadConversation();
     widget.controller.addListener(_handleControllerChanged);
   }
 
-  bool get _isHttp =>
-      Uri.tryParse(_serverController.text.trim())?.scheme == 'http';
-  bool get _httpHostAllowed =>
-      !_isHttp || insecureHttpHostAllowed(_serverController.text);
-  String? get _currentOrigin => normalizedServerOrigin(_serverController.text);
-  bool get _acknowledged => _isHttp && _currentOrigin == _acknowledgedOrigin;
-  bool get _isCreatingProfile => _editingProfileId == null;
   ServerProfile? _selectedProfile(ChatController controller) {
-    final id = _editingProfileId;
-    if (id == null) return null;
-    return controller.profiles.where((profile) => profile.id == id).firstOrNull;
+    final configured = controller.profiles.where((p) => p.configured);
+    return configured.where((p) => p.id == _selectedProfileId).firstOrNull ??
+        configured.firstOrNull;
   }
 
   bool get _serverBusy =>
@@ -113,43 +101,6 @@ class _SettingsSheetState extends State<SettingsSheet> {
     }
   }
 
-  void _loadProfile(ServerProfile profile) {
-    _editingProfileId = profile.id;
-    _profileNameController.text = profile.name;
-    _serverController.text = profile.baseUrl;
-    _serverKeyController.clear();
-    _protocol = profile.protocol;
-    _acknowledgedOrigin = profile.acknowledgedInsecureOrigin;
-    _profileEditorOpen = false;
-  }
-
-  void _startNewProfile() {
-    setState(() {
-      _editingProfileId = null;
-      _profileNameController.clear();
-      _serverController.text = SettingsStore.defaultBaseUrl;
-      _serverKeyController.clear();
-      _protocol = ServerProtocol.ollama;
-      _acknowledgedOrigin = null;
-      _profileEditorOpen = true;
-    });
-  }
-
-  void _editProfile() {
-    if (_serverBusy || _isCreatingProfile) return;
-    setState(() => _profileEditorOpen = true);
-  }
-
-  void _cancelProfileEdit() {
-    final selectedId = _editingProfileId;
-    final profile = selectedId == null
-        ? widget.controller.activeProfile
-        : widget.controller.profiles.firstWhere(
-            (candidate) => candidate.id == selectedId,
-          );
-    setState(() => _loadProfile(profile));
-  }
-
   void _loadConversation() {
     final conversation = widget.controller.conversation;
     _loadedConversationId = conversation?.id;
@@ -180,10 +131,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
   @override
   void dispose() {
     widget.controller.removeListener(_handleControllerChanged);
-    _profileNameController.dispose();
-    _serverController.dispose();
     _promptController.dispose();
-    _serverKeyController.dispose();
     _webKeyController.dispose();
     _temperatureController.dispose();
     _seedController.dispose();
@@ -206,7 +154,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
     return Scaffold(
       appBar: AppBar(
         title: Text(switch (widget.section) {
-          SettingsSection.servers => 'Servers',
+          SettingsSection.servers => 'Connections',
           SettingsSection.defaults => 'Chat defaults',
           SettingsSection.conversation => 'Chat settings',
           SettingsSection.webAgent => 'Web search',
@@ -249,15 +197,12 @@ class _SettingsSheetState extends State<SettingsSheet> {
                 },
                 if (widget.section == SettingsSection.servers &&
                     selectedProfile != null) ...[
-                  if (!_profileEditorOpen) ...[
-                    const SizedBox(height: 24),
-                    _buildServerDefaults(controller, selectedProfile),
-                  ],
+                  const SizedBox(height: 24),
+                  _buildServerDefaults(controller, selectedProfile),
                 ],
                 if (widget.section == SettingsSection.servers &&
                     selectedProfile?.protocol ==
-                        ServerProtocol.openAiCompatible &&
-                    !_profileEditorOpen) ...[
+                        ServerProtocol.openAiCompatible) ...[
                   const SizedBox(height: 24),
                   _SettingsSection(
                     title: 'Capabilities for ${selectedProfile!.name}',
@@ -321,8 +266,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
                   ),
                 ],
                 if (widget.section == SettingsSection.servers &&
-                    selectedProfile?.protocol == ServerProtocol.ollama &&
-                    !_profileEditorOpen) ...[
+                    selectedProfile?.protocol == ServerProtocol.ollama) ...[
                   const SizedBox(height: 24),
                   _buildModelManagement(controller, selectedProfile!),
                 ],
@@ -336,18 +280,18 @@ class _SettingsSheetState extends State<SettingsSheet> {
 
   Widget _buildWebAgentSettings(ChatController controller, ColorScheme colors) {
     return _SettingsSection(
-      title: 'Web search service',
+      title: 'Web search',
       child: _SettingsSurface(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
             Text(
-              'The API key and Web Agent preference apply across chats. Web Agent runs only when a chat\'s selected model supports tools.',
+              'Web search lets a model that supports tools look things up online. It uses Ollama cloud services (ollama.com) and needs an Ollama cloud API key. The key and this preference apply across chats.',
               style: Theme.of(context).textTheme.bodySmall,
             ),
             const SizedBox(height: 12),
             _SettingsField(
-              label: 'Ollama API key',
+              label: 'Ollama cloud API key',
               child: TextField(
                 controller: _webKeyController,
                 enabled: !_serverBusy,
@@ -391,7 +335,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
               contentPadding: EdgeInsets.zero,
               value: controller.webAgentEnabled,
               onChanged: _serverBusy ? null : _setWebAgent,
-              title: const Text('Enable Web Agent'),
+              title: const Text('Use web search'),
               subtitle: !controller.supportsTools
                   ? Text(
                       controller.selectedModel == null
@@ -506,286 +450,139 @@ class _SettingsSheetState extends State<SettingsSheet> {
     ThemeData theme,
     ColorScheme colors,
   ) {
-    final savedKeyApplies = _savedKeyApplies(controller);
-    final selectedId = _isCreatingProfile
-        ? null
-        : (_editingProfileId ?? controller.activeProfileId);
-    final selectedIsConnected =
-        selectedId != null && selectedId == controller.activeProfileId;
-    final connected = selectedIsConnected && controller.isConnected;
-    final selectedForChat =
-        selectedId != null &&
-        controller.conversation?.serverProfileId == selectedId;
-    final activeColor = theme.brightness == Brightness.dark
-        ? const Color(0xFF66BB6A)
-        : const Color(0xFF248A3D);
-    final statusColor = _isCreatingProfile
-        ? colors.outlineVariant
-        : connected
-        ? activeColor
-        : selectedForChat && !controller.conversationConnected
-        ? colors.error
-        : colors.outlineVariant;
-    final statusText = _isCreatingProfile
-        ? 'Unsaved'
-        : connected
-        ? selectedForChat
-              ? 'Connected for this chat · ${controller.serverDescription}'
-              : 'Connected for new chats · ${controller.serverDescription}'
-        : selectedForChat
-        ? (controller.errorMessage ?? 'This chat uses this server · Offline')
-        : 'Saved server';
-
+    if (!controller.isConfigured) {
+      return _SettingsSection(
+        title: 'Connections',
+        child: _SettingsSurface(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              const Text(
+                'No server is set up yet. Models run on your own Ollama or '
+                'OpenAI-compatible server.',
+              ),
+              const SizedBox(height: Design.space3),
+              FilledButton(
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size.fromHeight(48),
+                ),
+                onPressed: _serverBusy ? null : _openConnectionForm,
+                child: const Text('Connect a server'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    final profiles = controller.profiles.where((p) => p.configured).toList();
+    final selected = _selectedProfile(controller)!;
+    final status = controller.connectionStatusFor(selected.id);
+    final failure = controller.connectionFailureFor(selected.id);
+    final usage = [
+      if (controller.conversation?.serverProfileId == selected.id)
+        'This chat uses this server'
+      else if (selected.id == controller.activeProfileId)
+        'Used for new chats',
+    ];
     return _SettingsSection(
-      title: 'Server profiles',
-      trailing: _profileEditorOpen
-          ? null
-          : TextButton.icon(
-              onPressed: _serverBusy ? null : _startNewProfile,
-              icon: const Icon(Icons.add, size: 20),
-              label: const Text('New'),
-            ),
-      child: _SettingsSurface(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            DropdownButtonHideUnderline(
-              child: DropdownButton<String>(
-                value: selectedId,
-                hint: Text(
-                  'New profile',
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.titleSmall,
-                ),
-                isExpanded: true,
-                borderRadius: BorderRadius.circular(10),
-                items: <DropdownMenuItem<String>>[
-                  for (final profile in controller.profiles)
-                    DropdownMenuItem<String>(
-                      value: profile.id,
-                      child: Text(
-                        profile.name,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.titleSmall,
+      title: 'Connections',
+      trailing: TextButton.icon(
+        onPressed: _serverBusy ? null : _openConnectionForm,
+        icon: const Icon(Icons.add, size: 20),
+        label: const Text('New connection'),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Material(
+            color: colors.surfaceContainerLow,
+            borderRadius: BorderRadius.circular(12),
+            clipBehavior: Clip.antiAlias,
+            child: Column(
+              children: <Widget>[
+                for (var i = 0; i < profiles.length; i++) ...<Widget>[
+                  if (i > 0) Divider(height: 1, color: colors.outlineVariant),
+                  ListTile(
+                    minTileHeight: 56,
+                    selected: profiles[i].id == selected.id,
+                    title: Text(
+                      profiles[i].name,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Text(
+                      profiles[i].baseUrl,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    trailing: Text(
+                      controller.connectionStatusFor(profiles[i].id).label,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: colors.onSurfaceVariant,
                       ),
                     ),
+                    onTap: () =>
+                        setState(() => _selectedProfileId = profiles[i].id),
+                  ),
                 ],
-                onChanged: _serverBusy || _profileEditorOpen
-                    ? null
-                    : (id) {
-                        if (id == null || id == _editingProfileId) return;
-                        final profile = controller.profiles.firstWhere(
-                          (candidate) => candidate.id == id,
-                        );
-                        setState(() => _loadProfile(profile));
-                      },
-              ),
+              ],
             ),
-            const SizedBox(height: 8),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
+          ),
+          const SizedBox(height: Design.space3),
+          _SettingsSurface(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
-                Padding(
-                  padding: const EdgeInsets.only(top: 5),
-                  child: Container(
-                    width: 9,
-                    height: 9,
-                    decoration: BoxDecoration(
-                      color: statusColor,
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    statusText,
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: colors.onSurfaceVariant,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: <Widget>[
-                if (!_profileEditorOpen)
-                  TextButton.icon(
-                    onPressed: _serverBusy ? null : _editProfile,
-                    icon: const Icon(Icons.edit_outlined, size: 18),
-                    label: const Text('Edit profile'),
-                  ),
-                if (!_profileEditorOpen && !_isCreatingProfile)
-                  FilledButton.tonal(
-                    onPressed: _serverBusy
-                        ? null
-                        : () => _startChatOnProfile(selectedId!),
-                    child: Text(
-                      'New chat on ${_profileNameController.text.trim()}',
-                    ),
-                  ),
-              ],
-            ),
-            if (_profileEditorOpen) ...<Widget>[
-              const SizedBox(height: 16),
-              Divider(color: colors.outlineVariant),
-              const SizedBox(height: 8),
-              Row(
-                children: <Widget>[
-                  if (!_isCreatingProfile)
-                    Expanded(
-                      child: Text(
-                        'Edit profile',
-                        style: theme.textTheme.titleSmall?.copyWith(
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    )
-                  else
-                    const Spacer(),
-                  TextButton(
-                    onPressed: _serverBusy ? null : _cancelProfileEdit,
-                    child: const Text('Cancel'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: _profileNameController,
-                enabled: !_serverBusy,
-                textCapitalization: TextCapitalization.words,
-                decoration: InputDecoration(
-                  labelText: 'Name',
-                  hintText: 'Home',
-                  border: _settingsFieldBorder,
-                ),
-              ),
-              const SizedBox(height: 16),
-              DropdownButtonFormField<ServerProtocol>(
-                key: ValueKey<String>(
-                  'protocol-${_editingProfileId ?? 'new'}-${_protocol.name}',
-                ),
-                initialValue: _protocol,
-                decoration: InputDecoration(
-                  labelText: 'Protocol',
-                  border: _settingsFieldBorder,
-                ),
-                style: theme.textTheme.bodyLarge?.copyWith(
-                  fontWeight: FontWeight.w500,
-                ),
-                items: const <DropdownMenuItem<ServerProtocol>>[
-                  DropdownMenuItem(
-                    value: ServerProtocol.ollama,
-                    child: Text('Ollama'),
-                  ),
-                  DropdownMenuItem(
-                    value: ServerProtocol.openAiCompatible,
-                    child: Text('OpenAI-compatible'),
-                  ),
-                ],
-                onChanged: _serverBusy
-                    ? null
-                    : (value) {
-                        if (value != null) setState(() => _protocol = value);
-                      },
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: _serverController,
-                enabled: !_serverBusy,
-                keyboardType: TextInputType.url,
-                autocorrect: false,
-                enableSuggestions: false,
-                onChanged: (_) => setState(() {}),
-                decoration: InputDecoration(
-                  labelText: 'Server URL',
-                  hintText: _protocol == ServerProtocol.ollama
-                      ? 'http://192.168.1.20:11434'
-                      : 'https://example.com/v1',
-                  border: _settingsFieldBorder,
-                ),
-              ),
-              if (_protocol == ServerProtocol.openAiCompatible) ...<Widget>[
-                const SizedBox(height: 16),
-                TextField(
-                  controller: _serverKeyController,
-                  enabled: !_serverBusy,
-                  obscureText: true,
-                  autocorrect: false,
-                  enableSuggestions: false,
-                  decoration: InputDecoration(
-                    labelText: 'API key (optional)',
-                    hintText: savedKeyApplies ? '••••••••' : null,
-                    floatingLabelBehavior: savedKeyApplies
-                        ? FloatingLabelBehavior.always
-                        : FloatingLabelBehavior.auto,
-                    border: _settingsFieldBorder,
-                  ),
-                ),
-              ],
-              if (_isHttp && !_httpHostAllowed) ...<Widget>[
-                const SizedBox(height: 12),
                 Text(
-                  'Public or ambiguous HTTP hosts are blocked. Use HTTPS, localhost, a .local hostname, or a private IP address.',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: colors.error,
-                  ),
+                  [status.label, ...usage].join(' · '),
+                  style: theme.textTheme.bodyMedium,
                 ),
-              ] else if (_isHttp)
-                CheckboxListTile(
-                  contentPadding: EdgeInsets.zero,
-                  value: _acknowledged,
-                  onChanged: _serverBusy
-                      ? null
-                      : (value) => setState(() {
-                          _acknowledgedOrigin = value == true
-                              ? _currentOrigin
-                              : null;
-                        }),
-                  title: const Text(
-                    'I understand HTTP traffic is unencrypted.',
+                if (failure != null) ...<Widget>[
+                  const SizedBox(height: Design.space1),
+                  Text(
+                    failure.message,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: colors.error,
+                    ),
                   ),
-                  controlAffinity: ListTileControlAffinity.leading,
-                ),
-              const SizedBox(height: 8),
-              Row(
-                children: <Widget>[
-                  if (!_isCreatingProfile)
-                    TextButton.icon(
-                      onPressed: _serverBusy || controller.profiles.length == 1
+                ],
+                const SizedBox(height: Design.space3),
+                Wrap(
+                  spacing: Design.space2,
+                  runSpacing: Design.space2,
+                  children: <Widget>[
+                    OutlinedButton(
+                      onPressed: _serverBusy
                           ? null
-                          : _confirmDeleteProfile,
+                          : () => _openConnectionForm(profile: selected),
+                      child: const Text('Edit connection'),
+                    ),
+                    if (status != ConnectionStatus.ready)
+                      OutlinedButton(
+                        onPressed:
+                            _serverBusy || status == ConnectionStatus.checking
+                            ? null
+                            : () => _connectProfile(selected),
+                        child: const Text('Connect'),
+                      ),
+                    FilledButton.tonal(
+                      onPressed: _serverBusy
+                          ? null
+                          : () => _startChatOnProfile(selected),
+                      child: Text('New chat on ${selected.name}'),
+                    ),
+                    TextButton.icon(
+                      onPressed: _serverBusy || profiles.length == 1
+                          ? null
+                          : () => _confirmDeleteProfile(selected),
                       icon: const Icon(Icons.delete_outline),
                       label: const Text('Delete'),
                     ),
-                  if (!_isCreatingProfile) const SizedBox(width: 8),
-                  Expanded(
-                    child: FilledButton.tonal(
-                      style: FilledButton.styleFrom(
-                        minimumSize: const Size.fromHeight(48),
-                      ),
-                      onPressed:
-                          _serverBusy ||
-                              !_httpHostAllowed ||
-                              (_isHttp && !_acknowledged)
-                          ? null
-                          : _saveProfile,
-                      child: controller.profileMutationBusy
-                          ? const SizedBox.square(
-                              dimension: 20,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Text('Test and Save'),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ],
-        ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1015,30 +812,40 @@ class _SettingsSheetState extends State<SettingsSheet> {
     );
   }
 
-  bool _savedKeyApplies(ChatController controller) {
-    final id = _editingProfileId;
-    if (id == null || _protocol != ServerProtocol.openAiCompatible) {
-      return false;
-    }
-    final matches = controller.profiles.where((profile) => profile.id == id);
-    if (matches.isEmpty ||
-        matches.first.protocol != ServerProtocol.openAiCompatible) {
-      return false;
+  Future<void> _openConnectionForm({ServerProfile? profile}) async {
+    await showConnectionForm(context, widget.controller, profile: profile);
+    if (!mounted) return;
+    final configured = widget.controller.profiles.where((p) => p.configured);
+    setState(() {
+      // Show the connection just created or set up.
+      if (profile == null && configured.isNotEmpty) {
+        _selectedProfileId = configured.last.id;
+      }
+    });
+  }
+
+  /// First Connect of a saved profile shows the destination disclosure.
+  Future<void> _connectProfile(ServerProfile profile) async {
+    if (!await confirmServerDestination(context, widget.controller, profile)) {
+      return;
     }
     try {
-      return SettingsStore.canonicalBaseUrl(_serverController.text) ==
-              matches.first.baseUrl &&
-          controller.hasServerApiKeyForProfile(id);
+      await widget.controller.loadModelsForProfile(profile.id);
     } on Object {
-      return false;
+      // The status and failure for this profile are shown in place.
     }
   }
 
-  Future<void> _startChatOnProfile(String id) async {
-    if (!mounted || _editingProfileId != id) return;
+  Future<void> _startChatOnProfile(ServerProfile profile) async {
+    if (!await confirmServerDestination(context, widget.controller, profile) ||
+        !mounted) {
+      return;
+    }
     setState(() => _saving = true);
     try {
-      final started = await widget.controller.newConversationOnServer(id);
+      final started = await widget.controller.newConversationOnServer(
+        profile.id,
+      );
       if (!started) {
         _showMessage(
           widget.controller.errorMessage ??
@@ -1058,60 +865,11 @@ class _SettingsSheetState extends State<SettingsSheet> {
     }
   }
 
-  Future<void> _saveProfile() async {
-    setState(() => _saving = true);
-    try {
-      final profile = ServerProfile(
-        id:
-            _editingProfileId ??
-            'profile-${DateTime.now().microsecondsSinceEpoch}',
-        name: _profileNameController.text,
-        protocol: _protocol,
-        baseUrl: _serverController.text,
-        acknowledgedInsecureOrigin: _acknowledgedOrigin,
-      );
-      final saved = await widget.controller.upsertServerProfile(
-        profile,
-        serverApiKey: _serverKeyController.text.trim().isEmpty
-            ? null
-            : _serverKeyController.text,
-        makeActive: false,
-        preserveConversation: true,
-      );
-      if (!saved) {
-        final reason = widget.controller.modelLoading
-            ? 'Wait for the selected model details to finish loading.'
-            : widget.controller.isStreaming || widget.controller.isSubmitting
-            ? 'Stop the current response before changing servers.'
-            : (widget.controller.errorMessage ??
-                  'The server could not be reached.');
-        _showMessage(reason);
-        return;
-      }
-      if (mounted) {
-        final savedProfile = widget.controller.profiles.firstWhere(
-          (candidate) => candidate.id == profile.id,
-        );
-        setState(() => _loadProfile(savedProfile));
-      }
-      _showMessage('Server profile saved.');
-    } on Object catch (error) {
-      _showMessage('The server profile could not be saved: $error');
-    } finally {
-      if (mounted) setState(() => _saving = false);
-    }
-  }
-
-  Future<void> _confirmDeleteProfile() async {
-    final id = _editingProfileId;
-    if (id == null) return;
-    final profile = widget.controller.profiles.firstWhere(
-      (candidate) => candidate.id == id,
-    );
+  Future<void> _confirmDeleteProfile(ServerProfile profile) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('Delete server profile?'),
+        title: const Text('Delete connection?'),
         content: Text('Delete “${profile.name}”?'),
         actions: <Widget>[
           TextButton(
@@ -1129,20 +887,20 @@ class _SettingsSheetState extends State<SettingsSheet> {
 
     setState(() => _saving = true);
     try {
-      final deleted = await widget.controller.deleteServerProfile(id);
+      final deleted = await widget.controller.deleteServerProfile(profile.id);
       if (!deleted) {
         _showMessage(
           widget.controller.errorMessage ??
-              'The profile could not be deleted right now.',
+              'The connection could not be deleted right now.',
         );
         return;
       }
       if (mounted) {
-        setState(() => _loadProfile(widget.controller.activeProfile));
+        setState(() => _selectedProfileId = widget.controller.activeProfileId);
       }
-      _showMessage('Server profile deleted.');
+      _showMessage('Connection deleted.');
     } on Object catch (error) {
-      _showMessage('The server profile could not be deleted: $error');
+      _showMessage('The connection could not be deleted: $error');
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -1257,7 +1015,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
       await widget.controller.saveWebApiKey(_webKeyController.text);
       _webKeyController.clear();
     } on Object catch (error) {
-      _showMessage('The API key could not be saved: $error');
+      _showMessage('The Ollama cloud API key could not be saved: $error');
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -1268,7 +1026,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
     try {
       await widget.controller.saveWebApiKey('');
     } on Object catch (error) {
-      _showMessage('The API key could not be removed: $error');
+      _showMessage('The Ollama cloud API key could not be removed: $error');
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -1285,7 +1043,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
         final accepted = await showDialog<bool>(
           context: context,
           builder: (dialogContext) => AlertDialog(
-            title: const Text('Web Agent uses Ollama cloud services'),
+            title: const Text('Web search uses Ollama cloud services'),
             content: const Text(
               'Search terms, page URLs, and fetched page content leave your local network and are sent to Ollama. Regular chat goes to your configured server.',
             ),
@@ -1307,7 +1065,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
 
       if (!widget.controller.hasWebApiKey) {
         if (_webKeyController.text.trim().isEmpty) {
-          _showMessage('Save an Ollama API key first.');
+          _showMessage('Save an Ollama cloud API key first.');
           return;
         }
         await widget.controller.saveWebApiKey(_webKeyController.text);
@@ -1317,10 +1075,10 @@ class _SettingsSheetState extends State<SettingsSheet> {
         true,
       );
       if (!enabledSuccessfully) {
-        _showMessage('Web Agent is not ready for this model.');
+        _showMessage('Web search is not available for this chat’s model.');
       }
     } on Object catch (error) {
-      _showMessage('Web Agent settings could not be saved: $error');
+      _showMessage('Web search settings could not be saved: $error');
     }
   }
 

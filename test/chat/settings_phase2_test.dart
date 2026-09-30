@@ -141,12 +141,11 @@ void main() {
           ),
         ),
       );
-      await tester.tap(find.byType(DropdownButton<String>));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Lab').last);
+      await tester.tap(find.text('Lab'));
       await tester.pumpAndSettle();
 
-      expect(find.text('Saved server'), findsOneWidget);
+      // Row status label and the selected profile's status line.
+      expect(find.text('Saved'), findsNWidgets(2));
       expect(find.text('New chats on Lab'), findsOneWidget);
       expect(find.text('New chat on Lab'), findsOneWidget);
       expect(find.text('Models on Lab'), findsOneWidget);
@@ -204,6 +203,87 @@ void main() {
         ),
         findsOneWidget,
       );
+    },
+  );
+  testWidgets(
+    'fresh install: Connect a server opens an empty form that keeps fields '
+    'when connecting fails',
+    (tester) async {
+      final fixture = ChatFixture();
+      addTearDown(fixture.close);
+      await tester.runAsync(() async {
+        await fixture.open();
+        fixture.controller.dispose();
+        fixture.preferences.values.clear();
+        fixture.settings = SettingsStore(fixture.preferences);
+        await fixture.settings.migrateLegacyProfile();
+        fixture.createController();
+        await fixture.controller.initialize();
+      });
+      expect(fixture.controller.isConfigured, isFalse);
+      final bootstrapId = fixture.controller.activeProfileId;
+      // Lets real database and mock HTTP work finish between frames.
+      Future<void> settle() async {
+        for (var i = 0; i < 10; i++) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 20)),
+          );
+          await tester.pump();
+        }
+        await tester.pumpAndSettle();
+      }
+
+      bool? connected;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) => TextButton(
+              onPressed: () async => connected = await showConnectionForm(
+                context,
+                fixture.controller,
+              ),
+              child: const Text('Connect a server'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Connect a server'));
+      await tester.pumpAndSettle();
+
+      final name = find.widgetWithText(TextField, 'Name');
+      final url = find.widgetWithText(TextField, 'Server URL');
+      expect(tester.widget<TextField>(name).controller!.text, isEmpty);
+      expect(tester.widget<TextField>(url).controller!.text, isEmpty);
+
+      fixture.failedHosts.add('studio.test');
+      await tester.enterText(name, 'Studio');
+      await tester.enterText(url, 'https://studio.test');
+      await tester.pump();
+      await tester.tap(find.text('Save and connect'));
+      await tester.pump();
+      await settle();
+
+      expect(connected, isNull);
+      expect(
+        find.textContaining('Saved on this phone, but not connected.'),
+        findsOneWidget,
+      );
+      expect(tester.widget<TextField>(name).controller!.text, 'Studio');
+      expect(
+        tester.widget<TextField>(url).controller!.text,
+        'https://studio.test',
+      );
+
+      fixture.failedHosts.clear();
+      await tester.ensureVisible(find.text('Retry'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Retry'));
+      await settle();
+
+      expect(connected, isTrue);
+      expect(fixture.controller.isConfigured, isTrue);
+      expect(fixture.controller.activeProfile.id, bootstrapId);
+      expect(fixture.controller.activeProfile.name, 'Studio');
     },
   );
 }
