@@ -25,6 +25,9 @@ class ChatFixture {
   final images = TestImages();
   final secrets = TestSecrets();
   final failedHosts = <String>{};
+
+  /// Holds unary requests to a host until the completer completes.
+  final holds = <String, Completer<void>>{};
   final requests = <Map<String, dynamic>>[];
   final models = ['qwen3:4b', 'gemma3:4b'];
   bool holdResponse = false;
@@ -81,6 +84,7 @@ class ChatFixture {
       ollamaClientFactory: (url) => OllamaClient(
         baseUrl: url,
         client: MockClient((request) async {
+          await holds[request.url.host]?.future;
           if (failedHosts.contains(request.url.host)) {
             throw http.ClientException('Server unavailable');
           }
@@ -272,12 +276,14 @@ class _CompatibleResponseClient extends http.BaseClient {
 
 class TestPreferences implements PreferencesDriver {
   final values = <String, Object>{};
+  bool failWrites = false;
   @override
   String? getString(String key) => values[key] as String?;
   @override
   bool? getBool(String key) => values[key] as bool?;
   @override
   Future<void> setString(String key, String value) async {
+    if (failWrites) throw StateError('injected preference write failure');
     values[key] = value;
   }
 

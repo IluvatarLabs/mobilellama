@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -7,6 +8,8 @@ import 'package:mobollama/data/document_reader.dart';
 import 'package:mobollama/domain/message.dart';
 import 'package:mobollama/data/settings_store.dart';
 import 'package:mobollama/domain/generation_options.dart';
+import 'package:mobollama/domain/tool_call.dart';
+import 'package:mobollama/chat/chat_controller.dart';
 
 import '../support/chat_fixture.dart';
 
@@ -494,4 +497,242 @@ void main() {
       expect(f.controller.messages.last.status, MessageStatus.complete);
     },
   );
+
+  test('revision recovery survives failure and relaunch, restores offline, and ends with the next turn', () async {
+    final f = ChatFixture();
+    await f.open();
+    addTearDown(f.close);
+    final store = f.store;
+    await store.createConversation(
+      id: 'rev',
+      serverProfileId: 'home',
+      selectedModel: 'qwen3:4b',
+      systemPrompt: '',
+    );
+    Future<void> add(
+      String id,
+      MessageRole role,
+      String content, {
+      List<String> images = const [],
+      List<ToolCall> calls = const [],
+      List<ToolResult> results = const [],
+    }) => store.appendMessage(
+      id: id,
+      conversationId: 'rev',
+      role: role,
+      status: MessageStatus.complete,
+      content: content,
+      reasoning: role == MessageRole.assistant ? 'Thinking $id' : null,
+      imageReferences: images,
+      toolCalls: calls,
+      toolResults: results,
+    );
+    await add('u1', MessageRole.user, 'First question');
+    await add(
+      'a1',
+      MessageRole.assistant,
+      'First answer',
+      calls: const [
+        ToolCall(id: 'c1', name: 'lookup', arguments: {'q': 1}),
+      ],
+      results: const [ToolResult(id: 'r1', toolCallId: 'c1', content: 'hit')],
+    );
+    await add('u2', MessageRole.user, 'Second', images: ['image:rev:photo']);
+    await add('a2', MessageRole.assistant, 'Second answer');
+    final original = (await store.openConversation(
+      serverProfileId: 'home',
+      id: 'rev',
+    ))!.messages;
+    await f.controller.initialize();
+    await f.controller.openConversation('rev');
+
+    // Regenerating an older answer fails before output; the removed tail,
+    // including media referenced only by it, is retained for recovery.
+    f.failNextResponses = 1;
+    expect(await f.controller.regenerateAssistant('a1'), isTrue);
+    expect(f.controller.messages.last.status, MessageStatus.failed);
+    expect(f.controller.hasRecoveryCheckpoint('rev'), isTrue);
+    expect(f.images.deleted, isNot(contains('image:rev:photo')));
+    final backup = await f.controller.exportBackup();
+    expect(backup, isNot(contains('Second answer')));
+
+    // Relaunch, then restore without any network request.
+    await f.controller.shutdown();
+    f.controller.dispose();
+    f.createController();
+    f.failedHosts.add('home.test');
+    await f.controller.initialize();
+    await f.controller.openConversation('rev');
+    final requests = f.requests.length;
+    expect(f.controller.canRestorePreviousConversation, isTrue);
+    expect(await f.controller.restorePreviousConversation('rev'), isTrue);
+    expect(f.requests, hasLength(requests));
+    expect(f.controller.hasRecoveryCheckpoint('rev'), isFalse);
+    final restored = (await store.openConversation(
+      serverProfileId: 'home',
+      id: 'rev',
+    ))!.messages;
+    String shape(List<Message> messages) => jsonEncode([
+      for (final m in messages)
+        [
+          m.id,
+          m.position,
+          m.role.name,
+          m.status.name,
+          m.content,
+          m.reasoning,
+          m.imageReferences,
+          m.toolCalls.map((c) => c.toJson()).toList(),
+          m.toolResults.map((r) => r.toJson()).toList(),
+        ],
+    ]);
+    expect(shape(restored), shape(original));
+    expect(shape(f.controller.messages), shape(original));
+
+    // A successful regeneration keeps recovery until the next committed
+    // turn, which ends it without deleting live media.
+    f.failedHosts.clear();
+    expect(await f.controller.connectConversation(), isTrue);
+    expect(await f.controller.regenerateAssistant('a2'), isTrue);
+    expect(f.controller.messages.last.status, MessageStatus.complete);
+    expect(f.controller.hasRecoveryCheckpoint('rev'), isTrue);
+    expect(await f.controller.send('Next'), isTrue);
+    expect(f.controller.hasRecoveryCheckpoint('rev'), isFalse);
+    expect(await store.recoveryCheckpointConversationIds(), isEmpty);
+    expect(f.images.deleted, isNot(contains('image:rev:photo')));
+
+    // Deleting the chat deletes its checkpoint.
+    final latest = f.controller.messages.last.id;
+    expect(await f.controller.regenerateAssistant(latest), isTrue);
+    expect(await store.recoveryCheckpointConversationIds(), {'rev'});
+    expect(await f.controller.deleteConversation('rev'), isTrue);
+    expect(await store.recoveryCheckpointConversationIds(), isEmpty);
+  });
+
+  test('offline chats stay editable and reconnecting sends nothing until explicit Send', () async {
+    final f = ChatFixture();
+    await f.open();
+    addTearDown(f.close);
+    await f.seed('home-chat');
+    await f.seed('lab-chat', profile: 'lab');
+    f.failedHosts.addAll({'home.test', 'lab.test'});
+    await f.controller.initialize();
+    expect(f.controller.canEditDraft, isTrue);
+    expect(f.controller.submitAvailability, SubmitAvailability.unavailable);
+    expect(
+      f.controller.conversationConnectionStatus,
+      ConnectionStatus.unavailable,
+    );
+    await f.controller.openConversation('home-chat');
+    f.controller.setDraftText('Home draft');
+    await f.controller.openConversation('lab-chat');
+    f.controller.setDraftText('Lab draft');
+    await f.controller.shutdown();
+    f.controller.dispose();
+    f.createController();
+    await f.controller.initialize();
+    await f.controller.openConversation('home-chat');
+    expect(f.controller.messages, hasLength(2));
+    expect(f.controller.draftText, 'Home draft');
+    await f.controller.openConversation('lab-chat');
+    expect(f.controller.draftText, 'Lab draft');
+
+    f.failedHosts.clear();
+    expect(await f.controller.connectConversation(), isTrue);
+    expect(f.requests, isEmpty);
+    expect(f.controller.draftText, 'Lab draft');
+    expect(await f.controller.send(f.controller.draftText), isTrue);
+    expect(f.requests.single['host'], 'lab.test');
+    expect(f.requests.single['model'], 'qwen3:4b');
+    expect(
+      (f.requests.single['messages'] as List).last['content'],
+      'Lab draft',
+    );
+  });
+
+  test(
+    'a pending probe never blocks or redirects navigation to another chat',
+    () async {
+      final f = ChatFixture();
+      await f.open();
+      addTearDown(f.close);
+      await f.seed('home-chat');
+      await f.seed('lab-chat', profile: 'lab');
+      await f.controller.initialize();
+      final held = f.holds['lab.test'] = Completer<void>();
+      final opening = f.controller.openConversation('lab-chat');
+      await Future<void>.delayed(Duration.zero);
+      expect(f.controller.conversation!.id, 'lab-chat');
+      expect(f.controller.canEditDraft, isTrue);
+      await f.controller.openConversation('home-chat');
+      expect(f.controller.conversation!.id, 'home-chat');
+      expect(f.controller.canSend, isTrue);
+      held.complete();
+      await opening;
+      expect(f.controller.conversation!.id, 'home-chat');
+      expect(f.controller.activeProfileId, 'home');
+      expect(f.controller.canSend, isTrue);
+    },
+  );
+
+  test('address change keeps chats, never reuses the old key, and a failed save changes nothing', () async {
+    final f = ChatFixture();
+    await f.open();
+    addTearDown(f.close);
+    await f.controller.initialize();
+    final a = ServerProfile(
+      id: 'api',
+      name: 'API',
+      protocol: ServerProtocol.openAiCompatible,
+      baseUrl: 'https://a.test/v1',
+    );
+    final connectA = await f.controller.saveAndConnectServerProfile(
+      a,
+      serverApiKey: 'key-a',
+    );
+    expect(connectA.connection!.succeeded, isTrue);
+    expect(await f.controller.send('On A'), isTrue);
+    final chatId = f.controller.conversation!.id;
+    expect(f.requests.last['headers']['authorization'], 'Bearer key-a');
+    expect(f.controller.modelsForProfile('api'), isNotEmpty);
+
+    final b = a.copyWith(baseUrl: 'https://b.test/v1');
+    expect(
+      (await f.controller.saveServerProfile(b)).outcome,
+      ProfileSaveOutcome.confirmationRequired,
+    );
+    f.preferences.failWrites = true;
+    final failed = await f.controller.saveServerProfile(
+      b,
+      confirmAddressChange: true,
+    );
+    f.preferences.failWrites = false;
+    expect(failed.outcome, ProfileSaveOutcome.persistenceFailed);
+    expect(f.controller.activeProfile.baseUrl, 'https://a.test/v1');
+    expect(f.controller.hasServerApiKeyForProfile('api'), isTrue);
+    expect(f.controller.canSend, isTrue);
+
+    final changed = await f.controller.saveServerProfile(
+      b,
+      confirmAddressChange: true,
+    );
+    expect(changed.saved, isTrue);
+    expect(f.controller.activeProfile.baseUrl, 'https://b.test/v1');
+    expect(f.controller.conversation!.id, chatId);
+    expect(f.controller.history.single.serverProfileId, 'api');
+    expect(f.controller.modelsForProfile('api'), isEmpty);
+    expect(f.controller.connectionStatusFor('api'), ConnectionStatus.saved);
+    expect(f.controller.hasServerApiKeyForProfile('api'), isFalse);
+    expect(f.secrets.values.values, isNot(contains('key-a')));
+    expect(f.controller.isDestinationAcknowledged(a), isTrue);
+    expect(f.controller.isDestinationAcknowledged(b), isFalse);
+
+    expect(await f.controller.connectConversation(), isTrue);
+    expect(await f.controller.send('On B'), isTrue);
+    expect(f.controller.conversation!.id, chatId);
+    expect(
+      (f.requests.last['headers'] as Map).containsKey('authorization'),
+      isFalse,
+    );
+  });
 }

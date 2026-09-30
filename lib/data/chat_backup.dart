@@ -477,6 +477,9 @@ final class ChatBackup {
           message.documents.map((document) => document.reference),
         );
       }
+      // Replacement cascades away the local recovery checkpoint in the same
+      // transaction, so its now-unreferenced media is released too.
+      oldReferences.addAll(await _store.recoveryCheckpointReferences(targetId));
     }
 
     final allocatedIds = <String>{targetId};
