@@ -54,36 +54,68 @@ class ChatHistoryRow extends StatelessWidget {
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(fontSize: 16),
       ),
-      trailing: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 72),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            if (running) ...<Widget>[
-              Semantics(
-                label: 'Response running',
-                child: const SizedBox.square(
-                  dimension: 14,
-                  child: CircularProgressIndicator(strokeWidth: 2),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 72),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                if (running) ...<Widget>[
+                  Semantics(
+                    label: 'Response running',
+                    child: const SizedBox.square(
+                      dimension: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ),
+                  const SizedBox(width: 5),
+                ],
+                Flexible(
+                  child: Text(
+                    chatServerName(controller, chat),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: colors.onSurfaceVariant,
+                    ),
+                  ),
                 ),
-              ),
-              const SizedBox(width: 5),
-            ],
-            Flexible(
-              child: Text(
-                chatServerName(controller, chat),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(fontSize: 13, color: colors.onSurfaceVariant),
-              ),
+              ],
             ),
-          ],
-        ),
+          ),
+          ChatRowActionsButton(
+            chat: chat,
+            onPressed: () => showChatActions(context, controller, chat),
+          ),
+        ],
       ),
       onTap: onTap,
       onLongPress: () => showChatActions(context, controller, chat),
     );
   }
+}
+
+/// Visible entry to a history row's actions; long press is only a shortcut.
+class ChatRowActionsButton extends StatelessWidget {
+  const ChatRowActionsButton({
+    super.key,
+    required this.chat,
+    required this.onPressed,
+  });
+  final Conversation chat;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) => RoundAction(
+    label: 'Actions for ${chat.title}',
+    icon: 'more',
+    quiet: true,
+    color: Theme.of(context).colorScheme.onSurfaceVariant,
+    onPressed: onPressed,
+  );
 }
 
 class ChatHistoryPage extends StatefulWidget {
@@ -156,6 +188,11 @@ class _ChatHistoryPageState extends State<ChatHistoryPage> {
     } else {
       showChatError(context, widget.controller);
     }
+  }
+
+  Future<void> _showActions(Conversation chat) async {
+    await showChatActions(context, widget.controller, chat);
+    if (mounted) await _search();
   }
 
   @override
@@ -315,15 +352,12 @@ class _ChatHistoryPageState extends State<ChatHistoryPage> {
                             ),
                           ],
                         ),
+                        trailing: ChatRowActionsButton(
+                          chat: chat,
+                          onPressed: () => _showActions(chat),
+                        ),
                         onTap: () => _open(chat),
-                        onLongPress: () async {
-                          await showChatActions(
-                            context,
-                            widget.controller,
-                            chat,
-                          );
-                          if (mounted) await _search();
-                        },
+                        onLongPress: () => _showActions(chat),
                       );
                     },
                   ),

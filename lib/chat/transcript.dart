@@ -60,6 +60,7 @@ class TranscriptMessageView {
     this.editRemovesLaterMessages = false,
     this.canRegenerate = false,
     this.regenerateRemovesLaterMessages = false,
+    this.canRestorePrevious = false,
     this.thinking,
     this.imageReferences = const <String>[],
     this.documents = const <DocumentAttachment>[],
@@ -75,6 +76,10 @@ class TranscriptMessageView {
   final bool editRemovesLaterMessages;
   final bool canRegenerate;
   final bool regenerateRemovesLaterMessages;
+
+  /// Whether this answer's response menu offers `Restore previous
+  /// conversation`. Requires [ChatTranscript.onRestorePrevious].
+  final bool canRestorePrevious;
   final String? thinking;
   final List<String> imageReferences;
   final List<DocumentAttachment> documents;
@@ -88,6 +93,7 @@ class ChatTranscript extends StatefulWidget {
     this.onRetry,
     this.onEditAndResend,
     this.onRegenerate,
+    this.onRestorePrevious,
     this.canMutate,
     this.onCopy,
     this.answerSpeaker,
@@ -103,6 +109,11 @@ class ChatTranscript extends StatefulWidget {
   final Future<bool> Function(TranscriptMessageView message, String text)?
   onEditAndResend;
   final Future<bool> Function(TranscriptMessageView message)? onRegenerate;
+
+  /// Restores the conversation saved before the revision that produced this
+  /// answer. Offered only for messages with
+  /// [TranscriptMessageView.canRestorePrevious]. Returns false when refused.
+  final Future<bool> Function(TranscriptMessageView message)? onRestorePrevious;
   final bool Function()? canMutate;
   final ValueChanged<String>? onCopy;
   final AnswerSpeaker? answerSpeaker;
@@ -418,7 +429,12 @@ class _ChatTranscriptState extends State<ChatTranscript>
             key: const PageStorageKey<String>('transcript-list'),
             controller: _scrollController,
             keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-            padding: EdgeInsets.fromLTRB(18, 18, 18, widget.bottomPadding),
+            padding: EdgeInsets.fromLTRB(
+              Design.gutter,
+              Design.gutter,
+              Design.gutter,
+              widget.bottomPadding,
+            ),
             itemCount: widget.messages.length,
             itemBuilder: (context, index) {
               final message = widget.messages[index];
@@ -473,6 +489,7 @@ class _ChatTranscriptState extends State<ChatTranscript>
         onRetry: widget.onRetry,
         onEditAndResend: widget.onEditAndResend,
         onRegenerate: widget.onRegenerate,
+        onRestorePrevious: widget.onRestorePrevious,
         canMutate: widget.canMutate,
         onCopy: widget.onCopy,
         isSpeaking: _speakingMessageId == message.id,
@@ -491,6 +508,7 @@ class _TranscriptMessage extends StatelessWidget {
     required this.onRetry,
     required this.onEditAndResend,
     required this.onRegenerate,
+    required this.onRestorePrevious,
     required this.canMutate,
     required this.onCopy,
     required this.isSpeaking,
@@ -505,6 +523,7 @@ class _TranscriptMessage extends StatelessWidget {
   final Future<bool> Function(TranscriptMessageView message, String text)?
   onEditAndResend;
   final Future<bool> Function(TranscriptMessageView message)? onRegenerate;
+  final Future<bool> Function(TranscriptMessageView message)? onRestorePrevious;
   final bool Function()? canMutate;
   final ValueChanged<String>? onCopy;
   final bool isSpeaking;
@@ -520,6 +539,7 @@ class _TranscriptMessage extends StatelessWidget {
         findController: findController,
         onEditAndResend: onEditAndResend,
         canMutate: canMutate,
+        onCopy: onCopy,
       ),
       TranscriptRole.assistant => _AssistantMessage(
         message: message,
@@ -528,6 +548,7 @@ class _TranscriptMessage extends StatelessWidget {
         findController: findController,
         onRetry: onRetry,
         onRegenerate: onRegenerate,
+        onRestorePrevious: onRestorePrevious,
         canMutate: canMutate,
         onCopy: onCopy,
         isSpeaking: isSpeaking,
@@ -543,6 +564,44 @@ class _TranscriptMessage extends StatelessWidget {
   }
 }
 
+enum _MessageAction { copy, edit, regenerate, share, readAloud, restore }
+
+/// Copies [text] and confirms with an announced, non-modal message. Selection
+/// and scroll position are left untouched.
+void _copyText(
+  BuildContext context,
+  String text, {
+  required String confirmation,
+  ValueChanged<String>? onCopy,
+}) {
+  Clipboard.setData(ClipboardData(text: text));
+  onCopy?.call(text);
+  ScaffoldMessenger.of(context)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(
+        content: Text(confirmation),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+}
+
+/// The one visible menu trigger each message carries.
+class _MoreButton extends StatelessWidget {
+  const _MoreButton({required this.label, required this.onPressed});
+  final String label;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) => RoundAction(
+    label: label,
+    icon: 'more',
+    quiet: true,
+    color: Theme.of(context).colorScheme.onSurfaceVariant,
+    onPressed: onPressed,
+  );
+}
+
 class _UserMessage extends StatelessWidget {
   const _UserMessage({
     required this.message,
@@ -551,6 +610,7 @@ class _UserMessage extends StatelessWidget {
     required this.findController,
     required this.onEditAndResend,
     required this.canMutate,
+    required this.onCopy,
   });
 
   final TranscriptMessageView message;
@@ -560,8 +620,13 @@ class _UserMessage extends StatelessWidget {
   final Future<bool> Function(TranscriptMessageView message, String text)?
   onEditAndResend;
   final bool Function()? canMutate;
+  final ValueChanged<String>? onCopy;
 
   bool get _mutationAvailable => canMutate?.call() ?? true;
+
+  bool get _canCopy => message.content.trim().isNotEmpty;
+
+  bool get _canEdit => message.canEdit && onEditAndResend != null;
 
   Future<void> _edit(BuildContext context) async {
     final text = await showEditMessageSheet(context, message);
@@ -572,6 +637,37 @@ class _UserMessage extends StatelessWidget {
     }
     final saved = await onEditAndResend!(message, text);
     if (!saved && context.mounted) _showMutationUnavailable(context);
+  }
+
+  Future<void> _showMenu(BuildContext context) async {
+    final action = await showActionSheet<_MessageAction>(
+      context,
+      title: 'Message',
+      closeLabel: 'Close message actions',
+      actions: <SheetAction<_MessageAction>>[
+        if (_canCopy) const SheetAction(_MessageAction.copy, 'Copy message'),
+        if (_canEdit)
+          SheetAction(
+            _MessageAction.edit,
+            'Edit and resend',
+            enabled: _mutationAvailable,
+          ),
+      ],
+    );
+    if (!context.mounted) return;
+    switch (action) {
+      case _MessageAction.copy:
+        _copyText(
+          context,
+          message.content,
+          confirmation: 'Message copied.',
+          onCopy: onCopy,
+        );
+      case _MessageAction.edit:
+        await _edit(context);
+      default:
+        break;
+    }
   }
 
   @override
@@ -586,19 +682,12 @@ class _UserMessage extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.end,
             children: <Widget>[
-              if (message.canEdit && onEditAndResend != null) ...<Widget>[
-                IconButton(
-                  tooltip: 'Edit message',
-                  onPressed: _mutationAvailable ? () => _edit(context) : null,
-                  style: IconButton.styleFrom(
-                    minimumSize: const Size.square(44),
-                    maximumSize: const Size.square(44),
-                    padding: EdgeInsets.zero,
-                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  ),
-                  icon: const Icon(Icons.edit_outlined, size: 18),
+              if (_canCopy || _canEdit) ...<Widget>[
+                _MoreButton(
+                  label: 'Message actions',
+                  onPressed: () => _showMenu(context),
                 ),
-                const SizedBox(width: 4),
+                const SizedBox(width: Design.space1),
               ],
               Flexible(
                 child: ConstrainedBox(
@@ -609,9 +698,9 @@ class _UserMessage extends StatelessWidget {
                     decoration: BoxDecoration(
                       color: colors.surfaceContainerHigh,
                       borderRadius: const BorderRadius.only(
-                        topLeft: Radius.circular(18),
-                        topRight: Radius.circular(18),
-                        bottomLeft: Radius.circular(18),
+                        topLeft: Radius.circular(Design.radiusLarge),
+                        topRight: Radius.circular(Design.radiusLarge),
+                        bottomLeft: Radius.circular(Design.radiusLarge),
                         bottomRight: Radius.circular(5),
                       ),
                     ),
@@ -632,7 +721,7 @@ class _UserMessage extends StatelessWidget {
                               reference: message.imageReferences[index],
                             ),
                             if (index < message.imageReferences.length - 1)
-                              const SizedBox(height: 8),
+                              const SizedBox(height: Design.space2),
                           ],
                           if (message.imageReferences.isNotEmpty &&
                               (message.documents.isNotEmpty ||
@@ -795,6 +884,7 @@ class _AssistantMessage extends StatelessWidget {
     required this.findController,
     required this.onRetry,
     required this.onRegenerate,
+    required this.onRestorePrevious,
     required this.canMutate,
     required this.onCopy,
     required this.isSpeaking,
@@ -807,6 +897,7 @@ class _AssistantMessage extends StatelessWidget {
   final ChatFindController? findController;
   final ValueChanged<TranscriptMessageView>? onRetry;
   final Future<bool> Function(TranscriptMessageView message)? onRegenerate;
+  final Future<bool> Function(TranscriptMessageView message)? onRestorePrevious;
   final bool Function()? canMutate;
   final ValueChanged<String>? onCopy;
   final bool isSpeaking;
@@ -821,6 +912,79 @@ class _AssistantMessage extends StatelessWidget {
   bool get _isIncomplete =>
       message.status == TranscriptStatus.interrupted ||
       message.status == TranscriptStatus.failed;
+
+  /// Streaming, sending, and queued answers have no revision menu.
+  bool get _isSettled =>
+      message.status == TranscriptStatus.completed || _isIncomplete;
+
+  bool get _hasContent => message.content.trim().isNotEmpty;
+
+  bool get _canRetry => _isIncomplete && message.canRetry && onRetry != null;
+
+  bool get _canRegenerate =>
+      message.canRegenerate &&
+      (!_isIncomplete || !message.canRetry) &&
+      onRegenerate != null;
+
+  bool get _canRestore =>
+      message.canRestorePrevious && onRestorePrevious != null;
+
+  List<SheetAction<_MessageAction>> get _menuActions =>
+      <SheetAction<_MessageAction>>[
+        // A completed answer keeps Copy visible; an incomplete one keeps
+        // Retry visible and moves Copy into the menu.
+        if (_isIncomplete && _hasContent)
+          const SheetAction(_MessageAction.copy, 'Copy response'),
+        if (_canRegenerate)
+          SheetAction(
+            _MessageAction.regenerate,
+            'Regenerate',
+            enabled: _mutationAvailable,
+          ),
+        if (_hasContent) const SheetAction(_MessageAction.share, 'Share'),
+        if (_hasContent)
+          SheetAction(
+            _MessageAction.readAloud,
+            isSpeaking ? 'Stop reading' : 'Read aloud',
+          ),
+        if (_canRestore)
+          const SheetAction(
+            _MessageAction.restore,
+            'Restore previous conversation',
+          ),
+      ];
+
+  Future<void> _showMenu(BuildContext context) async {
+    final action = await showActionSheet<_MessageAction>(
+      context,
+      title: 'Response',
+      closeLabel: 'Close response actions',
+      actions: _menuActions,
+    );
+    if (!context.mounted) return;
+    switch (action) {
+      case _MessageAction.copy:
+        _copy(context);
+      case _MessageAction.regenerate:
+        await _regenerate(context);
+      case _MessageAction.share:
+        await shareResponse(context, message.content);
+      case _MessageAction.readAloud:
+        onReadAloud(message);
+      case _MessageAction.restore:
+        final restored = await onRestorePrevious!(message);
+        if (!restored && context.mounted) _showMutationUnavailable(context);
+      default:
+        break;
+    }
+  }
+
+  void _copy(BuildContext context) => _copyText(
+    context,
+    message.content,
+    confirmation: 'Response copied.',
+    onCopy: onCopy,
+  );
 
   Future<void> _regenerate(BuildContext context) async {
     if (message.regenerateRemovesLaterMessages) {
@@ -857,7 +1021,9 @@ class _AssistantMessage extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
-    final hasContent = message.content.trim().isNotEmpty;
+    final hasContent = _hasContent;
+    final showMenu = _isSettled && _menuActions.isNotEmpty;
+    final showCopy = hasContent && !_isIncomplete;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -868,7 +1034,7 @@ class _AssistantMessage extends StatelessWidget {
             toolCalls: message.toolCalls,
             isActive: message.status == TranscriptStatus.streaming,
           ),
-          if (hasContent) const SizedBox(height: 4),
+          if (hasContent) const SizedBox(height: Design.space1),
         ],
         if (!hasContent &&
             !_hasActivity &&
@@ -882,7 +1048,7 @@ class _AssistantMessage extends StatelessWidget {
                   dimension: 16,
                   child: CircularProgressIndicator(strokeWidth: 2),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: Design.space2),
                 Text(
                   'Working',
                   style: theme.textTheme.bodySmall?.copyWith(
@@ -923,54 +1089,39 @@ class _AssistantMessage extends StatelessWidget {
             findController: findController,
             style: theme.textTheme.bodyLarge,
           ),
-        if (hasContent || _isIncomplete)
+        if (showCopy || showMenu || _isIncomplete || isSpeaking)
           Padding(
-            padding: const EdgeInsets.only(top: 14),
+            padding: const EdgeInsets.only(top: Design.space2),
             child: Wrap(
               spacing: 2,
               runSpacing: 0,
               crossAxisAlignment: WrapCrossAlignment.center,
               children: <Widget>[
-                if (hasContent)
+                if (showCopy)
                   RoundAction(
                     label: 'Copy response',
                     icon: 'copy',
                     quiet: true,
                     color: colors.onSurfaceVariant,
-                    onPressed: () {
-                      Clipboard.setData(ClipboardData(text: message.content));
-                      onCopy?.call(message.content);
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('Response copied.')),
-                      );
-                    },
+                    onPressed: () => _copy(context),
                   ),
-                if (hasContent &&
-                    message.status != TranscriptStatus.streaming &&
-                    message.status != TranscriptStatus.sending &&
-                    message.status != TranscriptStatus.queued)
-                  IconButton(
-                    tooltip: isSpeaking ? 'Stop reading' : 'Read aloud',
+                if (isSpeaking)
+                  TextButton.icon(
+                    style: TextButton.styleFrom(
+                      minimumSize: const Size(Design.target, Design.target),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: Design.space2,
+                      ),
+                    ),
                     onPressed: () => onReadAloud(message),
-                    style: IconButton.styleFrom(
-                      minimumSize: const Size.square(44),
-                      maximumSize: const Size.square(44),
-                      padding: EdgeInsets.zero,
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      foregroundColor: isSpeaking
-                          ? colors.error
-                          : colors.onSurfaceVariant,
-                    ),
-                    icon: Icon(
-                      isSpeaking
-                          ? Icons.stop_circle_outlined
-                          : Icons.volume_up_outlined,
-                      size: 20,
-                    ),
+                    icon: const Icon(Icons.stop_circle_outlined, size: 18),
+                    label: const Text('Stop reading'),
                   ),
                 if (_isIncomplete)
                   Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: Design.space1,
+                    ),
                     child: Text(
                       message.status == TranscriptStatus.interrupted
                           ? 'Interrupted'
@@ -980,11 +1131,13 @@ class _AssistantMessage extends StatelessWidget {
                       ),
                     ),
                   ),
-                if (_isIncomplete && message.canRetry && onRetry != null)
+                if (_canRetry)
                   TextButton.icon(
                     style: TextButton.styleFrom(
                       minimumSize: const Size(48, 48),
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: Design.space2,
+                      ),
                       visualDensity: VisualDensity.compact,
                     ),
                     onPressed: _mutationAvailable
@@ -993,30 +1146,10 @@ class _AssistantMessage extends StatelessWidget {
                     icon: const Icon(Icons.refresh, size: 17),
                     label: const Text('Retry'),
                   ),
-                if (message.canRegenerate &&
-                    (!_isIncomplete || !message.canRetry) &&
-                    onRegenerate != null)
-                  RoundAction(
-                    label: 'Regenerate response',
-                    icon: 'retry',
-                    quiet: true,
-                    color: colors.onSurfaceVariant,
-                    onPressed: _mutationAvailable
-                        ? () => _regenerate(context)
-                        : null,
-                  ),
-                if (message.status == TranscriptStatus.completed && hasContent)
-                  IconButton(
-                    tooltip: 'Share response',
-                    onPressed: () => shareResponse(context, message.content),
-                    style: IconButton.styleFrom(
-                      minimumSize: const Size.square(44),
-                      maximumSize: const Size.square(44),
-                      padding: EdgeInsets.zero,
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      foregroundColor: colors.onSurfaceVariant,
-                    ),
-                    icon: const Icon(Icons.ios_share_outlined, size: 19),
+                if (showMenu)
+                  _MoreButton(
+                    label: 'Response actions',
+                    onPressed: () => _showMenu(context),
                   ),
               ],
             ),
@@ -1108,80 +1241,66 @@ class _EditMessageSheetState extends State<_EditMessageSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final bottomInset = MediaQuery.viewInsetsOf(context).bottom;
     final warning = widget.message.editRemovesLaterMessages
         ? 'This replaces this message and removes every reply after it.'
         : 'This replaces this message and the replies after it.';
-    return AnimatedPadding(
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOut,
-      padding: EdgeInsets.only(bottom: bottomInset),
-      child: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxHeight: MediaQuery.sizeOf(context).height * .9,
-        ),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
+    return KeyboardSafeSheet(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          const SheetHandle(),
+          const SheetHeading(
+            title: 'Edit message',
+            closeLabel: 'Close edit message',
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            key: const ValueKey<String>('edit-message-field'),
+            controller: _text,
+            autofocus: true,
+            minLines: 3,
+            maxLines: 10,
+            textAlignVertical: TextAlignVertical.top,
+            textCapitalization: TextCapitalization.sentences,
+            decoration: InputDecoration(
+              border: const OutlineInputBorder(),
+              errorText: _error,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            warning,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          if (widget.message.imageReferences.isNotEmpty ||
+              widget.message.documents.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 6),
+            Text(
+              'Attached images and documents stay with the edited message.',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
             children: <Widget>[
-              const SheetHandle(),
-              const SheetHeading(
-                title: 'Edit message',
-                closeLabel: 'Close edit message',
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
               ),
-              const SizedBox(height: 8),
-              Flexible(
-                child: TextField(
-                  key: const ValueKey<String>('edit-message-field'),
-                  controller: _text,
-                  autofocus: true,
-                  minLines: 5,
-                  maxLines: null,
-                  textAlignVertical: TextAlignVertical.top,
-                  textCapitalization: TextCapitalization.sentences,
-                  decoration: InputDecoration(
-                    border: const OutlineInputBorder(),
-                    errorText: _error,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                warning,
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-              ),
-              if (widget.message.imageReferences.isNotEmpty ||
-                  widget.message.documents.isNotEmpty) ...<Widget>[
-                const SizedBox(height: 6),
-                Text(
-                  'Attached images and documents stay with the edited message.',
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
-              const SizedBox(height: 8),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: <Widget>[
-                  TextButton(
-                    onPressed: () => Navigator.pop(context),
-                    child: const Text('Cancel'),
-                  ),
-                  const SizedBox(width: 4),
-                  FilledButton(
-                    onPressed: _submit,
-                    child: const Text('Save & resend'),
-                  ),
-                ],
+              const SizedBox(width: 4),
+              FilledButton(
+                onPressed: _submit,
+                child: const Text('Save & resend'),
               ),
             ],
           ),
-        ),
+        ],
       ),
     );
   }

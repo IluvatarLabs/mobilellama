@@ -105,17 +105,17 @@ void main() {
 
     await tester.pumpWidget(subject(TranscriptStatus.streaming));
     expect(find.byTooltip('Copy response'), findsOneWidget);
-    expect(find.byTooltip('Read aloud'), findsNothing);
-    expect(find.byTooltip('Share response'), findsNothing);
+    expect(find.byTooltip('Response actions'), findsNothing);
 
     await tester.pumpWidget(subject(TranscriptStatus.completed));
     await tester.pump();
     expect(find.byTooltip('Copy response'), findsOneWidget);
-    expect(find.byTooltip('Read aloud'), findsOneWidget);
-    expect(find.byTooltip('Share response'), findsOneWidget);
+    await _openMenu(tester, 'Response actions');
+    expect(find.text('Read aloud'), findsOneWidget);
+    expect(find.text('Share'), findsOneWidget);
   });
 
-  testWidgets('transcript keeps activity secondary and exposes copy/retry', (
+  testWidgets('transcript keeps activity secondary; More copies both roles', (
     tester,
   ) async {
     String? copied;
@@ -184,8 +184,15 @@ void main() {
     expect(find.text('Reasoning detail').hitTestable(), findsOneWidget);
     expect(find.text('Found one match').hitTestable(), findsOneWidget);
 
-    await tester.tap(find.byTooltip('Copy response'));
-    await tester.pump();
+    await _openMenu(tester, 'Message actions');
+    await tester.tap(find.text('Copy message'));
+    await tester.pumpAndSettle();
+    expect(clipboardPayload, <Object?, Object?>{'text': 'Question'});
+    expect(find.text('Message copied.'), findsOneWidget);
+
+    await _openMenu(tester, 'Response actions');
+    await tester.tap(find.text('Copy response'));
+    await tester.pumpAndSettle();
     expect(copied, '**Answer**');
     expect(clipboardPayload, <Object?, Object?>{'text': '**Answer**'});
 
@@ -220,11 +227,10 @@ void main() {
     );
 
     expect(
-      tester.getSize(find.byTooltip('Edit message')).shortestSide,
+      tester.getSize(find.byTooltip('Message actions')).shortestSide,
       greaterThanOrEqualTo(44),
     );
-    await tester.tap(find.byTooltip('Edit message'));
-    await tester.pumpAndSettle();
+    await _openEdit(tester);
     var field = tester.widget<TextField>(
       find.byKey(const ValueKey<String>('edit-message-field')),
     );
@@ -242,8 +248,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(edits, isEmpty);
 
-    await tester.tap(find.byTooltip('Edit message'));
-    await tester.pumpAndSettle();
+    await _openEdit(tester);
     field = tester.widget<TextField>(
       find.byKey(const ValueKey<String>('edit-message-field')),
     );
@@ -300,8 +305,7 @@ void main() {
       ),
     );
 
-    await tester.tap(find.byTooltip('Edit message'));
-    await tester.pumpAndSettle();
+    await _openEdit(tester);
     await tester.enterText(
       find.byKey(const ValueKey<String>('edit-message-field')),
       '',
@@ -339,8 +343,7 @@ void main() {
       ),
     );
 
-    await tester.tap(find.byTooltip('Edit message'));
-    await tester.pumpAndSettle();
+    await _openEdit(tester);
     await tester.enterText(
       find.byKey(const ValueKey<String>('edit-message-field')),
       'Changed',
@@ -380,9 +383,9 @@ void main() {
       ),
     );
 
-    expect(find.byTooltip('Regenerate response'), findsOneWidget);
     expect(find.text('Interrupted'), findsOneWidget);
-    await tester.tap(find.byTooltip('Regenerate response'));
+    await _openMenu(tester, 'Response actions');
+    await tester.tap(find.text('Regenerate'));
     await tester.pumpAndSettle();
     expect(
       find.text('This response and every message after it will be removed.'),
@@ -392,7 +395,8 @@ void main() {
     await tester.pumpAndSettle();
     expect(regenerated, isEmpty);
 
-    await tester.tap(find.byTooltip('Regenerate response'));
+    await _openMenu(tester, 'Response actions');
+    await tester.tap(find.text('Regenerate'));
     await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(TextButton, 'Regenerate'));
     await tester.pumpAndSettle();
@@ -436,19 +440,25 @@ void main() {
       ),
     );
 
-    final buttons = tester.widgetList<IconButton>(find.byType(IconButton));
+    await _openMenu(tester, 'Message actions');
     expect(
-      buttons
-          .singleWhere((button) => button.tooltip == 'Edit message')
-          .onPressed,
-      isNull,
+      tester
+          .widget<ListTile>(find.widgetWithText(ListTile, 'Edit and resend'))
+          .enabled,
+      isFalse,
     );
+    await tester.tap(find.byTooltip('Close message actions'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Response actions').first);
+    await tester.pumpAndSettle();
     expect(
-      buttons
-          .singleWhere((button) => button.tooltip == 'Regenerate response')
-          .onPressed,
-      isNull,
+      tester
+          .widget<ListTile>(find.widgetWithText(ListTile, 'Regenerate'))
+          .enabled,
+      isFalse,
     );
+    await tester.tap(find.byTooltip('Close response actions'));
+    await tester.pumpAndSettle();
     expect(
       tester
           .widget<TextButton>(find.widgetWithText(TextButton, 'Retry'))
@@ -489,10 +499,9 @@ void main() {
       );
 
       await tester.pumpAndSettle();
-      await tester.ensureVisible(find.byTooltip('Edit message'));
+      await tester.ensureVisible(find.byTooltip('Message actions'));
       await tester.pumpAndSettle();
-      await tester.tap(find.byTooltip('Edit message'));
-      await tester.pumpAndSettle();
+      await _openEdit(tester);
       await tester.ensureVisible(
         find.widgetWithText(FilledButton, 'Save & resend'),
       );
@@ -812,23 +821,28 @@ void main() {
         ),
       );
 
-      await tester.tap(find.byTooltip('Read aloud').first);
-      await tester.pump();
+      final stopReading = find.widgetWithText(TextButton, 'Stop reading');
+      await tester.tap(find.byTooltip('Response actions').first);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Read aloud'));
+      await tester.pumpAndSettle();
       expect(speaker.spoken, <String>['First answer']);
-      expect(find.byTooltip('Stop reading'), findsOneWidget);
+      expect(stopReading, findsOneWidget);
 
-      await tester.tap(find.byTooltip('Read aloud'));
-      await tester.pump();
+      await tester.tap(find.byTooltip('Response actions').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Read aloud'));
+      await tester.pumpAndSettle();
       expect(speaker.stops, 1);
       expect(speaker.spoken, <String>['First answer', 'Second answer']);
       speaker.complete(0);
       await tester.pump();
-      expect(find.byTooltip('Stop reading'), findsOneWidget);
+      expect(stopReading, findsOneWidget);
 
-      await tester.tap(find.byTooltip('Stop reading'));
+      await tester.tap(stopReading);
       await tester.pump();
       expect(speaker.stops, 2);
-      expect(find.byTooltip('Stop reading'), findsNothing);
+      expect(stopReading, findsNothing);
     },
   );
 
@@ -883,14 +897,26 @@ void main() {
 
     await tester.tap(find.byTooltip('Dictate message'));
     await tester.pump();
-    await tester.tap(find.byTooltip('Read aloud'));
-    await tester.pump();
+    await _openMenu(tester, 'Response actions');
+    await tester.tap(find.text('Read aloud'));
+    await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('Open another page'));
     await tester.pumpAndSettle();
     expect(find.text('Next page'), findsOneWidget);
     expect(dictation.cancels, 1);
     expect(speaker.stops, 1);
   });
+}
+
+Future<void> _openMenu(WidgetTester tester, String label) async {
+  await tester.tap(find.byTooltip(label));
+  await tester.pumpAndSettle();
+}
+
+Future<void> _openEdit(WidgetTester tester) async {
+  await _openMenu(tester, 'Message actions');
+  await tester.tap(find.text('Edit and resend'));
+  await tester.pumpAndSettle();
 }
 
 class _ComposerHarness extends StatefulWidget {
