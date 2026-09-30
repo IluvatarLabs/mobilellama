@@ -34,7 +34,7 @@
 		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>MobileLlama connects to the Ollama server you choose on your local network.</string>
+	<string>MobileLlama connects to the server you choose on your local network, such as Ollama or an OpenAI-compatible server.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>MobileLlama uses selected images in conversations when you attach them.</string>
 	<key>NSCameraUsageDescription</key>
