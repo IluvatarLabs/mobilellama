@@ -84,6 +84,24 @@ class TranscriptMessageView {
   final List<String> imageReferences;
   final List<DocumentAttachment> documents;
   final List<ToolActivityView> toolCalls;
+
+  TranscriptMessageView copyWith({bool? canRestorePrevious}) =>
+      TranscriptMessageView(
+        id: id,
+        role: role,
+        content: content,
+        status: status,
+        canRetry: canRetry,
+        canEdit: canEdit,
+        editRemovesLaterMessages: editRemovesLaterMessages,
+        canRegenerate: canRegenerate,
+        regenerateRemovesLaterMessages: regenerateRemovesLaterMessages,
+        canRestorePrevious: canRestorePrevious ?? this.canRestorePrevious,
+        thinking: thinking,
+        imageReferences: imageReferences,
+        documents: documents,
+        toolCalls: toolCalls,
+      );
 }
 
 class ChatTranscript extends StatefulWidget {
@@ -101,6 +119,7 @@ class ChatTranscript extends StatefulWidget {
     this.findController,
     this.findScope,
     this.emptyState,
+    this.messageFooter,
     this.bottomPadding = 24,
   });
 
@@ -121,6 +140,10 @@ class ChatTranscript extends StatefulWidget {
   final ChatFindController? findController;
   final Object? findScope;
   final Widget? emptyState;
+
+  /// Optional content shown directly below one message, such as a request
+  /// failure with its recovery actions.
+  final Widget? Function(TranscriptMessageView message)? messageFooter;
   final double bottomPadding;
 
   @override
@@ -477,11 +500,8 @@ class _ChatTranscriptState extends State<ChatTranscript>
       message.id,
       () => GlobalKey(debugLabel: 'find-${message.id}'),
     );
-    return Padding(
-      padding: EdgeInsets.only(
-        bottom: message.role == TranscriptRole.user ? 30 : 24,
-      ),
-      child: _TranscriptMessage(
+    final footer = widget.messageFooter?.call(message);
+    final body = _TranscriptMessage(
         message: message,
         messageIndex: index,
         findTextKey: findTextKey,
@@ -494,7 +514,21 @@ class _ChatTranscriptState extends State<ChatTranscript>
         onCopy: widget.onCopy,
         isSpeaking: _speakingMessageId == message.id,
         onReadAloud: _toggleReadAloud,
+    );
+    return Padding(
+      padding: EdgeInsets.only(
+        bottom: message.role == TranscriptRole.user ? 30 : 24,
       ),
+      child: footer == null
+          ? body
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                body,
+                const SizedBox(height: Design.space2),
+                footer,
+              ],
+            ),
     );
   }
 }
@@ -972,8 +1006,8 @@ class _AssistantMessage extends StatelessWidget {
       case _MessageAction.readAloud:
         onReadAloud(message);
       case _MessageAction.restore:
-        final restored = await onRestorePrevious!(message);
-        if (!restored && context.mounted) _showMutationUnavailable(context);
+        // The caller reports the outcome, including a Stop-first instruction.
+        await onRestorePrevious!(message);
       default:
         break;
     }
@@ -993,7 +1027,9 @@ class _AssistantMessage extends StatelessWidget {
         builder: (context) => AlertDialog(
           title: const Text('Regenerate this response?'),
           content: const Text(
-            'This response and every message after it will be removed.',
+            'This response and every message after it will be replaced. '
+            'You can restore the previous conversation until you send or '
+            'revise another message.',
           ),
           actions: <Widget>[
             TextButton(
@@ -1154,6 +1190,8 @@ class _AssistantMessage extends StatelessWidget {
               ],
             ),
           ),
+        if (_canRestore)
+          _RecoveryNotice(onRestore: () => onRestorePrevious!(message)),
       ],
     );
   }
@@ -1184,6 +1222,60 @@ class _AssistantMessage extends StatelessWidget {
   void _showLinkError(BuildContext context, String message) {
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(message)));
+  }
+}
+
+/// Persistent, compact recovery affordance shown under the result of the
+/// latest edit, regenerate, or retry while its checkpoint exists.
+class _RecoveryNotice extends StatelessWidget {
+  const _RecoveryNotice({required this.onRestore});
+  final VoidCallback onRestore;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(top: Design.space2),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border.all(color: Design.line(context)),
+          borderRadius: BorderRadius.circular(Design.radiusMedium),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(
+            Design.space1,
+            0,
+            Design.space3,
+            Design.space2,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              TextButton.icon(
+                style: TextButton.styleFrom(
+                  minimumSize: const Size(Design.target, Design.target),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: Design.space2,
+                  ),
+                ),
+                onPressed: onRestore,
+                icon: const Icon(Icons.history, size: 18),
+                label: const Text('Restore previous conversation'),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(left: Design.space2),
+                child: Text(
+                  'Available until you send or revise another message.',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -1241,9 +1333,10 @@ class _EditMessageSheetState extends State<_EditMessageSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final warning = widget.message.editRemovesLaterMessages
-        ? 'This replaces this message and removes every reply after it.'
-        : 'This replaces this message and the replies after it.';
+    final warning =
+        '${widget.message.editRemovesLaterMessages ? 'This replaces this message and every reply after it.' : 'This replaces this message and the replies after it.'} '
+        'You can restore the previous conversation until you send or revise '
+        'another message.';
     return KeyboardSafeSheet(
       child: Column(
         mainAxisSize: MainAxisSize.min,

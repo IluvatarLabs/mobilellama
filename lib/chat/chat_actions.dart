@@ -43,12 +43,67 @@ void showChatError(BuildContext context, ChatController controller) {
   );
 }
 
+/// The aggregate [ChatController.errorMessage] without the failures that the
+/// chat renders separately with their own actions.
+String? generalChatError(ChatController controller) {
+  var text = controller.errorMessage;
+  if (text == null) return null;
+  for (final failure in <ChatFailure?>[
+    controller.conversationConnectionFailure,
+    controller.conversationFailure,
+    controller.draftPersistenceFailure,
+  ]) {
+    if (failure != null) text = text!.replaceAll(failure.message, '');
+  }
+  text = text!.trim();
+  return text.isEmpty ? null : text;
+}
+
+void _showSnack(BuildContext context, String text) =>
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(text)));
+
+/// Restores the visible chat's conversation from before its latest revision.
+/// A still-running response must be stopped first.
+Future<bool> restorePreviousConversation(
+  BuildContext context,
+  ChatController controller,
+  String conversationId,
+) async {
+  if (controller.isConversationRunning(conversationId)) {
+    _showSnack(
+      context,
+      'Stop the response first, then restore the previous conversation.',
+    );
+    return false;
+  }
+  final restored = await controller.restorePreviousConversation(
+    conversationId,
+  );
+  if (context.mounted) {
+    _showSnack(
+      context,
+      restored
+          ? 'Previous conversation restored.'
+          : generalChatError(controller) ??
+                'The previous conversation could not be restored.',
+    );
+  }
+  return restored;
+}
+
 Future<void> showChatActions(
   BuildContext context,
   ChatController controller,
   Conversation chat, {
   VoidCallback? onFind,
 }) async {
+  final server = controller.profiles
+      .where((profile) => profile.id == chat.serverProfileId)
+      .map((profile) => profile.name)
+      .firstOrNull;
+  final visible = controller.conversation?.id == chat.id;
   final action = await showModalBottomSheet<String>(
     context: context,
     isScrollControlled: true,
@@ -63,10 +118,26 @@ Future<void> showChatActions(
           mainAxisSize: MainAxisSize.min,
           children: [
             const SheetHandle(),
-            const SheetHeading(title: 'Chat', closeLabel: 'Close chat actions'),
+            SheetHeading(title: chat.title, closeLabel: 'Close chat actions'),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  [
+                    'Server: ${server ?? 'Unavailable'}',
+                    if (chat.selectedModel.isNotEmpty) 'Model: ${chat.selectedModel}',
+                  ].join(' · '),
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ),
             for (final item in <(String, String)>[
-              if (controller.conversation?.id == chat.id && onFind != null)
-                ('find', 'Find in chat'),
+              if (visible && onFind != null) ('find', 'Find in chat'),
+              if (visible && controller.hasRecoveryCheckpoint(chat.id))
+                ('restore', 'Restore previous conversation'),
               ('rename', 'Rename'),
               ('pin', chat.isPinned ? 'Unpin' : 'Pin'),
               ('archive', chat.isArchived ? 'Unarchive' : 'Archive'),
@@ -104,6 +175,10 @@ Future<void> showChatActions(
   if (!context.mounted || action == null) return;
   if (action == 'find') {
     onFind?.call();
+    return;
+  }
+  if (action == 'restore') {
+    await restorePreviousConversation(context, controller, chat.id);
     return;
   }
   if (action == 'settings') {
