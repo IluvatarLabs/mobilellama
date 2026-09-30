@@ -32,7 +32,7 @@ class ConversationStore {
         const IdentityAttachmentReferenceCodec(),
   }) : _referenceCodec = referenceCodec;
 
-  static const schemaVersion = 8;
+  static const schemaVersion = 9;
   final SqliteDatabase _database;
   final AttachmentReferenceCodec _referenceCodec;
 
@@ -132,6 +132,17 @@ class ConversationStore {
                conversation_id, position ASC, created_at ASC, id ASC
              )''');
         await database.execute('PRAGMA user_version = 8');
+      }
+      if (fromVersion < 9 && toVersion >= 9) {
+        // One local-only recovery snapshot per chat for the latest revision.
+        await database.execute('''CREATE TABLE recovery_checkpoints(
+             conversation_id TEXT PRIMARY KEY
+               REFERENCES conversations(id) ON DELETE CASCADE,
+             from_position INTEGER NOT NULL CHECK(from_position >= 0),
+             messages_json TEXT NOT NULL,
+             created_at INTEGER NOT NULL
+           )''');
+        await database.execute('PRAGMA user_version = 9');
       }
     });
   }
@@ -272,8 +283,87 @@ class ConversationStore {
         return true;
       }
     }
+
+    final checkpointRows = await _database.query(
+      'SELECT messages_json FROM recovery_checkpoints',
+    );
+    for (final row in checkpointRows) {
+      if (_referencesInMessages(_decodeCheckpointMessages(row['messages_json']))
+          .contains(reference)) {
+        return true;
+      }
+    }
     return false;
   }
+
+  /// Conversation IDs that currently retain a recovery checkpoint.
+  Future<Set<String>> recoveryCheckpointConversationIds() async {
+    final rows = await _database.query(
+      'SELECT conversation_id FROM recovery_checkpoints',
+    );
+    return {for (final row in rows) row['conversation_id']! as String};
+  }
+
+  /// Attachment references retained by [conversationId]'s checkpoint. Callers
+  /// still check [isAttachmentReferenceInUse] before deleting a file.
+  Future<List<String>> recoveryCheckpointReferences(
+    String conversationId,
+  ) async {
+    final rows = await _database.query(
+      '''SELECT messages_json FROM recovery_checkpoints
+         WHERE conversation_id = ? LIMIT 1''',
+      <Object?>[conversationId],
+    );
+    if (rows.isEmpty) return const <String>[];
+    return _referencesInMessages(
+      _decodeCheckpointMessages(rows.single['messages_json']),
+    ).toList(growable: false);
+  }
+
+  /// Atomically replaces the revision tail with the checkpoint and consumes
+  /// it. Returns attachment references from the discarded revision tail, which
+  /// the caller may delete once they are no longer in use.
+  Future<List<String>> restoreRecoveryCheckpoint(
+    String conversationId,
+  ) => _database.transaction((database) async {
+    final rows = await database.query(
+      '''SELECT from_position, messages_json FROM recovery_checkpoints
+             WHERE conversation_id = ? LIMIT 1''',
+      <Object?>[conversationId],
+    );
+    if (rows.isEmpty) {
+      throw StateError('No previous conversation is available to restore.');
+    }
+    final fromPosition = _readInt(rows.single['from_position']);
+    final restored = _decodeCheckpointMessages(rows.single['messages_json']);
+    final conversationRows = await database.query(
+      'SELECT is_renamed FROM conversations WHERE id = ? LIMIT 1',
+      <Object?>[conversationId],
+    );
+    if (conversationRows.isEmpty) {
+      throw StateError('Conversation $conversationId does not exist.');
+    }
+    final removed = await _loadTail(database, conversationId, fromPosition);
+    await database.execute(
+      'DELETE FROM messages WHERE conversation_id = ? AND position >= ?',
+      <Object?>[conversationId, fromPosition],
+    );
+    for (final message in restored) {
+      _validateMessage(message);
+      await _insertMessage(database, message);
+      await _replaceMessageParts(database, message);
+    }
+    await database.execute(
+      'DELETE FROM recovery_checkpoints WHERE conversation_id = ?',
+      <Object?>[conversationId],
+    );
+    await _updateTitleAfterTailChange(
+      database,
+      conversationId,
+      explicitlyRenamed: _readInt(conversationRows.single['is_renamed']) == 1,
+    );
+    return _referencesInMessages(removed).toList(growable: false);
+  });
 
   Future<List<Conversation>> listAllConversations({
     bool includeEmpty = false,
@@ -693,6 +783,11 @@ class ConversationStore {
            WHERE conversation_id = ? AND id = ? AND position = ?''',
         <Object?>[conversationId, prompt.id, originalPosition],
       );
+      // A committed new user turn ends the previous revision's recovery.
+      await database.execute(
+        'DELETE FROM recovery_checkpoints WHERE conversation_id = ?',
+        <Object?>[conversationId],
+      );
       return QueuedPromptClaim(
         prompt: prompt,
         userMessage: user,
@@ -935,14 +1030,26 @@ class ConversationStore {
           conversationId,
         ],
       );
+      await database.execute(
+        'DELETE FROM recovery_checkpoints WHERE conversation_id = ?',
+        <Object?>[conversationId],
+      );
     }
     return message;
   });
 
-  Future<void> replaceConversationTail({
+  /// Replaces messages from [fromPosition]. With [saveRecoveryCheckpoint],
+  /// the removed tail becomes the chat's single recovery checkpoint in the
+  /// same transaction, replacing any earlier checkpoint.
+  ///
+  /// Returns attachment references that the replacement may have released
+  /// (from the removed tail and any replaced checkpoint). Callers must still
+  /// check [isAttachmentReferenceInUse] before deleting a file.
+  Future<List<String>> replaceConversationTail({
     required String conversationId,
     required int fromPosition,
     Message? replacement,
+    bool saveRecoveryCheckpoint = false,
   }) async {
     if (conversationId.trim().isEmpty) {
       throw ArgumentError.value(
@@ -972,7 +1079,7 @@ class ConversationStore {
       _validateMessage(replacement);
     }
 
-    await _database.transaction((database) async {
+    return _database.transaction((database) async {
       final conversationRows = await database.query(
         'SELECT is_renamed FROM conversations WHERE id = ? LIMIT 1',
         <Object?>[conversationId],
@@ -1007,6 +1114,33 @@ class ConversationStore {
         );
       }
 
+      final removed = await _loadTail(database, conversationId, fromPosition);
+      final released = <String>{..._referencesInMessages(removed)};
+      if (saveRecoveryCheckpoint) {
+        final previous = await database.query(
+          '''SELECT messages_json FROM recovery_checkpoints
+             WHERE conversation_id = ? LIMIT 1''',
+          <Object?>[conversationId],
+        );
+        for (final row in previous) {
+          released.addAll(
+            _referencesInMessages(
+              _decodeCheckpointMessages(row['messages_json']),
+            ),
+          );
+        }
+        await database.execute(
+          '''INSERT OR REPLACE INTO recovery_checkpoints(
+               conversation_id, from_position, messages_json, created_at
+             ) VALUES(?, ?, ?, ?)''',
+          <Object?>[
+            conversationId,
+            fromPosition,
+            jsonEncode(removed.map(_encodeCheckpointMessage).toList()),
+            _toEpoch(DateTime.now().toUtc()),
+          ],
+        );
+      }
       await database.execute(
         'DELETE FROM messages WHERE conversation_id = ? AND position >= ?',
         <Object?>[conversationId, fromPosition],
@@ -1016,40 +1150,136 @@ class ConversationStore {
         await _replaceMessageParts(database, replacement);
       }
 
-      final timestamp = DateTime.now().toUtc();
-      final explicitlyRenamed =
-          _readInt(conversationRows.single['is_renamed']) == 1;
-      if (explicitlyRenamed) {
-        await database.execute(
-          'UPDATE conversations SET updated_at = ? WHERE id = ?',
-          <Object?>[_toEpoch(timestamp), conversationId],
-        );
-        return;
-      }
-
-      final firstUserRows = await database.query(
-        '''SELECT content FROM messages
-           WHERE conversation_id = ? AND role = 'user'
-           ORDER BY position ASC LIMIT 1''',
-        <Object?>[conversationId],
+      await _updateTitleAfterTailChange(
+        database,
+        conversationId,
+        explicitlyRenamed: _readInt(conversationRows.single['is_renamed']) == 1,
       );
-      final hasUserMessage = firstUserRows.isNotEmpty;
-      final title = hasUserMessage
-          ? titleFromFirstUserText(firstUserRows.single['content']! as String)
-          : 'New chat';
-      await database.execute(
-        '''UPDATE conversations
-           SET title = ?, title_from_first_user = ?, updated_at = ?
-           WHERE id = ?''',
-        <Object?>[
-          title,
-          hasUserMessage ? 1 : 0,
-          _toEpoch(timestamp),
-          conversationId,
-        ],
-      );
+      return released.toList(growable: false);
     });
   }
+
+  Future<List<Message>> _loadTail(
+    SqliteDatabase database,
+    String conversationId,
+    int fromPosition,
+  ) async {
+    final rows = await database.query(
+      '''SELECT * FROM messages WHERE conversation_id = ? AND position >= ?
+         ORDER BY position ASC, created_at ASC, id ASC''',
+      <Object?>[conversationId, fromPosition],
+    );
+    return [for (final row in rows) await _messageFromDatabase(database, row)];
+  }
+
+  static Set<String> _referencesInMessages(Iterable<Message> messages) => {
+    for (final message in messages) ...[
+      ...message.imageReferences,
+      ...message.documents.map((document) => document.reference),
+    ],
+  };
+
+  /// Recomputes an automatically derived title from the first user turn and
+  /// preserves an explicit name.
+  Future<void> _updateTitleAfterTailChange(
+    SqliteDatabase database,
+    String conversationId, {
+    required bool explicitlyRenamed,
+  }) async {
+    final timestamp = DateTime.now().toUtc();
+    if (explicitlyRenamed) {
+      await database.execute(
+        'UPDATE conversations SET updated_at = ? WHERE id = ?',
+        <Object?>[_toEpoch(timestamp), conversationId],
+      );
+      return;
+    }
+    final firstUserRows = await database.query(
+      '''SELECT content FROM messages
+         WHERE conversation_id = ? AND role = 'user'
+         ORDER BY position ASC LIMIT 1''',
+      <Object?>[conversationId],
+    );
+    final hasUserMessage = firstUserRows.isNotEmpty;
+    final title = hasUserMessage
+        ? titleFromFirstUserText(firstUserRows.single['content']! as String)
+        : 'New chat';
+    await database.execute(
+      '''UPDATE conversations
+         SET title = ?, title_from_first_user = ?, updated_at = ?
+         WHERE id = ?''',
+      <Object?>[
+        title,
+        hasUserMessage ? 1 : 0,
+        _toEpoch(timestamp),
+        conversationId,
+      ],
+    );
+  }
+
+  Map<String, Object?> _encodeCheckpointMessage(Message message) => {
+    'id': message.id,
+    'conversationId': message.conversationId,
+    'position': message.position,
+    'role': message.role.name,
+    'status': message.status.name,
+    'content': message.content,
+    'reasoning': message.reasoning,
+    'providerTranscriptJson': message.providerTranscriptJson,
+    'images': message.imageReferences.map(_referenceCodec.encode).toList(),
+    'documents': jsonDecode(_encodeDocuments(message.documents)),
+    'toolCalls': message.toolCalls.map((call) => call.toJson()).toList(),
+    'toolResults': message.toolResults
+        .map((result) => result.toJson())
+        .toList(),
+    'createdAt': _toEpoch(message.createdAt),
+    'updatedAt': _toEpoch(message.updatedAt),
+  };
+
+  List<Message> _decodeCheckpointMessages(Object? value) {
+    if (value is! String) {
+      throw const FormatException('recovery checkpoint must be JSON text');
+    }
+    final decoded = jsonDecode(value);
+    if (decoded is! List) {
+      throw const FormatException('recovery checkpoint must be a JSON array');
+    }
+    return [
+      for (final entry in decoded)
+        if (entry is Map)
+          _decodeCheckpointMessage(Map<String, Object?>.from(entry))
+        else
+          throw const FormatException('checkpoint message must be an object'),
+    ];
+  }
+
+  Message _decodeCheckpointMessage(Map<String, Object?> json) => Message(
+    id: json['id']! as String,
+    conversationId: json['conversationId']! as String,
+    position: _readInt(json['position']),
+    role: _enumByName(MessageRole.values, json['role']! as String),
+    status: _enumByName(MessageStatus.values, json['status']! as String),
+    content: json['content']! as String,
+    reasoning: json['reasoning'] as String?,
+    providerTranscriptJson: json['providerTranscriptJson'] as String?,
+    imageReferences: List<String>.unmodifiable([
+      for (final reference in json['images']! as List)
+        _referenceCodec.decode(reference as String),
+    ]),
+    documents: List<DocumentAttachment>.unmodifiable(
+      _decodeDocuments(jsonEncode(json['documents'])),
+    ),
+    toolCalls: List<ToolCall>.unmodifiable([
+      for (final call in json['toolCalls']! as List)
+        ToolCall.fromJson(Map<String, Object?>.from(call as Map)),
+    ]),
+    toolResults: List<ToolResult>.unmodifiable([
+      for (final result in json['toolResults']! as List)
+        ToolResult.fromJson(Map<String, Object?>.from(result as Map)),
+    ]),
+    createdAt: _fromEpoch(json['createdAt']),
+    updatedAt: _fromEpoch(json['updatedAt']),
+  );
 
   Future<void> importThreadsAtomically(List<ConversationThread> threads) async {
     _validateImportedThreads(threads);

@@ -21,6 +21,7 @@ final class ServerProfile {
     required ServerProtocol protocol,
     required String baseUrl,
     String? acknowledgedInsecureOrigin,
+    bool configured = true,
   }) {
     final normalizedId = id.trim();
     final normalizedName = name.trim();
@@ -42,6 +43,7 @@ final class ServerProfile {
       baseUrl: canonicalBaseUrl,
       acknowledgedInsecureOrigin:
           uri.scheme == 'http' && acknowledgedOrigin == origin ? origin : null,
+      configured: configured,
     );
   }
 
@@ -51,6 +53,7 @@ final class ServerProfile {
     required this.protocol,
     required this.baseUrl,
     required this.acknowledgedInsecureOrigin,
+    required this.configured,
   });
 
   final String id;
@@ -58,6 +61,10 @@ final class ServerProfile {
   final ServerProtocol protocol;
   final String baseUrl;
   final String? acknowledgedInsecureOrigin;
+
+  /// False only for the synthesized bootstrap profile of a fresh install that
+  /// the user has not saved through the connection form.
+  final bool configured;
 
   bool get insecureLanAcknowledged =>
       Uri.parse(baseUrl).scheme == 'http' &&
@@ -68,6 +75,7 @@ final class ServerProfile {
     ServerProtocol? protocol,
     String? baseUrl,
     Object? acknowledgedInsecureOrigin = _notProvided,
+    bool? configured,
   }) => ServerProfile(
     id: id,
     name: name ?? this.name,
@@ -77,6 +85,7 @@ final class ServerProfile {
         identical(acknowledgedInsecureOrigin, _notProvided)
         ? this.acknowledgedInsecureOrigin
         : acknowledgedInsecureOrigin as String?,
+    configured: configured ?? this.configured,
   );
 
   Map<String, Object?> toJson() => <String, Object?>{
@@ -86,6 +95,8 @@ final class ServerProfile {
     'baseUrl': baseUrl,
     if (acknowledgedInsecureOrigin != null)
       'acknowledgedInsecureOrigin': acknowledgedInsecureOrigin,
+    // Absent means configured, so every pre-existing stored profile keeps it.
+    if (!configured) 'configured': false,
   };
 
   factory ServerProfile.fromJson(Map<String, Object?> json) => ServerProfile(
@@ -94,6 +105,7 @@ final class ServerProfile {
     protocol: SettingsStore.readServerProtocol(json['protocol'] as String?),
     baseUrl: json['baseUrl']! as String,
     acknowledgedInsecureOrigin: json['acknowledgedInsecureOrigin'] as String?,
+    configured: json['configured'] != false,
   );
 
   static const Object _notProvided = Object();
@@ -145,6 +157,7 @@ class SettingsStore {
   static const _legacyServerProtocolKey = 'server_protocol';
   static const _legacyInsecureLanAcknowledgedOriginKey =
       'insecure_lan_acknowledged_origin';
+  static const _acknowledgedDestinationsKey = 'acknowledged_destinations_v1';
   static const _themeKey = 'theme';
   static const _webAgentEnabledKey = 'web_agent_enabled';
 
@@ -179,7 +192,12 @@ class SettingsStore {
 
   /// Persists the former single-server settings as the first named profile.
   /// The legacy keys remain readable but are no longer mutated.
-  Future<void> migrateLegacyProfile() async {
+  ///
+  /// A stored profile document, any legacy single-server key, or existing
+  /// local history ([hasLocalHistory]) is evidence of an existing installation,
+  /// whose profile stays configured. Only a fresh installation gets an
+  /// unconfigured bootstrap profile.
+  Future<void> migrateLegacyProfile({bool hasLocalHistory = false}) async {
     final current = _readProfileDocument();
     if (current != null) {
       if (current.activeProfileId == null ||
@@ -195,7 +213,9 @@ class SettingsStore {
       }
       return;
     }
-    final profile = _legacyProfile();
+    final profile = _legacyProfile(
+      configured: hasLocalHistory || _hasLegacyConfiguration,
+    );
     await _writeProfileDocument(
       _ProfileDocument(
         profiles: <ServerProfile>[profile],
@@ -203,6 +223,39 @@ class SettingsStore {
       ),
     );
   }
+
+  bool get _hasLegacyConfiguration =>
+      _preferences.getString(_legacyBaseUrlKey) != null ||
+      _preferences.getString(_legacyServerProtocolKey) != null ||
+      _preferences.getString(_legacyInsecureLanAcknowledgedOriginKey) != null;
+
+  /// Whether the user acknowledged sending chat content to this exact
+  /// protocol and canonical endpoint.
+  bool isDestinationAcknowledged(ServerProtocol protocol, String baseUrl) =>
+      _acknowledgedDestinations.contains(_destinationKey(protocol, baseUrl));
+
+  Future<void> acknowledgeDestination(ServerProtocol protocol, String baseUrl) {
+    final values = _acknowledgedDestinations
+      ..add(_destinationKey(protocol, baseUrl));
+    return _preferences.setString(
+      _acknowledgedDestinationsKey,
+      jsonEncode(values.toList()..sort()),
+    );
+  }
+
+  Set<String> get _acknowledgedDestinations {
+    final raw = _preferences.getString(_acknowledgedDestinationsKey);
+    if (raw == null) return <String>{};
+    try {
+      final decoded = jsonDecode(raw);
+      return decoded is List ? decoded.whereType<String>().toSet() : {};
+    } on FormatException {
+      return <String>{};
+    }
+  }
+
+  static String _destinationKey(ServerProtocol protocol, String baseUrl) =>
+      '${protocol.name} ${canonicalBaseUrl(baseUrl)}';
 
   LocalSettings load() {
     final profile = activeProfile;
@@ -371,14 +424,14 @@ class SettingsStore {
       _preferences.setBool(_webAgentEnabledKey, value);
 
   _ProfileDocument _legacyDocument() {
-    final profile = _legacyProfile();
+    final profile = _legacyProfile(configured: _hasLegacyConfiguration);
     return _ProfileDocument(
       profiles: <ServerProfile>[profile],
       activeProfileId: profile.id,
     );
   }
 
-  ServerProfile _legacyProfile() {
+  ServerProfile _legacyProfile({required bool configured}) {
     final rawBaseUrl =
         _preferences.getString(_legacyBaseUrlKey) ?? defaultBaseUrl;
     final baseUrl = canonicalBaseUrl(rawBaseUrl);
@@ -393,6 +446,7 @@ class SettingsStore {
       ),
       baseUrl: baseUrl,
       acknowledgedInsecureOrigin: acknowledgedOrigin,
+      configured: configured,
     );
   }
 
