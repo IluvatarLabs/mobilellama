@@ -106,6 +106,16 @@ void main() {
       await _queue(tester, harness.controller, 'QUEUE_ALPHA');
       await _queue(tester, harness.controller, 'QUEUE_EDIT_ME');
       await _queue(tester, harness.controller, 'QUEUE_REMOVE_ME');
+      // With the keyboard up the short viewport shows the queue summary.
+      if (tester.view.viewInsets.bottom > 0) {
+        expect(find.textContaining('3 queued'), findsOneWidget);
+      }
+      FocusManager.instance.primaryFocus?.unfocus();
+      await _pumpUntil(
+        tester,
+        () => find.text('Queued (3)').evaluate().isNotEmpty,
+        description: 'full queue panel after keyboard dismissal',
+      );
       expect(find.text('Queued (3)'), findsOneWidget);
 
       await tester.tap(find.byTooltip('Edit queued message').at(1));
