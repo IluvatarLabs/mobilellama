@@ -60,8 +60,9 @@ flutter run --dart-define=MOBILELLAMA_ICLOUD=false
 
 For iPhone signing and other build options, see [Building](docs/building.md).
 
-In the app, tap **Connect a server**, enter its URL and any required API key,
-then choose a model. Ollama URLs usually look like `http://192.168.1.10:11434`;
+In the app, tap **Connect a server**, choose the connection type, enter its URL
+and any required API key, tap **Save and connect**, then choose a model.
+Settings › Help & About has the same guidance offline. Ollama URLs usually look like `http://192.168.1.10:11434`;
 OpenAI-compatible URLs include `/v1`. Use your server's LAN address when
 connecting from a phone—`localhost` means the phone itself.
 

@@ -8,6 +8,7 @@ import '../chat/share_actions.dart';
 import '../data/settings_store.dart';
 import '../data/chat_sync.dart';
 import '../ui/design.dart';
+import 'help_about.dart';
 import 'settings_sheet.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -30,6 +31,9 @@ class _SettingsPageState extends State<SettingsPage> {
               SettingsSheet(controller: controller, section: section),
         ),
       );
+
+  Future<void> _push(BuildContext context, Widget page) =>
+      Navigator.push<void>(context, MaterialPageRoute(builder: (_) => page));
 
   Future<void> _backUpChats(BuildContext context) async {
     if (_dataAction != null) return;
@@ -171,30 +175,35 @@ class _SettingsPageState extends State<SettingsPage> {
       child: AnimatedBuilder(
         animation: controller,
         builder: (context, _) => ListView(
-          padding: const EdgeInsets.fromLTRB(14, 12, 14, 24),
+          padding: const EdgeInsets.fromLTRB(
+            Design.gutter,
+            Design.space3,
+            Design.gutter,
+            Design.space5,
+          ),
           children: [
             const Text(
               'Settings',
               style: TextStyle(fontSize: 23, fontWeight: FontWeight.w700),
             ),
             _Group(
-              title: 'App',
+              title: 'Connections',
               children: [
-                _Row(
-                  label: 'Appearance',
-                  value: switch (controller.themePreference) {
-                    ThemePreference.system => 'System',
-                    ThemePreference.light => 'Light',
-                    ThemePreference.dark => 'Dark',
-                  },
-                  onTap: () => _editor(context, SettingsSection.appearance),
-                ),
-                _Row(
-                  label: 'Web search',
-                  value: controller.webAgentEnabled ? 'On' : 'Off',
-                  detail: 'Applies across chats; runs only with tool-capable models.',
-                  onTap: () => _editor(context, SettingsSection.webAgent),
-                ),
+                if (controller.isConfigured)
+                  _Row(
+                    label: 'Servers',
+                    value:
+                        '${controller.profiles.where((p) => p.configured).length}',
+                    detail:
+                        'Addresses, keys, default models, and capabilities.',
+                    onTap: () => _editor(context, SettingsSection.servers),
+                  )
+                else
+                  _Row(
+                    label: 'Connect a server',
+                    detail: 'Models run on your own Ollama or OpenAI-compatible server.',
+                    onTap: () => showConnectionForm(context, controller),
+                  ),
               ],
             ),
             _Group(
@@ -222,18 +231,32 @@ class _SettingsPageState extends State<SettingsPage> {
               ],
             ),
             _Group(
-              title: 'Servers',
+              title: 'Appearance',
               children: [
                 _Row(
-                  label: 'Saved servers',
-                  value: '${controller.profiles.length}',
-                  detail: 'Connection, default model, and capability settings.',
-                  onTap: () => _editor(context, SettingsSection.servers),
+                  label: 'Theme',
+                  value: switch (controller.themePreference) {
+                    ThemePreference.system => 'System',
+                    ThemePreference.light => 'Light',
+                    ThemePreference.dark => 'Dark',
+                  },
+                  onTap: () => _editor(context, SettingsSection.appearance),
                 ),
               ],
             ),
             _Group(
-              title: 'Data',
+              title: 'Web search',
+              children: [
+                _Row(
+                  label: 'Web search',
+                  value: controller.webAgentEnabled ? 'On' : 'Off',
+                  detail: 'Optional. Uses Ollama cloud services with models that support tools.',
+                  onTap: () => _editor(context, SettingsSection.webAgent),
+                ),
+              ],
+            ),
+            _Group(
+              title: 'Data & sync',
               children: [
                 _Row(
                   label: 'Archived chats',
@@ -323,6 +346,34 @@ class _SettingsPageState extends State<SettingsPage> {
                       );
                     }
                   },
+                ),
+              ],
+            ),
+            _Group(
+              title: 'Help & About',
+              children: [
+                _Row(
+                  label: 'Connection help',
+                  onTap: () => _push(context, const ConnectionHelpPage()),
+                ),
+                _Row(
+                  label: 'Privacy',
+                  onTap: () => _push(context, const PrivacyInfoPage()),
+                ),
+                if (kPrivacyPolicyUrl.isNotEmpty)
+                  _Row(
+                    label: 'Privacy policy',
+                    onTap: () => openExternalUrl(context, kPrivacyPolicyUrl),
+                  ),
+                _Row(
+                  label: 'Report a problem',
+                  detail:
+                      'Opens GitHub issues. Nothing is attached automatically.',
+                  onTap: () => openExternalUrl(context, kIssuesUrl),
+                ),
+                _Row(
+                  label: 'About MobileLlama',
+                  onTap: () => _push(context, const AboutPage()),
                 ),
               ],
             ),
