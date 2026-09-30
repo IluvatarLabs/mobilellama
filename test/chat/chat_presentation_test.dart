@@ -236,7 +236,7 @@ void main() {
     );
     expect(field.controller!.text, 'Original question');
     expect(
-      find.text('This replaces this message and removes every reply after it.'),
+      find.textContaining('You can restore the previous conversation'),
       findsOneWidget,
     );
 
@@ -388,7 +388,7 @@ void main() {
     await tester.tap(find.text('Regenerate'));
     await tester.pumpAndSettle();
     expect(
-      find.text('This response and every message after it will be removed.'),
+      find.textContaining('You can restore the previous conversation'),
       findsOneWidget,
     );
     await tester.tap(find.widgetWithText(TextButton, 'Cancel'));

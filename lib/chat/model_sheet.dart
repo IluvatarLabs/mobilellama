@@ -4,7 +4,9 @@ import 'package:flutter/material.dart';
 
 import '../settings/settings_sheet.dart';
 import '../ui/design.dart';
+import 'chat_actions.dart';
 import 'chat_controller.dart';
+import 'model_management_page.dart';
 
 Future<void> showModelSheet(
   BuildContext context,
@@ -26,7 +28,10 @@ Future<void> showModelSheet(
     return;
   }
 
-  unawaited(controller.loadModelCapabilities());
+  final chatProfileId = controller.conversationProfile.id;
+  // Cached rows show immediately; the list refreshes separately and only the
+  // selected model's details load. Nothing here takes a global lock.
+  unawaited(controller.loadModelCapabilities(profileId: chatProfileId));
   await showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
@@ -36,13 +41,28 @@ Future<void> showModelSheet(
     builder: (context) => AnimatedBuilder(
       animation: controller,
       builder: (context, _) {
-        final ready = controller.conversationConnected;
-        final selected = controller.selectedModel;
-        final busy = !controller.canChangeContext;
         final profile = controller.conversationProfile;
+        final ready = controller.conversationConnected;
+        final selected = ready ? controller.selectedModel : null;
+        final busy = !controller.canChangeContext;
         final existingChat = controller.conversation != null;
-        Future<void> choose(String? model) async {
-          final success = await controller.selectModel(model!);
+        final models = controller.modelsForProfile(profile.id);
+        final refreshing =
+            controller.modelListRefreshing(profile.id) ||
+            controller.connectionStatusFor(profile.id) ==
+                ConnectionStatus.checking;
+        final listError = controller.modelListError(profile.id);
+        final stored = controller.conversation?.selectedModel;
+        final storedUnavailable =
+            stored != null &&
+            stored.isNotEmpty &&
+            ready &&
+            !refreshing &&
+            listError == null &&
+            !models.any((model) => model.name == stored);
+        final error = generalChatError(controller);
+        Future<void> choose(String model) async {
+          final success = await controller.selectModel(model);
           if (success && context.mounted) Navigator.pop(context);
         }
 
@@ -59,7 +79,7 @@ Future<void> showModelSheet(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   const SheetHandle(),
-                  SheetHeading(
+                  const SheetHeading(
                     title: 'Model',
                     closeLabel: 'Close model picker',
                   ),
@@ -72,60 +92,64 @@ Future<void> showModelSheet(
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
                   ),
-                  if (controller.errorMessage != null)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      child: Text(
-                        controller.errorMessage!,
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.error,
-                        ),
-                      ),
+                  if (error != null) _ErrorText(error),
+                  if (refreshing) const _RefreshingModels(),
+                  if (listError != null)
+                    _ListError(
+                      message: listError.message,
+                      onRetry: () =>
+                          controller.refreshModelList(profileId: profile.id),
                     ),
-                  if (controller.modelLoading || controller.profileMutationBusy)
-                    const LinearProgressIndicator(),
-                  if (!ready)
+                  if (!ready && !refreshing)
                     _ModelRow(
                       title: 'Connect to ${profile.name}',
                       subtitle: 'Saved messages are available offline.',
                       onTap: busy
                           ? null
                           : () async {
-                              await controller.connectConversation();
-                              unawaited(controller.loadModelCapabilities());
+                              if (await controller.connectConversation()) {
+                                unawaited(
+                                  controller.loadModelCapabilities(
+                                    profileId: profile.id,
+                                  ),
+                                );
+                              }
                             },
                     ),
-                  if (ready && controller.models.isEmpty)
+                  if (storedUnavailable)
                     _ModelRow(
-                      title: 'No models returned',
-                      subtitle: 'Tap to refresh',
-                      onTap: busy ? null : controller.refreshModels,
+                      title: stored,
+                      subtitle:
+                          'Unavailable on ${profile.name}. Choose another model.',
+                      onTap: null,
                     ),
-                  if (ready)
-                    for (final model in controller.models)
-                      _ModelRow(
-                        title: model.name,
-                        subtitle: [
-                          profile.name,
-                          if (controller
-                                  .detailsForModel(model.name)
-                                  ?.supportsThinking ??
-                              false)
-                            'Thinking',
-                          if (controller
-                                  .detailsForModel(model.name)
-                                  ?.supportsTools ??
-                              false)
-                            'Tools',
-                          if (controller
-                                  .detailsForModel(model.name)
-                                  ?.supportsVision ??
-                              false)
-                            'Images',
-                        ].join(' · '),
-                        selected: model.name == selected,
-                        onTap: busy ? null : () => choose(model.name),
+                  if (ready &&
+                      models.isEmpty &&
+                      !refreshing &&
+                      listError == null)
+                    _NoModels(controller: controller, profileId: profile.id),
+                  for (final model in models)
+                    _ModelRow(
+                      title: model.name,
+                      subtitle: _modelSubtitle(
+                        controller,
+                        model.name,
+                        profile.id,
+                        profile.name,
                       ),
+                      selected: model.name == selected,
+                      detailsFailed:
+                          controller.modelDetailsError(
+                            model.name,
+                            profileId: profile.id,
+                          ) !=
+                          null,
+                      onRetryDetails: () => controller.loadModelDetails(
+                        model.name,
+                        profileId: profile.id,
+                      ),
+                      onTap: ready && !busy ? () => choose(model.name) : null,
+                    ),
                   _ModelRow(
                     title: existingChat
                         ? 'New chat on another server'
@@ -159,6 +183,144 @@ Future<void> showModelSheet(
   );
 }
 
+/// Known capabilities fill in progressively; unknown ones stay unstated.
+String _modelSubtitle(
+  ChatController controller,
+  String model,
+  String profileId,
+  String profileName,
+) {
+  if (controller.modelDetailsError(model, profileId: profileId) != null) {
+    return '$profileName · Details unavailable';
+  }
+  if (controller.modelDetailsLoading(model, profileId: profileId)) {
+    return '$profileName · Loading details…';
+  }
+  final details = controller.detailsForModel(model, profileId: profileId);
+  return [
+    profileName,
+    if (details?.supportsThinking ?? false) 'Thinking',
+    if (details?.supportsTools ?? false) 'Tools',
+    if (details?.supportsVision ?? false) 'Images',
+  ].join(' · ');
+}
+
+class _ErrorText extends StatelessWidget {
+  const _ErrorText(this.message);
+  final String message;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 8),
+    child: Text(
+      message,
+      style: TextStyle(color: Theme.of(context).colorScheme.error),
+    ),
+  );
+}
+
+class _RefreshingModels extends StatelessWidget {
+  const _RefreshingModels();
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+    liveRegion: true,
+    child: Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        children: <Widget>[
+          const SizedBox.square(
+            dimension: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: Design.space2),
+          Expanded(
+            child: Text(
+              'Refreshing models…',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+/// A list refresh failure keeps cached rows and offers Retry in place.
+class _ListError extends StatelessWidget {
+  const _ListError({required this.message, required this.onRetry});
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) => Row(
+    children: <Widget>[
+      Expanded(
+        child: Text(
+          message,
+          style: TextStyle(color: Theme.of(context).colorScheme.error),
+        ),
+      ),
+      TextButton(
+        style: TextButton.styleFrom(
+          minimumSize: const Size(Design.target, Design.target),
+        ),
+        onPressed: onRetry,
+        child: const Text('Retry'),
+      ),
+    ],
+  );
+}
+
+/// A reachable server without models is a usable state, not an error.
+class _NoModels extends StatelessWidget {
+  const _NoModels({required this.controller, required this.profileId});
+  final ChatController controller;
+  final String profileId;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 8),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        const Text('Server is reachable but has no available models'),
+        Wrap(
+          spacing: Design.space2,
+          children: <Widget>[
+            TextButton(
+              style: TextButton.styleFrom(
+                minimumSize: const Size(Design.target, Design.target),
+              ),
+              onPressed: () =>
+                  controller.refreshModelList(profileId: profileId),
+              child: const Text('Refresh'),
+            ),
+            if (controller.canManageModelsForProfile(profileId))
+              TextButton(
+                style: TextButton.styleFrom(
+                  minimumSize: const Size(Design.target, Design.target),
+                ),
+                onPressed: () => Navigator.push<void>(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => ModelManagementPage(
+                      controller: controller,
+                      profileId: profileId,
+                    ),
+                  ),
+                ),
+                child: const Text('Manage models'),
+              ),
+          ],
+        ),
+      ],
+    ),
+  );
+}
+
 class _DefaultModelPicker extends StatefulWidget {
   const _DefaultModelPicker({
     required this.controller,
@@ -173,8 +335,6 @@ class _DefaultModelPicker extends StatefulWidget {
 }
 
 class _DefaultModelPickerState extends State<_DefaultModelPicker> {
-  List<ChatModelOption> _models = const [];
-  bool _loading = true;
   bool _saving = false;
   String? _error;
 
@@ -191,33 +351,18 @@ class _DefaultModelPickerState extends State<_DefaultModelPicker> {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) unawaited(_load());
-    });
-  }
-
-  Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    try {
-      final models = await controller.loadModelsForProfile(widget.profileId);
-      if (mounted) setState(() => _models = models);
-    } on Object catch (error) {
       if (mounted) {
-        setState(() {
-          _models = const [];
-          _error = controller.errorMessage ?? error.toString();
-        });
+        unawaited(controller.refreshModelList(profileId: widget.profileId));
       }
-    } finally {
-      if (mounted) setState(() => _loading = false);
-    }
+    });
   }
 
   Future<void> _choose(String? model) async {
-    if (_loading || _saving || !controller.canChangeContext) return;
-    setState(() => _saving = true);
+    if (_saving || !controller.canChangeContext) return;
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
     final saved = await controller.setDefaultModelFor(widget.profileId, model);
     if (!mounted) return;
     if (saved) {
@@ -227,74 +372,87 @@ class _DefaultModelPickerState extends State<_DefaultModelPicker> {
     setState(() {
       _saving = false;
       _error =
-          controller.errorMessage ?? 'The default model could not be saved.';
+          generalChatError(controller) ??
+          'The default model could not be saved.';
     });
   }
 
   @override
-  Widget build(BuildContext context) {
-    final selected = controller.defaultModelFor(widget.profileId);
-    final busy = _loading || _saving || !controller.canChangeContext;
-    return SafeArea(
-      top: false,
-      child: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxHeight: MediaQuery.sizeOf(context).height * .8,
-        ),
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 26),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[
-              const SheetHandle(),
-              SheetHeading(
-                title: 'Default model for $_profileName',
-                closeLabel: 'Close default model picker',
-              ),
-              Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: Text(
-                  'Applies to future chats on $_profileName. Existing chats keep their model.',
-                  style: Theme.of(context).textTheme.bodySmall,
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: controller,
+    builder: (context, _) {
+      final id = widget.profileId;
+      final selected = controller.defaultModelFor(id);
+      final models = controller.modelsForProfile(id);
+      final refreshing = controller.modelListRefreshing(id);
+      final listError = controller.modelListError(id);
+      final busy = _saving || !controller.canChangeContext;
+      final storedUnavailable =
+          selected != null &&
+          models.isNotEmpty &&
+          !refreshing &&
+          !models.any((model) => model.name == selected);
+      return SafeArea(
+        top: false,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(context).height * .8,
+          ),
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 26),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                const SheetHandle(),
+                SheetHeading(
+                  title: 'Default model for $_profileName',
+                  closeLabel: 'Close default model picker',
                 ),
-              ),
-              if (_loading || _saving) const LinearProgressIndicator(),
-              if (_error case final error?)
                 Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  padding: const EdgeInsets.only(bottom: 12),
                   child: Text(
-                    error,
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
-                    ),
+                    'Applies to future chats on $_profileName. Existing chats keep their model.',
+                    style: Theme.of(context).textTheme.bodySmall,
                   ),
                 ),
-              _ModelRow(
-                title: 'Last used',
-                subtitle: 'Use the latest model chosen on $_profileName',
-                selected: selected == null,
-                onTap: busy ? null : () => _choose(null),
-              ),
-              for (final model in _models)
+                if (refreshing) const _RefreshingModels(),
+                if (_saving) const LinearProgressIndicator(),
+                if (_error case final error?) _ErrorText(error),
+                if (listError != null)
+                  _ListError(
+                    message: listError.message,
+                    onRetry: () => controller.refreshModelList(profileId: id),
+                  ),
                 _ModelRow(
-                  title: model.name,
-                  subtitle: _profileName,
-                  selected: selected == model.name,
-                  onTap: busy ? null : () => _choose(model.name),
+                  title: 'Last used',
+                  subtitle: 'Use the latest model chosen on $_profileName',
+                  selected: selected == null,
+                  onTap: busy ? null : () => _choose(null),
                 ),
-              if (!_loading && _models.isEmpty)
-                _ModelRow(
-                  title: 'No models returned',
-                  subtitle: 'Tap to try $_profileName again',
-                  onTap: _saving ? null : _load,
-                ),
-            ],
+                if (storedUnavailable)
+                  _ModelRow(
+                    title: selected,
+                    subtitle:
+                        'Unavailable on $_profileName. Choose another model.',
+                    onTap: null,
+                  ),
+                for (final model in models)
+                  _ModelRow(
+                    title: model.name,
+                    subtitle: _profileName,
+                    selected: selected == model.name,
+                    onTap: busy ? null : () => _choose(model.name),
+                  ),
+                if (!refreshing && listError == null && models.isEmpty)
+                  _NoModels(controller: controller, profileId: id),
+              ],
+            ),
           ),
         ),
-      ),
-    );
-  }
+      );
+    },
+  );
 }
 
 class _ModelRow extends StatelessWidget {
@@ -304,12 +462,18 @@ class _ModelRow extends StatelessWidget {
     required this.onTap,
     this.selected = false,
     this.trailing,
+    this.detailsFailed = false,
+    this.onRetryDetails,
   });
   final String title;
   final String subtitle;
   final VoidCallback? onTap;
   final bool selected;
   final Widget? trailing;
+
+  /// This model's details failed to load; offer a local retry.
+  final bool detailsFailed;
+  final VoidCallback? onRetryDetails;
   @override
   Widget build(BuildContext context) => DecoratedBox(
     decoration: BoxDecoration(
@@ -330,14 +494,29 @@ class _ModelRow extends StatelessWidget {
           color: Theme.of(context).colorScheme.onSurfaceVariant,
         ),
       ),
-      trailing: selected
-          ? const Icon(
+      selected: selected,
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          if (detailsFailed && onRetryDetails != null)
+            TextButton(
+              style: TextButton.styleFrom(
+                minimumSize: const Size(Design.target, Design.target),
+              ),
+              onPressed: onRetryDetails,
+              child: Text('Retry', semanticsLabel: 'Retry details for $title'),
+            ),
+          if (selected)
+            const Icon(
               Icons.check,
               color: Design.accent,
               size: 23,
               semanticLabel: 'Selected',
             )
-          : trailing,
+          else
+            ?trailing,
+        ],
+      ),
       onTap: onTap,
     ),
   );

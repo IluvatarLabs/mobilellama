@@ -7,13 +7,73 @@ import 'package:flutter_math_fork/flutter_math.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:mobollama/chat/attachment_strip.dart';
+import 'package:mobollama/chat/chat_screen.dart';
 import 'package:mobollama/chat/composer.dart';
 import 'package:mobollama/chat/find_in_chat.dart';
 import 'package:mobollama/chat/queue_panel.dart';
 import 'package:mobollama/chat/transcript.dart';
 import 'package:mobollama/domain/queued_prompt.dart';
 
+import '../support/chat_fixture.dart';
+
 void main() {
+  testWidgets(
+    'header names each chat destination and a failed revision restores from its answer',
+    (tester) async {
+      final fixture = ChatFixture();
+      await tester.runAsync(() async {
+        await fixture.open();
+        await fixture.seed('home-chat', content: 'Original answer');
+        await fixture.seed('lab-chat', profile: 'lab');
+        await fixture.controller.initialize();
+        await fixture.controller.openConversation('lab-chat');
+      });
+      await tester.pumpWidget(
+        MaterialApp(home: ChatScreen(controller: fixture.controller)),
+      );
+      await tester.pump();
+      expect(find.text('Lab · Ready'), findsOneWidget);
+
+      await tester.runAsync(() async {
+        await fixture.controller.openConversation('home-chat');
+        fixture.failNextResponses = 1;
+        await fixture.controller.regenerateAssistant('home-chat-assistant');
+      });
+      await tester.pump();
+      expect(find.text('Lab · Ready'), findsNothing);
+      expect(find.textContaining('Home · '), findsOneWidget);
+      expect(find.text('Original answer'), findsNothing);
+      expect(
+        find.text('Available until you send or revise another message.'),
+        findsOneWidget,
+      );
+
+      await tester.tap(
+        find.widgetWithText(TextButton, 'Restore previous conversation'),
+      );
+      // Restore runs real database work; let it finish between frames.
+      for (var i = 0; i < 5; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 20)),
+        );
+        await tester.pump();
+      }
+      expect(find.text('Original answer'), findsOneWidget);
+      expect(fixture.controller.hasRecoveryCheckpoint('home-chat'), isFalse);
+      await tester.pumpWidget(const SizedBox());
+      // Shutdown mixes fake-zone draft writes with real database work.
+      var closed = false;
+      unawaited(fixture.close().whenComplete(() => closed = true));
+      for (var i = 0; i < 50 && !closed; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 10)),
+        );
+        await tester.pump();
+      }
+      expect(closed, isTrue);
+    },
+  );
+
   testWidgets('streaming keeps Stop separate from the queued send action', (
     tester,
   ) async {
