@@ -1,7 +1,10 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
+import 'package:url_launcher/url_launcher.dart';
 
+import '../data/settings_store.dart';
 import '../domain/conversation.dart';
 import '../domain/document_attachment.dart';
 import '../ui/design.dart';
@@ -30,10 +33,86 @@ class _ChatScreenState extends State<ChatScreen> {
 
   ChatController get controller => widget.controller;
 
+  // Announcement tracking: completion and failure are announced once, without
+  // moving focus away from the draft.
+  String? _announcedChatId;
+  bool _wasStreaming = false;
+  ChatFailure? _announcedFailure;
+
+  @override
+  void initState() {
+    super.initState();
+    controller.addListener(_announceChanges);
+  }
+
+  @override
+  void didUpdateWidget(ChatScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_announceChanges);
+      widget.controller.addListener(_announceChanges);
+    }
+  }
+
   @override
   void dispose() {
+    controller.removeListener(_announceChanges);
     _findController.dispose();
     super.dispose();
+  }
+
+  void _announceChanges() {
+    if (!mounted) return;
+    final chatId = controller.conversation?.id;
+    final streaming = controller.isStreaming;
+    final failure = controller.conversationFailure;
+    String? message;
+    if (chatId == _announcedChatId) {
+      if (failure != null && failure != _announcedFailure) {
+        message = failure.message;
+      } else if (_wasStreaming && !streaming && failure == null) {
+        message = 'Response complete.';
+      }
+    }
+    _announcedChatId = chatId;
+    _wasStreaming = streaming;
+    _announcedFailure = failure;
+    if (message != null) {
+      SemanticsService.sendAnnouncement(
+        View.of(context),
+        message,
+        Directionality.of(context),
+      );
+    }
+  }
+
+  /// Opens the connection form directly. Returns true only when Save and
+  /// connect succeeded.
+  Future<bool> _openConnectionForm({ServerProfile? profile}) =>
+      _openServerSettings(); // WIRE: showConnectionForm(context, controller, profile: profile)
+
+  /// Interim entry until the direct connection form is wired.
+  Future<bool> _openServerSettings() async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SettingsSheet(
+          controller: controller,
+          section: SettingsSection.servers,
+        ),
+      ),
+    );
+    return controller.conversationConnected;
+  }
+
+  /// First connection: form, then model selection when no valid model is
+  /// configured; the picker returns to the chat with its destination shown.
+  Future<void> _connectServer() async {
+    final connected = await _openConnectionForm();
+    if (!connected || !mounted) return;
+    if (controller.conversationConnected && controller.selectedModel == null) {
+      await showModelSheet(context, controller);
+    }
   }
 
   Future<bool> _newChat(BuildContext context) async {
@@ -69,15 +148,16 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: controller,
     builder: (context, _) {
-      final colors = Theme.of(context).colorScheme;
       final media = MediaQuery.of(context);
       // Compact chrome when the keyboard or landscape leaves little height;
-      // grow with the title's text size so scaled text is never clipped.
+      // grow with the header's two lines so scaled text is never clipped.
       final shortScreen =
           media.size.height - media.viewInsets.bottom - media.padding.top < 480;
       final toolbarHeight = math.max(
         shortScreen ? 52.0 : 64.0,
-        media.textScaler.scale(16) * 1.3 + Design.space2,
+        media.textScaler.scale(16) * 1.3 +
+            media.textScaler.scale(12) * 1.35 +
+            Design.space2,
       );
       return Scaffold(
         drawerScrimColor: Design.ink.withValues(alpha: .54),
@@ -103,35 +183,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           titleSpacing: 0,
           centerTitle: true,
-          title: TextButton(
-            onPressed: () => showModelSheet(context, controller),
-            style: TextButton.styleFrom(
-              foregroundColor: colors.onSurface,
-              minimumSize: const Size(44, 44),
-              padding: const EdgeInsets.symmetric(horizontal: 4),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Flexible(
-                  child: Text(
-                    controller.conversationConnected
-                        ? (controller.selectedModel ?? 'Choose model')
-                        : (controller.conversation?.selectedModel ??
-                              'MobileLlama'),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 5),
-                const DesignIcon('down', size: 15),
-              ],
-            ),
-          ),
+          title: _ChatHeaderTitle(controller: controller),
           actions: [
             RoundAction(
               label: 'New chat',
@@ -157,20 +209,100 @@ class _ChatScreenState extends State<ChatScreen> {
         body: _ChatBody(
           controller: controller,
           findController: _findController,
+          onConnectServer: _connectServer,
+          onEditConnection: () =>
+              _openConnectionForm(profile: controller.conversationProfile),
         ),
       );
     },
   );
 }
 
+/// Model selection plus the chat's destination and connection status as a
+/// secondary line. Text truncates visually; semantics keep the full values.
+class _ChatHeaderTitle extends StatelessWidget {
+  const _ChatHeaderTitle({required this.controller});
+  final ChatController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final status = controller.conversationConnectionStatus;
+    final destination = status == ConnectionStatus.notConfigured
+        ? status.label
+        : '${controller.conversationDestinationName} · ${status.label}';
+    final model = controller.conversationConnected
+        ? (controller.selectedModel ?? 'Choose model')
+        : (controller.conversation?.selectedModel ?? 'MobileLlama');
+    return TextButton(
+      onPressed: () => showModelSheet(context, controller),
+      style: TextButton.styleFrom(
+        foregroundColor: colors.onSurface,
+        minimumSize: const Size(44, 44),
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Flexible(
+                child: Text(
+                  model,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 5),
+              const DesignIcon('down', size: 15),
+            ],
+          ),
+          Semantics(
+            liveRegion: true,
+            child: Text(
+              destination,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w400,
+                color: colors.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _ChatBody extends StatelessWidget {
-  const _ChatBody({required this.controller, required this.findController});
+  const _ChatBody({
+    required this.controller,
+    required this.findController,
+    required this.onConnectServer,
+    required this.onEditConnection,
+  });
   final ChatController controller;
   final ChatFindController findController;
+  final Future<void> Function() onConnectServer;
+  final Future<bool> Function() onEditConnection;
 
   /// Body height below which queue and attachment previews collapse to
   /// summaries and the composer uses compact padding.
   static const double _shortHeight = 420;
+
+  /// Recovery actions that concern the connection rather than one request.
+  static const Set<ChatRecoveryAction> _connectionActions = {
+    ChatRecoveryAction.retryConnection,
+    ChatRecoveryAction.editConnection,
+    ChatRecoveryAction.openSystemSettings,
+  };
 
   bool get _hasAttachments =>
       controller.pendingImageReferences.isNotEmpty ||
@@ -178,38 +310,144 @@ class _ChatBody extends StatelessWidget {
 
   bool get _imagesUnsupported =>
       controller.pendingImageReferences.isNotEmpty &&
-      controller.conversationConnected &&
-      controller.selectedModel != null &&
-      !controller.supportsImages;
+      controller.imagesSupported == false;
+
+  bool get _checking =>
+      controller.conversationConnectionStatus == ConnectionStatus.checking;
 
   /// Why Send/Queue is unavailable, or null when it is available.
-  String? get _submitUnavailableReason {
-    if (!controller.conversationConnected) {
-      return controller.conversation == null
-          ? 'Connect a server to send.'
-          : 'Connect to ${controller.conversationProfile.name} to send.';
+  String? get _submitUnavailableReason =>
+      switch (controller.submitAvailability) {
+        SubmitAvailability.noConnection => 'Connect a server to send',
+        SubmitAvailability.unavailable =>
+          '${controller.conversationDestinationName} is unavailable',
+        SubmitAvailability.noModel => 'Choose a model to send',
+        SubmitAvailability.localMutation => 'Saving…',
+        SubmitAvailability.streaming ||
+        SubmitAvailability.queuePaused ||
+        SubmitAvailability.ready =>
+          _imagesUnsupported
+              ? 'This model can’t read images. Remove them or choose another model.'
+              : null,
+      };
+
+  /// The chat's request failure, when it belongs to a visible message.
+  bool _failureOnMessage(ChatFailure failure) =>
+      failure.messageId != null &&
+      controller.transcriptMessages.any(
+        (message) => message.id == failure.messageId,
+      );
+
+  /// A profile-level failure shown as a compact banner, unless the chat's
+  /// own failure already says the same thing.
+  ChatFailure? get _connectionBanner {
+    final failure = controller.conversationConnectionFailure;
+    if (failure == null) return null;
+    if (failure.message == controller.conversationFailure?.message) {
+      return null;
     }
-    if (controller.selectedModel == null) return 'Choose a model to send.';
-    if (_imagesUnsupported) {
-      return 'This model can’t read images. Remove them or choose another model.';
-    }
-    if (!controller.canQueueOrSend) {
-      return 'Wait for the current action to finish.';
-    }
-    return null;
+    return failure;
   }
 
-  Future<void> _connect(BuildContext context) async {
-    if (controller.conversation == null) {
-      await Navigator.push<void>(
-        context,
-        MaterialPageRoute(
-          builder: (_) => SettingsSheet(controller: controller),
-        ),
-      );
-    } else {
-      await controller.connectConversation();
+  Future<void> _connect() => controller.connectConversation();
+
+  Future<void> _runAction(
+    BuildContext context,
+    ChatRecoveryAction action,
+    ChatFailure failure,
+  ) async {
+    switch (action) {
+      case ChatRecoveryAction.retryConnection:
+        await controller.connectConversation();
+      case ChatRecoveryAction.editConnection:
+        await onEditConnection();
+      case ChatRecoveryAction.openSystemSettings:
+        // UIApplication.openSettingsURLString on iOS.
+        await launchUrl(Uri.parse('app-settings:'));
+      case ChatRecoveryAction.retry:
+        final target = _retryTarget(failure);
+        if (target != null) await controller.retryAssistant(target);
+      case ChatRecoveryAction.resume:
+        await controller.resumeQueue();
+      case ChatRecoveryAction.chooseModel:
+        await showModelSheet(context, controller);
+      case ChatRecoveryAction.refreshModels:
+        await controller.refreshModelList(profileId: failure.profileId);
+      case ChatRecoveryAction.removeAttachment:
+        await _showAttachments(context);
+      case ChatRecoveryAction.retrySave:
+        await controller.retryDraftSave();
     }
+  }
+
+  /// The retryable answer for a failure, or null when Retry is unavailable.
+  String? _retryTarget(ChatFailure failure) {
+    final messages = controller.transcriptMessages;
+    final latest = messages.lastWhere(
+      (message) => message.role == TranscriptRole.assistant,
+      orElse: () => const TranscriptMessageView(
+        id: '',
+        role: TranscriptRole.system,
+        content: '',
+      ),
+    );
+    if (latest.id.isEmpty || !latest.canRetry) return null;
+    if (latest.status != TranscriptStatus.failed &&
+        latest.status != TranscriptStatus.interrupted) {
+      return null;
+    }
+    return latest.id;
+  }
+
+  /// Actions offered for [failure]; [nearMessage] omits Retry because the
+  /// affected answer shows its own Retry button.
+  List<ChatRecoveryAction> _actionsFor(
+    ChatFailure failure, {
+    bool nearMessage = false,
+    bool connectionOnly = false,
+  }) => [
+    for (final action in failure.actions)
+      if ((!connectionOnly || _connectionActions.contains(action)) &&
+          !(action == ChatRecoveryAction.retry &&
+              (nearMessage || _retryTarget(failure) == null)) &&
+          !(action == ChatRecoveryAction.removeAttachment &&
+              !_hasAttachments) &&
+          !(action == ChatRecoveryAction.resume && !controller.queuePaused))
+        action,
+  ];
+
+  Widget _failureNotice(
+    BuildContext context,
+    ChatFailure failure, {
+    required VoidCallback onDismiss,
+    bool nearMessage = false,
+    bool connectionOnly = false,
+  }) => _FailureNotice(
+    failure: failure,
+    actions: _actionsFor(
+      failure,
+      nearMessage: nearMessage,
+      connectionOnly: connectionOnly,
+    ),
+    busy: _checking,
+    onAction: (action) => _runAction(context, action, failure),
+    onDismiss: onDismiss,
+  );
+
+  List<TranscriptMessageView> get _transcriptMessages {
+    final messages = controller.transcriptMessages;
+    final id = controller.conversation?.id;
+    if (id == null || !controller.hasRecoveryCheckpoint(id)) return messages;
+    final latest = messages.lastIndexWhere(
+      (message) => message.role == TranscriptRole.assistant,
+    );
+    if (latest < 0) return messages;
+    return [
+      for (var index = 0; index < messages.length; index++)
+        index == latest
+            ? messages[index].copyWith(canRestorePrevious: true)
+            : messages[index],
+    ];
   }
 
   Future<void> _showQueue(BuildContext context) => showModalBottomSheet<void>(
@@ -303,34 +541,57 @@ class _ChatBody extends StatelessWidget {
   /// Setup and model prompts shown above the composer.
   List<Widget> _statusLines(BuildContext context, {required bool short}) {
     final colors = Theme.of(context).colorScheme;
+    final profileId = controller.conversationProfile.id;
+    final failure = controller.conversationFailure;
     return <Widget>[
-      // A new chat shows its connect action in the welcome state instead.
-      if (!controller.conversationConnected && controller.conversation != null)
+      // A request failure that is not attached to a visible message.
+      if (failure != null && !_failureOnMessage(failure))
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: Design.gutter),
+          child: _failureNotice(
+            context,
+            failure,
+            onDismiss: () =>
+                controller.dismissFailure(controller.conversation?.id ?? ''),
+          ),
+        ),
+      // An unconfigured new chat shows its connect action in the welcome.
+      if (controller.conversationProfile.configured &&
+          !controller.conversationConnected &&
+          _connectionBanner == null)
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: Design.gutter),
           child: TextButton(
-            onPressed: controller.canChangeContext
-                ? () => _connect(context)
+            onPressed: controller.canChangeContext && !_checking
+                ? _connect
                 : null,
             child: Text(
-              controller.profileMutationBusy
+              _checking
                   ? 'Connecting…'
-                  : 'Connect to ${controller.conversationProfile.name} to continue',
+                  : 'Connect to ${controller.conversationDestinationName} to continue',
             ),
           ),
         )
-      else if (controller.conversationConnected && controller.models.isEmpty)
+      else if (controller.conversationConnected &&
+          controller.models.isEmpty &&
+          !controller.modelListRefreshing(profileId))
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: Design.gutter),
           child: Wrap(
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              const Text('No models returned.'),
+              Text(
+                controller.modelListError(profileId)?.message ??
+                    'Server is reachable but has no available models',
+              ),
               TextButton(
-                onPressed: controller.canChangeContext
-                    ? controller.refreshModels
-                    : null,
-                child: const Text('Refresh'),
+                onPressed: () =>
+                    controller.refreshModelList(profileId: profileId),
+                child: Text(
+                  controller.modelListError(profileId) == null
+                      ? 'Refresh'
+                      : 'Retry',
+                ),
               ),
             ],
           ),
@@ -339,7 +600,7 @@ class _ChatBody extends StatelessWidget {
           controller.selectedModel == null)
         TextButton(
           onPressed: () => showModelSheet(context, controller),
-          child: const Text('Choose an available model to continue'),
+          child: const Text('Choose a model to continue'),
         ),
       if (!short)
         if (controller.contextNotice case final notice?)
@@ -360,34 +621,60 @@ class _ChatBody extends StatelessWidget {
     ];
   }
 
+  /// Compact banners for connection/setup-level failures, local save
+  /// failures, and any other chat error. Request failures render near their
+  /// message instead.
+  List<Widget> _banners(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final general = generalChatError(controller);
+    return <Widget>[
+      if (_connectionBanner case final failure?)
+        _failureNotice(
+          context,
+          failure,
+          connectionOnly: true,
+          onDismiss: controller.clearError,
+        ),
+      if (controller.draftPersistenceFailure case final failure?)
+        _failureNotice(context, failure, onDismiss: controller.clearError),
+      if (general != null)
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                general,
+                style: TextStyle(fontSize: 14, color: colors.error),
+              ),
+            ),
+            IconButton(
+              tooltip: 'Dismiss error',
+              onPressed: controller.clearError,
+              icon: const Icon(Icons.close, size: 18),
+            ),
+          ],
+        ),
+    ];
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!controller.initialized) {
       return const Center(child: CircularProgressIndicator());
     }
-    final colors = Theme.of(context).colorScheme;
+    final chatFailure = controller.conversationFailure;
     return AnimatedBuilder(
       animation: findController,
       builder: (context, _) => Column(
         children: [
-          if (controller.errorMessage != null)
+          for (final banner in _banners(context))
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: Design.gutter),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      controller.errorMessage!,
-                      style: TextStyle(fontSize: 14, color: colors.error),
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: 'Dismiss error',
-                    onPressed: controller.clearError,
-                    icon: const Icon(Icons.close, size: 18),
-                  ),
-                ],
+              padding: const EdgeInsets.fromLTRB(
+                Design.gutter,
+                Design.space1,
+                Design.gutter,
+                0,
               ),
+              child: banner,
             ),
           if (findController.isOpen) ChatFindBar(controller: findController),
           Expanded(
@@ -402,7 +689,7 @@ class _ChatBody extends StatelessWidget {
                         key: PageStorageKey(
                           'transcript-${controller.conversation?.id ?? 'new'}',
                         ),
-                        messages: controller.transcriptMessages,
+                        messages: _transcriptMessages,
                         findController: findController,
                         findScope: Object.hash(
                           controller.conversation?.id,
@@ -415,14 +702,31 @@ class _ChatBody extends StatelessWidget {
                             controller.editAndResend(message.id, text),
                         onRegenerate: (message) =>
                             controller.regenerateAssistant(message.id),
+                        onRestorePrevious: (_) => restorePreviousConversation(
+                          context,
+                          controller,
+                          controller.conversation!.id,
+                        ),
                         canMutate: () => controller.canSend,
+                        messageFooter: (message) =>
+                            chatFailure != null &&
+                                chatFailure.messageId == message.id
+                            ? _failureNotice(
+                                context,
+                                chatFailure,
+                                nearMessage: true,
+                                onDismiss: () => controller.dismissFailure(
+                                  controller.conversation!.id,
+                                ),
+                              )
+                            : null,
                         emptyState: _Welcome(
                           setup:
-                              controller.conversation == null &&
-                              !controller.conversationConnected,
-                          connecting: controller.profileMutationBusy,
+                              controller.submitAvailability ==
+                              SubmitAvailability.noConnection,
+                          connecting: _checking,
                           onConnect: controller.canChangeContext
-                              ? () => _connect(context)
+                              ? onConnectServer
                               : null,
                         ),
                       ),
@@ -473,16 +777,14 @@ class _ChatBody extends StatelessWidget {
                                   controller.queuedPrompts.isNotEmpty,
                               // Local editing survives an unreachable server;
                               // only a local mutation briefly holds it.
-                              editable:
-                                  !controller.isSubmitting &&
-                                  !controller.conversationMutationBusy,
-                              canSubmit: _submitUnavailableReason == null,
+                              editable: controller.canEditDraft,
+                              canSubmit:
+                                  controller.canSubmit && !_imagesUnsupported,
                               submitUnavailableReason: _submitUnavailableReason,
                               hasAttachments: _hasAttachments,
                               imagesEnabled:
-                                  controller.conversationConnected &&
-                                  controller.selectedModel != null &&
-                                  controller.supportsImages,
+                                  controller.canEditDraft &&
+                                  controller.imagesSupported != false,
                               onPickImage: controller.pickImage,
                               onTakePhoto: () =>
                                   controller.pickImage(camera: true),
@@ -500,6 +802,106 @@ class _ChatBody extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// A classified failure with its recovery actions. Dismiss hides only the
+/// presentation; the failed status and preserved content remain.
+class _FailureNotice extends StatelessWidget {
+  const _FailureNotice({
+    required this.failure,
+    required this.actions,
+    required this.busy,
+    required this.onAction,
+    required this.onDismiss,
+  });
+
+  final ChatFailure failure;
+  final List<ChatRecoveryAction> actions;
+  final bool busy;
+  final ValueChanged<ChatRecoveryAction> onAction;
+  final VoidCallback onDismiss;
+
+  static String _label(ChatRecoveryAction action) => switch (action) {
+    ChatRecoveryAction.retryConnection => 'Retry connection',
+    ChatRecoveryAction.editConnection => 'Edit connection',
+    ChatRecoveryAction.openSystemSettings => 'Open Settings',
+    ChatRecoveryAction.retry => 'Retry',
+    ChatRecoveryAction.resume => 'Resume',
+    ChatRecoveryAction.chooseModel => 'Choose model',
+    ChatRecoveryAction.refreshModels => 'Refresh models',
+    ChatRecoveryAction.removeAttachment => 'Remove attachment',
+    ChatRecoveryAction.retrySave => 'Retry save',
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: colors.errorContainer.withValues(alpha: .35),
+        border: Border.all(color: colors.error.withValues(alpha: .35)),
+        borderRadius: BorderRadius.circular(Design.radiusMedium),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(Design.space3, 0, 0, Design.space1),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: Design.space3),
+                    child: Text(
+                      failure.message,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: colors.onSurface,
+                      ),
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Dismiss',
+                  constraints: const BoxConstraints.tightFor(
+                    width: Design.target,
+                    height: Design.target,
+                  ),
+                  onPressed: onDismiss,
+                  icon: const Icon(Icons.close, size: 18),
+                ),
+              ],
+            ),
+            if (actions.isNotEmpty)
+              Wrap(
+                spacing: Design.space1,
+                children: <Widget>[
+                  for (final action in actions)
+                    TextButton(
+                      style: TextButton.styleFrom(
+                        minimumSize: const Size(Design.target, Design.target),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: Design.space2,
+                        ),
+                      ),
+                      onPressed:
+                          busy && action == ChatRecoveryAction.retryConnection
+                          ? null
+                          : () => onAction(action),
+                      child: Text(
+                        busy && action == ChatRecoveryAction.retryConnection
+                            ? 'Connecting…'
+                            : _label(action),
+                      ),
+                    ),
+                ],
+              ),
+          ],
+        ),
       ),
     );
   }
