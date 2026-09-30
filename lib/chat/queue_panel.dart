@@ -15,6 +15,7 @@ class QueuedPromptPanel extends StatefulWidget {
     required this.onEdit,
     required this.onRemove,
     required this.onReorder,
+    this.maxHeight,
   });
 
   final List<QueuedPrompt> prompts;
@@ -23,6 +24,10 @@ class QueuedPromptPanel extends StatefulWidget {
   final Future<void> Function(String id, String text) onEdit;
   final Future<void> Function(String id) onRemove;
   final Future<void> Function(List<String> ids) onReorder;
+
+  /// Upper bound for the panel; rows scroll inside it. Defaults to a share of
+  /// the screen height.
+  final double? maxHeight;
 
   @override
   State<QueuedPromptPanel> createState() => _QueuedPromptPanelState();
@@ -132,16 +137,22 @@ class _QueuedPromptPanelState extends State<QueuedPromptPanel> {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(14, 4, 14, 2),
+      padding: const EdgeInsets.fromLTRB(
+        Design.gutter,
+        Design.space1,
+        Design.gutter,
+        2,
+      ),
       child: ConstrainedBox(
         constraints: BoxConstraints(
-          maxHeight: MediaQuery.sizeOf(context).height * .38,
+          maxHeight:
+              widget.maxHeight ?? MediaQuery.sizeOf(context).height * .38,
         ),
         child: DecoratedBox(
           decoration: BoxDecoration(
             color: colors.surfaceContainerLow,
             border: Border.all(color: Design.line(context)),
-            borderRadius: BorderRadius.circular(14),
+            borderRadius: BorderRadius.circular(Design.radiusMedium),
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -396,53 +407,47 @@ class _QueuedPromptEditorState extends State<_QueuedPromptEditor> {
 
   @override
   Widget build(BuildContext context) {
-    final keyboard = MediaQuery.viewInsetsOf(context).bottom;
-    return SafeArea(
-      top: false,
-      child: SingleChildScrollView(
-        padding: EdgeInsets.fromLTRB(16, 0, 16, 16 + keyboard),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            const SheetHandle(),
-            const SheetHeading(
-              title: 'Edit queued message',
-              closeLabel: 'Close queued message editor',
-            ),
-            TextField(
-              controller: _controller,
-              autofocus: true,
-              minLines: 3,
-              maxLines: 8,
-              onChanged: (_) => setState(() {}),
-              decoration: const InputDecoration(labelText: 'Message'),
-            ),
-            if (_hasAttachments) ...<Widget>[
-              const SizedBox(height: 10),
-              const Text('Attached images and documents will be kept.'),
-            ],
-            const SizedBox(height: 16),
-            Wrap(
-              alignment: WrapAlignment.end,
-              spacing: 8,
-              runSpacing: 8,
-              children: <Widget>[
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton(
-                  onPressed:
-                      _controller.text.trim().isNotEmpty || _hasAttachments
-                      ? () => Navigator.pop(context, _controller.text.trim())
-                      : null,
-                  child: const Text('Save'),
-                ),
-              ],
-            ),
+    return KeyboardSafeSheet(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          const SheetHandle(),
+          const SheetHeading(
+            title: 'Edit queued message',
+            closeLabel: 'Close queued message editor',
+          ),
+          TextField(
+            controller: _controller,
+            autofocus: true,
+            minLines: 3,
+            maxLines: 8,
+            onChanged: (_) => setState(() {}),
+            decoration: const InputDecoration(labelText: 'Message'),
+          ),
+          if (_hasAttachments) ...<Widget>[
+            const SizedBox(height: 10),
+            const Text('Attached images and documents will be kept.'),
           ],
-        ),
+          const SizedBox(height: 16),
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: 8,
+            runSpacing: 8,
+            children: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: _controller.text.trim().isNotEmpty || _hasAttachments
+                    ? () => Navigator.pop(context, _controller.text.trim())
+                    : null,
+                child: const Text('Save'),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }

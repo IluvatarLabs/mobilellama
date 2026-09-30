@@ -8,6 +8,16 @@ import 'speech_actions.dart';
 
 /// A bottom composer with one expanding text field and explicit media/action
 /// controls. Transport state remains owned by the caller.
+///
+/// Local work and network submission are separate inputs:
+/// * [editable] governs text entry, dictation, and local attachment picking.
+///   When false (a brief local mutation), the field becomes read-only so focus,
+///   selection, and copying are preserved.
+/// * [canSubmit] governs Send/Queue. When false, [submitUnavailableReason] is
+///   shown under a non-empty draft so the user knows why sending is disabled.
+///
+/// The field grows until it reaches the height its parent allows, then scrolls.
+/// Give the composer bounded height (for example with [Flexible]) to cap it.
 class ChatComposer extends StatefulWidget {
   const ChatComposer({
     super.key,
@@ -21,13 +31,15 @@ class ChatComposer extends StatefulWidget {
     this.controller,
     this.isStreaming = false,
     this.isQueueing = false,
-    this.enabled = true,
+    this.editable = true,
+    this.canSubmit = true,
+    this.submitUnavailableReason,
     this.hintText = 'Message',
     this.draftScopeRevision = 0,
     this.draftText = '',
     this.onDraftChanged,
-    this.sendEnabled = true,
     this.hasAttachments = false,
+    this.compact = false,
   });
 
   final Future<bool> Function(String) onSend;
@@ -40,13 +52,17 @@ class ChatComposer extends StatefulWidget {
   final TextEditingController? controller;
   final bool isStreaming;
   final bool isQueueing;
-  final bool enabled;
+  final bool editable;
+  final bool canSubmit;
+  final String? submitUnavailableReason;
   final String hintText;
   final int draftScopeRevision;
   final String draftText;
   final ValueChanged<String>? onDraftChanged;
-  final bool sendEnabled;
   final bool hasAttachments;
+
+  /// Tighter vertical padding for short viewports (landscape, keyboard).
+  final bool compact;
 
   @override
   State<ChatComposer> createState() => _ChatComposerState();
@@ -70,10 +86,10 @@ class _ChatComposerState extends State<ChatComposer>
   TextEditingValue? _dictationBase;
   bool _routeWasCurrent = true;
 
-  bool get _canSend =>
-      widget.enabled &&
-      widget.sendEnabled &&
-      (_controller.text.trim().isNotEmpty || widget.hasAttachments);
+  bool get _hasContent =>
+      _controller.text.trim().isNotEmpty || widget.hasAttachments;
+
+  bool get _canSend => widget.editable && widget.canSubmit && _hasContent;
 
   @override
   void initState() {
@@ -107,7 +123,7 @@ class _ChatComposerState extends State<ChatComposer>
         ),
       );
     }
-    if ((oldWidget.enabled && !widget.enabled) ||
+    if ((oldWidget.editable && !widget.editable) ||
         (!oldWidget.isStreaming && widget.isStreaming)) {
       unawaited(_cancelDictation());
     }
@@ -156,7 +172,7 @@ class _ChatComposerState extends State<ChatComposer>
       await _cancelDictation();
       return;
     }
-    if (!widget.enabled || widget.isStreaming) return;
+    if (!widget.editable || widget.isStreaming) return;
 
     final session = ++_dictationSession;
     _dictationBase = _controller.value;
@@ -265,7 +281,18 @@ class _ChatComposerState extends State<ChatComposer>
     await _dictation.cancel();
   }
 
-  Future<void> _showAttachmentSheet() async {
+  bool get _hasAttachmentActions =>
+      widget.onPickImage != null ||
+      widget.onTakePhoto != null ||
+      widget.onPickDocument != null;
+
+  bool get _dictating => _listening || _startingDictation;
+
+  bool get _canDictate => widget.editable && !widget.isStreaming;
+
+  /// [includeDictation] folds the dictation control into this sheet when the
+  /// composer is too narrow for a separate button.
+  Future<void> _showAttachmentSheet({bool includeDictation = false}) async {
     FocusManager.instance.primaryFocus?.unfocus();
     await showModalBottomSheet<void>(
       context: context,
@@ -326,6 +353,19 @@ class _ChatComposerState extends State<ChatComposer>
                           widget.onPickDocument!();
                         },
                 ),
+                if (includeDictation)
+                  ListTile(
+                    minTileHeight: 56,
+                    leading: const Icon(Icons.mic_none_outlined),
+                    title: const Text('Dictate message'),
+                    enabled: _canDictate,
+                    onTap: _canDictate
+                        ? () {
+                            Navigator.pop(context);
+                            unawaited(_toggleDictation());
+                          }
+                        : null,
+                  ),
               ],
             ),
           ),
@@ -376,21 +416,32 @@ class _ChatComposerState extends State<ChatComposer>
     super.dispose();
   }
 
+  /// Width below which attachment and dictation share one menu button.
+  static const double _narrowWidth = 330;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
-    final surfaceEnabled = widget.enabled;
-    final controlColor = surfaceEnabled
+    final controlColor = widget.editable
         ? colors.onSurfaceVariant
         : colors.onSurfaceVariant.withValues(alpha: 0.4);
+    final disabledColor = colors.onSurfaceVariant.withValues(alpha: 0.35);
+    final reason = widget.submitUnavailableReason;
+    final showReason =
+        !widget.canSubmit && reason != null && _hasContent && !_dictating;
 
     return Material(
       color: colors.surfaceContainerLowest,
       child: SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(14, 8, 14, 14),
+          padding: EdgeInsets.fromLTRB(
+            Design.gutter,
+            widget.compact ? Design.space1 : Design.space2,
+            Design.gutter,
+            widget.compact ? Design.space1 : Design.space3,
+          ),
           child: DecoratedBox(
             decoration: BoxDecoration(
               color: Design.composer(context),
@@ -398,145 +449,175 @@ class _ChatComposerState extends State<ChatComposer>
               borderRadius: BorderRadius.circular(28),
             ),
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(8, 6, 7, 6),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: <Widget>[
-                      if (widget.onPickImage != null ||
-                          widget.onTakePhoto != null ||
-                          widget.onPickDocument != null)
-                        IconButton(
-                          tooltip: 'Add attachment',
-                          constraints: const BoxConstraints.tightFor(
-                            width: 44,
-                            height: 44,
-                          ),
-                          onPressed: widget.enabled
-                              ? _showAttachmentSheet
-                              : null,
-                          color: controlColor,
-                          disabledColor: colors.onSurfaceVariant.withValues(
-                            alpha: 0.35,
-                          ),
-                          style: IconButton.styleFrom(
-                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                          ),
-                          icon: const DesignIcon('plus'),
-                        ),
-                      Expanded(
-                        child: TextField(
-                          controller: _controller,
-                          enabled: surfaceEnabled,
-                          minLines: 1,
-                          maxLines: 6,
-                          keyboardType: TextInputType.multiline,
-                          textCapitalization: TextCapitalization.sentences,
-                          style: theme.textTheme.bodyLarge,
-                          cursorColor: colors.primary,
-                          decoration: InputDecoration(
-                            hintText: widget.hintText,
-                            hintStyle: theme.textTheme.bodyLarge?.copyWith(
-                              color: colors.onSurfaceVariant,
-                            ),
-                            filled: false,
-                            contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 9,
-                            ),
-                            border: InputBorder.none,
-                            enabledBorder: InputBorder.none,
-                            focusedBorder: InputBorder.none,
-                            disabledBorder: InputBorder.none,
+              padding: EdgeInsets.fromLTRB(
+                Design.space2,
+                widget.compact ? 2 : 6,
+                7,
+                widget.compact ? 2 : 6,
+              ),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final narrow = constraints.maxWidth < _narrowWidth;
+                  // Callers normally bound the composer. Without a bound, cap
+                  // the editor at half the screen so it still scrolls.
+                  final maxHeight = constraints.hasBoundedHeight
+                      ? constraints.maxHeight
+                      : MediaQuery.sizeOf(context).height * .5;
+                  return ConstrainedBox(
+                    constraints: BoxConstraints(maxHeight: maxHeight),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Flexible(
+                          child: _buildRow(
+                            theme,
+                            narrow: narrow,
+                            controlColor: controlColor,
+                            disabledColor: disabledColor,
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      IconButton(
-                        tooltip: _listening || _startingDictation
-                            ? 'Stop dictation'
-                            : 'Dictate message',
-                        constraints: const BoxConstraints.tightFor(
-                          width: 44,
-                          height: 44,
-                        ),
-                        onPressed: widget.enabled && !widget.isStreaming
-                            ? _toggleDictation
-                            : null,
-                        color: _listening || _startingDictation
-                            ? colors.error
-                            : controlColor,
-                        disabledColor: colors.onSurfaceVariant.withValues(
-                          alpha: 0.35,
-                        ),
-                        style: IconButton.styleFrom(
-                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                        ),
-                        icon: _listening || _startingDictation
-                            ? const Icon(Icons.stop_circle_outlined, size: 22)
-                            : const Icon(Icons.mic_none_outlined, size: 22),
-                      ),
-                      const SizedBox(width: 4),
-                      if (widget.isStreaming) ...<Widget>[
-                        IconButton.filled(
-                          tooltip: 'Stop response',
-                          constraints: const BoxConstraints.tightFor(
-                            width: 44,
-                            height: 44,
-                          ),
-                          onPressed: widget.onStop,
-                          style: _primaryActionStyle(colors),
-                          icon: const Icon(Icons.stop_rounded, size: 21),
-                        ),
-                        if (_canSend) ...<Widget>[
-                          const SizedBox(width: 4),
-                          IconButton.filled(
-                            tooltip: 'Queue message',
-                            constraints: const BoxConstraints.tightFor(
-                              width: 44,
-                              height: 44,
-                            ),
-                            onPressed: _send,
-                            style: _primaryActionStyle(colors),
-                            icon: const DesignIcon('send', size: 20),
-                          ),
-                        ],
-                      ] else
-                        IconButton.filled(
-                          tooltip: widget.isQueueing ? 'Queue message' : 'Send',
-                          constraints: const BoxConstraints.tightFor(
-                            width: 44,
-                            height: 44,
-                          ),
-                          onPressed: _canSend ? _send : null,
-                          style: _primaryActionStyle(colors),
-                          icon: const DesignIcon('send', size: 20),
-                        ),
-                    ],
-                  ),
-                  if (_listening || _startingDictation)
-                    Semantics(
-                      liveRegion: true,
-                      child: Padding(
-                        padding: const EdgeInsets.only(bottom: 3),
-                        child: Text(
-                          _startingDictation
-                              ? 'Starting dictation…'
-                              : 'Listening…',
-                          style: theme.textTheme.labelSmall?.copyWith(
+                        if (_dictating)
+                          _Caption(
+                            text: _startingDictation
+                                ? 'Starting dictation…'
+                                : 'Listening…',
                             color: colors.error,
+                            liveRegion: true,
+                          )
+                        else if (showReason)
+                          _Caption(
+                            text: reason,
+                            color: colors.onSurfaceVariant,
                           ),
-                        ),
-                      ),
+                      ],
                     ),
-                ],
+                  );
+                },
               ),
             ),
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildRow(
+    ThemeData theme, {
+    required bool narrow,
+    required Color controlColor,
+    required Color disabledColor,
+  }) {
+    final colors = theme.colorScheme;
+    final showAdd = _hasAttachmentActions || narrow;
+    // Dictation keeps its own button unless the composer is narrow; then it
+    // lives in the + menu, except while active so it can always be stopped.
+    final showMic = !narrow || _dictating;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: <Widget>[
+        if (showAdd)
+          IconButton(
+            tooltip: narrow ? 'Add attachment or dictate' : 'Add attachment',
+            constraints: const BoxConstraints.tightFor(
+              width: Design.target,
+              height: Design.target,
+            ),
+            onPressed: widget.editable
+                ? () => _showAttachmentSheet(includeDictation: narrow)
+                : null,
+            color: controlColor,
+            disabledColor: disabledColor,
+            style: IconButton.styleFrom(
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            icon: const DesignIcon('plus'),
+          ),
+        Expanded(
+          child: TextField(
+            controller: _controller,
+            // Read-only rather than disabled keeps focus, selection, and
+            // copying available during a brief local mutation.
+            readOnly: !widget.editable,
+            minLines: 1,
+            maxLines: null,
+            keyboardType: TextInputType.multiline,
+            textCapitalization: TextCapitalization.sentences,
+            style: theme.textTheme.bodyLarge,
+            cursorColor: colors.primary,
+            decoration: InputDecoration(
+              hintText: widget.hintText,
+              hintStyle: theme.textTheme.bodyLarge?.copyWith(
+                color: colors.onSurfaceVariant,
+              ),
+              filled: false,
+              isDense: widget.compact,
+              contentPadding: EdgeInsets.symmetric(
+                horizontal: Design.space2,
+                vertical: widget.compact ? 6 : 9,
+              ),
+              border: InputBorder.none,
+              enabledBorder: InputBorder.none,
+              focusedBorder: InputBorder.none,
+              disabledBorder: InputBorder.none,
+            ),
+          ),
+        ),
+        const SizedBox(width: Design.space1),
+        if (showMic) ...<Widget>[
+          IconButton(
+            tooltip: _dictating ? 'Stop dictation' : 'Dictate message',
+            constraints: const BoxConstraints.tightFor(
+              width: Design.target,
+              height: Design.target,
+            ),
+            onPressed: _dictating || _canDictate ? _toggleDictation : null,
+            color: _dictating ? colors.error : controlColor,
+            disabledColor: disabledColor,
+            style: IconButton.styleFrom(
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            icon: _dictating
+                ? const Icon(Icons.stop_circle_outlined, size: 22)
+                : const Icon(Icons.mic_none_outlined, size: 22),
+          ),
+          const SizedBox(width: Design.space1),
+        ],
+        if (widget.isStreaming) ...<Widget>[
+          IconButton.filled(
+            tooltip: 'Stop response',
+            constraints: const BoxConstraints.tightFor(
+              width: Design.target,
+              height: Design.target,
+            ),
+            onPressed: widget.onStop,
+            style: _primaryActionStyle(colors),
+            icon: const Icon(Icons.stop_rounded, size: 21),
+          ),
+          if (_canSend) ...<Widget>[
+            const SizedBox(width: Design.space1),
+            IconButton.filled(
+              tooltip: 'Queue message',
+              constraints: const BoxConstraints.tightFor(
+                width: Design.target,
+                height: Design.target,
+              ),
+              onPressed: _send,
+              style: _primaryActionStyle(colors),
+              icon: const DesignIcon('send', size: 20),
+            ),
+          ],
+        ] else
+          IconButton.filled(
+            tooltip: widget.isQueueing ? 'Queue message' : 'Send',
+            constraints: const BoxConstraints.tightFor(
+              width: Design.target,
+              height: Design.target,
+            ),
+            onPressed: _canSend ? _send : null,
+            style: _primaryActionStyle(colors),
+            icon: const DesignIcon('send', size: 20),
+          ),
+      ],
     );
   }
 
@@ -547,5 +628,29 @@ class _ChatComposerState extends State<ChatComposer>
     foregroundColor: colors.onPrimary,
     disabledBackgroundColor: colors.primary.withValues(alpha: .45),
     disabledForegroundColor: colors.onPrimary,
+  );
+}
+
+class _Caption extends StatelessWidget {
+  const _Caption({
+    required this.text,
+    required this.color,
+    this.liveRegion = false,
+  });
+  final String text;
+  final Color color;
+  final bool liveRegion;
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+    liveRegion: liveRegion,
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(Design.space2, 0, Design.space2, 3),
+      child: Text(
+        text,
+        textAlign: TextAlign.center,
+        style: Theme.of(context).textTheme.labelSmall?.copyWith(color: color),
+      ),
+    ),
   );
 }

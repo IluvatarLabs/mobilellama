@@ -5,6 +5,22 @@ import 'package:flutter_svg/flutter_svg.dart';
 abstract final class Design {
   static const ink = Color(0xFF2A2E3A);
   static const accent = Color(0xFF3B5BDB);
+
+  /// Shared spacing scale for repeated gaps. [gutter] is the content inset.
+  static const double space1 = 4;
+  static const double space2 = 8;
+  static const double space3 = 12;
+  static const double gutter = 16;
+  static const double space5 = 24;
+
+  /// Minimum hit target for primary interactive controls.
+  static const double target = 44;
+
+  /// Corner radii: small tiles/chips, cards/panels, and message bubbles.
+  static const double radiusSmall = 10;
+  static const double radiusMedium = 14;
+  static const double radiusLarge = 18;
+
   static bool dark(BuildContext context) =>
       Theme.of(context).brightness == Brightness.dark;
   static Color panel(BuildContext context) =>
@@ -106,6 +122,103 @@ class SheetHeading extends StatelessWidget {
     ),
   );
 }
+
+/// Body of a modal bottom sheet that contains a form. It sits above the
+/// keyboard and scrolls, so its confirmation button stays reachable at any
+/// text size or orientation.
+class KeyboardSafeSheet extends StatelessWidget {
+  const KeyboardSafeSheet({super.key, required this.child});
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => AnimatedPadding(
+    duration: const Duration(milliseconds: 180),
+    curve: Curves.easeOut,
+    padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
+    child: SafeArea(
+      top: false,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(
+          Design.gutter,
+          0,
+          Design.gutter,
+          Design.gutter,
+        ),
+        child: child,
+      ),
+    ),
+  );
+}
+
+/// One row of [showActionSheet].
+class SheetAction<T> {
+  const SheetAction(
+    this.value,
+    this.label, {
+    this.enabled = true,
+    this.destructive = false,
+  });
+  final T value;
+  final String label;
+  final bool enabled;
+  final bool destructive;
+}
+
+/// A titled list of actions in the same style as the chat actions sheet.
+/// Returns the chosen value, or null when dismissed.
+Future<T?> showActionSheet<T>(
+  BuildContext context, {
+  required String title,
+  required String closeLabel,
+  required List<SheetAction<T>> actions,
+}) => showModalBottomSheet<T>(
+  context: context,
+  isScrollControlled: true,
+  useSafeArea: true,
+  showDragHandle: false,
+  barrierColor: Design.ink.withValues(alpha: .70),
+  builder: (context) => SafeArea(
+    top: false,
+    child: SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(
+        Design.gutter,
+        0,
+        Design.gutter,
+        Design.space5,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          const SheetHandle(),
+          SheetHeading(title: title, closeLabel: closeLabel),
+          for (final action in actions)
+            DecoratedBox(
+              decoration: BoxDecoration(
+                border: Border(
+                  top: BorderSide(color: Design.line(context, .12)),
+                ),
+              ),
+              child: ListTile(
+                minTileHeight: 56,
+                contentPadding: EdgeInsets.zero,
+                enabled: action.enabled,
+                title: Text(
+                  action.label,
+                  style: TextStyle(
+                    fontSize: 17,
+                    color: action.destructive && action.enabled
+                        ? Theme.of(context).colorScheme.error
+                        : null,
+                  ),
+                ),
+                onTap: () => Navigator.pop(context, action.value),
+              ),
+            ),
+        ],
+      ),
+    ),
+  ),
+);
 
 class SheetHandle extends StatelessWidget {
   const SheetHandle({super.key});

@@ -51,6 +51,65 @@ void main() {
     expect(stops, 1);
   });
 
+  testWidgets(
+    'short landscape with keyboard and largest text keeps Stop and Queue tappable',
+    (tester) async {
+      // iPhone SE landscape with the keyboard up, AX5-sized text.
+      tester.view.physicalSize = const Size(667, 375);
+      tester.view.devicePixelRatio = 1;
+      tester.view.viewInsets = const FakeViewPadding(bottom: 209);
+      addTearDown(tester.view.reset);
+      final sent = <String>[];
+      var stops = 0;
+      final draft = List<String>.generate(40, (i) => 'Line $i').join('\n');
+
+      await tester.pumpWidget(
+        MaterialApp(
+          builder: (context, child) => MediaQuery(
+            data: MediaQuery.of(context)
+                .copyWith(textScaler: const TextScaler.linear(3.1)),
+            child: child!,
+          ),
+          home: Scaffold(
+            appBar: AppBar(toolbarHeight: 52, title: const Text('Chat')),
+            body: Column(
+              children: <Widget>[
+                const Expanded(child: SizedBox.expand()),
+                Flexible(
+                  child: ChatComposer(
+                    compact: true,
+                    isStreaming: true,
+                    draftText: draft,
+                    onSend: (text) async {
+                      sent.add(text);
+                      return true;
+                    },
+                    onStop: () => stops += 1,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      await tester.enterText(find.byType(TextField), draft);
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+
+      final body = tester.getRect(find.byType(Column).first);
+      for (final label in <String>['Stop response', 'Queue message']) {
+        final rect = tester.getRect(find.byTooltip(label));
+        expect(rect.shortestSide, greaterThanOrEqualTo(44));
+        expect(rect.bottom, lessThanOrEqualTo(body.bottom));
+      }
+      await tester.tap(find.byTooltip('Stop response'));
+      await tester.tap(find.byTooltip('Queue message'));
+      await tester.pump();
+      expect(stops, 1);
+      expect(sent, <String>[draft]);
+    },
+  );
+
   testWidgets('a paused queue labels a new draft as Queue', (tester) async {
     final sent = <String>[];
     await tester.pumpWidget(

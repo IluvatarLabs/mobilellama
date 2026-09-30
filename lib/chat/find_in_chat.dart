@@ -159,7 +159,7 @@ class _ChatFindBarState extends State<ChatFindBar> {
       child: SafeArea(
         bottom: false,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(14, 6, 8, 6),
+          padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
           child: Row(
             children: <Widget>[
               const Icon(Icons.search, size: 20),
@@ -182,8 +182,8 @@ class _ChatFindBarState extends State<ChatFindBar> {
               ),
               Semantics(
                 liveRegion: true,
-                child: SizedBox(
-                  width: 58,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(minWidth: 44),
                   child: Text(
                     widget.controller.query.trim().isEmpty
                         ? ''

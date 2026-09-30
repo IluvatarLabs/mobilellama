@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import '../domain/conversation.dart';
@@ -68,16 +70,25 @@ class _ChatScreenState extends State<ChatScreen> {
     animation: controller,
     builder: (context, _) {
       final colors = Theme.of(context).colorScheme;
+      final media = MediaQuery.of(context);
+      // Compact chrome when the keyboard or landscape leaves little height;
+      // grow with the title's text size so scaled text is never clipped.
+      final shortScreen =
+          media.size.height - media.viewInsets.bottom - media.padding.top < 480;
+      final toolbarHeight = math.max(
+        shortScreen ? 52.0 : 64.0,
+        media.textScaler.scale(16) * 1.3 + Design.space2,
+      );
       return Scaffold(
         drawerScrimColor: Design.ink.withValues(alpha: .54),
         drawer: _HistoryDrawer(controller: controller, onNewChat: _newChat),
         appBar: AppBar(
           automaticallyImplyLeading: false,
-          leadingWidth: 58,
-          toolbarHeight: 64,
+          leadingWidth: Design.gutter + Design.target,
+          toolbarHeight: toolbarHeight,
           leading: Builder(
             builder: (context) => Padding(
-              padding: const EdgeInsets.only(left: 14),
+              padding: const EdgeInsets.only(left: Design.gutter),
               child: Center(
                 child: RoundAction(
                   label: 'Open chats',
@@ -140,7 +151,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ),
             ],
-            const SizedBox(width: 14),
+            const SizedBox(width: Design.gutter),
           ],
         ),
         body: _ChatBody(
@@ -156,6 +167,199 @@ class _ChatBody extends StatelessWidget {
   const _ChatBody({required this.controller, required this.findController});
   final ChatController controller;
   final ChatFindController findController;
+
+  /// Body height below which queue and attachment previews collapse to
+  /// summaries and the composer uses compact padding.
+  static const double _shortHeight = 420;
+
+  bool get _hasAttachments =>
+      controller.pendingImageReferences.isNotEmpty ||
+      controller.pendingDocuments.isNotEmpty;
+
+  bool get _imagesUnsupported =>
+      controller.pendingImageReferences.isNotEmpty &&
+      controller.conversationConnected &&
+      controller.selectedModel != null &&
+      !controller.supportsImages;
+
+  /// Why Send/Queue is unavailable, or null when it is available.
+  String? get _submitUnavailableReason {
+    if (!controller.conversationConnected) {
+      return controller.conversation == null
+          ? 'Connect a server to send.'
+          : 'Connect to ${controller.conversationProfile.name} to send.';
+    }
+    if (controller.selectedModel == null) return 'Choose a model to send.';
+    if (_imagesUnsupported) {
+      return 'This model can’t read images. Remove them or choose another model.';
+    }
+    if (!controller.canQueueOrSend) {
+      return 'Wait for the current action to finish.';
+    }
+    return null;
+  }
+
+  Future<void> _connect(BuildContext context) async {
+    if (controller.conversation == null) {
+      await Navigator.push<void>(
+        context,
+        MaterialPageRoute(
+          builder: (_) => SettingsSheet(controller: controller),
+        ),
+      );
+    } else {
+      await controller.connectConversation();
+    }
+  }
+
+  Future<void> _showQueue(BuildContext context) => showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    showDragHandle: true,
+    builder: (context) => SafeArea(
+      top: false,
+      child: AnimatedBuilder(
+        animation: controller,
+        builder: (context, _) => controller.queuedPrompts.isEmpty
+            ? const Padding(
+                padding: EdgeInsets.all(Design.gutter),
+                child: Text('No queued messages.'),
+              )
+            : QueuedPromptPanel(
+                prompts: controller.queuedPrompts,
+                paused: controller.queuePaused,
+                maxHeight: MediaQuery.sizeOf(context).height * .75,
+                onResume: controller.resumeQueue,
+                onEdit: controller.editQueuedPrompt,
+                onRemove: controller.removeQueuedPrompt,
+                onReorder: controller.reorderQueuedPrompts,
+              ),
+      ),
+    ),
+  );
+
+  Future<void> _showAttachments(BuildContext context) =>
+      showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        useSafeArea: true,
+        showDragHandle: false,
+        builder: (context) => SafeArea(
+          top: false,
+          child: AnimatedBuilder(
+            animation: controller,
+            builder: (context, _) => Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: Design.gutter),
+                  child: Column(
+                    children: <Widget>[
+                      SheetHandle(),
+                      SheetHeading(
+                        title: 'Attachments',
+                        closeLabel: 'Close attachments',
+                      ),
+                    ],
+                  ),
+                ),
+                if (!_hasAttachments)
+                  const Padding(
+                    padding: EdgeInsets.all(Design.gutter),
+                    child: Text('No attachments.'),
+                  ),
+                ..._attachmentPreviews(context),
+                const SizedBox(height: Design.gutter),
+              ],
+            ),
+          ),
+        ),
+      );
+
+  List<Widget> _attachmentPreviews(BuildContext context) => <Widget>[
+    if (controller.pendingImageReferences.isNotEmpty)
+      PendingImageStrip(
+        references: controller.pendingImageReferences,
+        onRemove: controller.removePendingImage,
+      ),
+    if (_imagesUnsupported)
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: Design.gutter),
+        child: Text(
+          'Remove the image or choose a model that supports images.',
+          style: Theme.of(context).textTheme.bodySmall
+              ?.copyWith(color: Theme.of(context).colorScheme.error),
+        ),
+      ),
+    if (controller.pendingDocuments.isNotEmpty)
+      _PendingDocuments(
+        documents: controller.pendingDocuments,
+        onRemove: controller.removePendingDocument,
+      ),
+  ];
+
+  /// Setup and model prompts shown above the composer.
+  List<Widget> _statusLines(BuildContext context, {required bool short}) {
+    final colors = Theme.of(context).colorScheme;
+    return <Widget>[
+      // A new chat shows its connect action in the welcome state instead.
+      if (!controller.conversationConnected && controller.conversation != null)
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: Design.gutter),
+          child: TextButton(
+            onPressed: controller.canChangeContext
+                ? () => _connect(context)
+                : null,
+            child: Text(
+              controller.profileMutationBusy
+                  ? 'Connecting…'
+                  : 'Connect to ${controller.conversationProfile.name} to continue',
+            ),
+          ),
+        )
+      else if (controller.conversationConnected && controller.models.isEmpty)
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: Design.gutter),
+          child: Wrap(
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              const Text('No models returned.'),
+              TextButton(
+                onPressed: controller.canChangeContext
+                    ? controller.refreshModels
+                    : null,
+                child: const Text('Refresh'),
+              ),
+            ],
+          ),
+        )
+      else if (controller.conversationConnected &&
+          controller.selectedModel == null)
+        TextButton(
+          onPressed: () => showModelSheet(context, controller),
+          child: const Text('Choose an available model to continue'),
+        ),
+      if (!short)
+        if (controller.contextNotice case final notice?)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              Design.gutter,
+              Design.space1,
+              Design.gutter,
+              Design.space2,
+            ),
+            child: Text(
+              notice,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodySmall
+                  ?.copyWith(color: colors.onSurfaceVariant),
+            ),
+          ),
+    ];
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!controller.initialized) {
@@ -168,7 +372,7 @@ class _ChatBody extends StatelessWidget {
         children: [
           if (controller.errorMessage != null)
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
+              padding: const EdgeInsets.symmetric(horizontal: Design.gutter),
               child: Row(
                 children: [
                   Expanded(
@@ -187,142 +391,113 @@ class _ChatBody extends StatelessWidget {
             ),
           if (findController.isOpen) ChatFindBar(controller: findController),
           Expanded(
-            child: ChatTranscript(
-              key: PageStorageKey(
-                'transcript-${controller.conversation?.id ?? 'new'}',
-              ),
-              messages: controller.transcriptMessages,
-              findController: findController,
-              findScope: Object.hash(
-                controller.conversation?.id,
-                controller.draftScopeRevision,
-              ),
-              onRetry: controller.conversationConnected
-                  ? (message) => controller.retryAssistant(message.id)
-                  : null,
-              onEditAndResend: (message, text) =>
-                  controller.editAndResend(message.id, text),
-              onRegenerate: (message) =>
-                  controller.regenerateAssistant(message.id),
-              canMutate: () => controller.canSend,
-              emptyState: const _Welcome(),
-            ),
-          ),
-          if (!controller.conversationConnected)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: TextButton(
-                onPressed: controller.canChangeContext
-                    ? () async {
-                        if (controller.conversation == null) {
-                          await Navigator.push<void>(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) =>
-                                  SettingsSheet(controller: controller),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final height = constraints.maxHeight;
+                final short = height < _shortHeight;
+                return Column(
+                  children: [
+                    Expanded(
+                      child: ChatTranscript(
+                        key: PageStorageKey(
+                          'transcript-${controller.conversation?.id ?? 'new'}',
+                        ),
+                        messages: controller.transcriptMessages,
+                        findController: findController,
+                        findScope: Object.hash(
+                          controller.conversation?.id,
+                          controller.draftScopeRevision,
+                        ),
+                        onRetry: controller.conversationConnected
+                            ? (message) => controller.retryAssistant(message.id)
+                            : null,
+                        onEditAndResend: (message, text) =>
+                            controller.editAndResend(message.id, text),
+                        onRegenerate: (message) =>
+                            controller.regenerateAssistant(message.id),
+                        canMutate: () => controller.canSend,
+                        emptyState: _Welcome(
+                          setup:
+                              controller.conversation == null &&
+                              !controller.conversationConnected,
+                          connecting: controller.profileMutationBusy,
+                          onConnect: controller.canChangeContext
+                              ? () => _connect(context)
+                              : null,
+                        ),
+                      ),
+                    ),
+                    // The bottom region never exceeds the body. In a short
+                    // viewport it may take all of it; the transcript yields.
+                    ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: short ? height : height * .6,
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ..._statusLines(context, short: short),
+                          if (short)
+                            _DraftSummary(
+                              queued: controller.queuedPrompts.length,
+                              queuePaused: controller.queuePaused,
+                              attachments:
+                                  controller.pendingImageReferences.length +
+                                  controller.pendingDocuments.length,
+                              onOpenQueue: () => _showQueue(context),
+                              onOpenAttachments: () =>
+                                  _showAttachments(context),
+                            )
+                          else ...[
+                            if (controller.queuedPrompts.isNotEmpty)
+                              QueuedPromptPanel(
+                                prompts: controller.queuedPrompts,
+                                paused: controller.queuePaused,
+                                maxHeight: height * .3,
+                                onResume: controller.resumeQueue,
+                                onEdit: controller.editQueuedPrompt,
+                                onRemove: controller.removeQueuedPrompt,
+                                onReorder: controller.reorderQueuedPrompts,
+                              ),
+                            ..._attachmentPreviews(context),
+                          ],
+                          Flexible(
+                            child: ChatComposer(
+                              compact: short,
+                              draftScopeRevision: controller.draftScopeRevision,
+                              draftText: controller.draftText,
+                              onDraftChanged: controller.setDraftText,
+                              isStreaming: controller.isStreaming,
+                              isQueueing:
+                                  controller.isStreaming ||
+                                  controller.queuedPrompts.isNotEmpty,
+                              // Local editing survives an unreachable server;
+                              // only a local mutation briefly holds it.
+                              editable:
+                                  !controller.isSubmitting &&
+                                  !controller.conversationMutationBusy,
+                              canSubmit: _submitUnavailableReason == null,
+                              submitUnavailableReason: _submitUnavailableReason,
+                              hasAttachments: _hasAttachments,
+                              imagesEnabled:
+                                  controller.conversationConnected &&
+                                  controller.selectedModel != null &&
+                                  controller.supportsImages,
+                              onPickImage: controller.pickImage,
+                              onTakePhoto: () =>
+                                  controller.pickImage(camera: true),
+                              onPickDocument: controller.pickDocument,
+                              onSend: controller.send,
+                              onStop: controller.stop,
                             ),
-                          );
-                        } else {
-                          await controller.connectConversation();
-                        }
-                      }
-                    : null,
-                child: Text(
-                  controller.profileMutationBusy
-                      ? 'Connecting…'
-                      : controller.conversation == null
-                      ? 'Connect a server'
-                      : 'Connect to ${controller.conversationProfile.name} to continue',
-                ),
-              ),
-            )
-          else if (controller.models.isEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Wrap(
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  const Text('No models returned.'),
-                  TextButton(
-                    onPressed: controller.canChangeContext
-                        ? controller.refreshModels
-                        : null,
-                    child: const Text('Refresh'),
-                  ),
-                ],
-              ),
-            )
-          else if (controller.selectedModel == null)
-            TextButton(
-              onPressed: () => showModelSheet(context, controller),
-              child: const Text('Choose an available model to continue'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                );
+              },
             ),
-          if (controller.contextNotice case final notice?)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(18, 4, 18, 8),
-              child: Text(
-                notice,
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.bodySmall
-                    ?.copyWith(color: colors.onSurfaceVariant),
-              ),
-            ),
-          if (controller.queuedPrompts.isNotEmpty)
-            QueuedPromptPanel(
-              prompts: controller.queuedPrompts,
-              paused: controller.queuePaused,
-              onResume: controller.resumeQueue,
-              onEdit: controller.editQueuedPrompt,
-              onRemove: controller.removeQueuedPrompt,
-              onReorder: controller.reorderQueuedPrompts,
-            ),
-          if (controller.pendingImageReferences.isNotEmpty)
-            PendingImageStrip(
-              references: controller.pendingImageReferences,
-              onRemove: controller.removePendingImage,
-            ),
-          if (controller.pendingImageReferences.isNotEmpty &&
-              controller.conversationConnected &&
-              controller.selectedModel != null &&
-              !controller.supportsImages)
-            const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 16),
-              child: Text(
-                'Remove the image or choose a model that supports images.',
-              ),
-            ),
-          if (controller.pendingDocuments.isNotEmpty)
-            _PendingDocuments(
-              documents: controller.pendingDocuments,
-              onRemove: controller.removePendingDocument,
-            ),
-          ChatComposer(
-            draftScopeRevision: controller.draftScopeRevision,
-            draftText: controller.draftText,
-            onDraftChanged: controller.setDraftText,
-            isStreaming: controller.isStreaming,
-            isQueueing:
-                controller.isStreaming || controller.queuedPrompts.isNotEmpty,
-            enabled:
-                controller.canQueueOrSend &&
-                !controller.isSubmitting &&
-                !controller.conversationMutationBusy,
-            sendEnabled:
-                controller.canQueueOrSend &&
-                (controller.pendingImageReferences.isEmpty ||
-                    controller.supportsImages),
-            hasAttachments:
-                controller.pendingImageReferences.isNotEmpty ||
-                controller.pendingDocuments.isNotEmpty,
-            imagesEnabled:
-                controller.conversationConnected &&
-                controller.selectedModel != null &&
-                controller.supportsImages,
-            onPickImage: controller.pickImage,
-            onTakePhoto: () => controller.pickImage(camera: true),
-            onPickDocument: controller.pickDocument,
-            onSend: controller.send,
-            onStop: controller.stop,
           ),
         ],
       ),
@@ -330,58 +505,171 @@ class _ChatBody extends StatelessWidget {
   }
 }
 
-class _Welcome extends StatelessWidget {
-  const _Welcome();
+/// Collapsed queue and attachment previews for short viewports. Each summary
+/// opens the full editing surface.
+class _DraftSummary extends StatelessWidget {
+  const _DraftSummary({
+    required this.queued,
+    required this.queuePaused,
+    required this.attachments,
+    required this.onOpenQueue,
+    required this.onOpenAttachments,
+  });
+
+  final int queued;
+  final bool queuePaused;
+  final int attachments;
+  final VoidCallback onOpenQueue;
+  final VoidCallback onOpenAttachments;
+
   @override
-  Widget build(BuildContext context) => LayoutBuilder(
-    builder: (context, constraints) => SingleChildScrollView(
-      child: ConstrainedBox(
-        constraints: BoxConstraints(minHeight: constraints.maxHeight),
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 18),
-            child:
-                !Design.dark(context) &&
-                    MediaQuery.textScalerOf(context).scale(17) < 24
-                ? Image.asset(
-                    'assets/welcome.png',
-                    width: 236,
-                    semanticLabel: 'What can I help with?',
-                  )
-                : ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 290),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        ExcludeSemantics(
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(17),
-                            child: Image.asset(
-                              'assets/mobilellama-icon.png',
-                              width: 72,
-                              height: 72,
-                            ),
-                          ),
+  Widget build(BuildContext context) {
+    if (queued == 0 && attachments == 0) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(
+        Design.gutter,
+        Design.space1,
+        Design.gutter,
+        0,
+      ),
+      child: Wrap(
+        spacing: Design.space2,
+        runSpacing: Design.space1,
+        children: <Widget>[
+          if (queued > 0)
+            _SummaryButton(
+              label: queuePaused ? '$queued queued · paused' : '$queued queued',
+              icon: Icons.schedule_send_outlined,
+              onPressed: onOpenQueue,
+            ),
+          if (attachments > 0)
+            _SummaryButton(
+              label: attachments == 1
+                  ? '1 attachment'
+                  : '$attachments attachments',
+              icon: Icons.attach_file_rounded,
+              onPressed: onOpenAttachments,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SummaryButton extends StatelessWidget {
+  const _SummaryButton({
+    required this.label,
+    required this.icon,
+    required this.onPressed,
+  });
+  final String label;
+  final IconData icon;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) => OutlinedButton.icon(
+    onPressed: onPressed,
+    style: OutlinedButton.styleFrom(
+      minimumSize: const Size(Design.target, Design.target),
+      padding: const EdgeInsets.symmetric(horizontal: Design.space3),
+      foregroundColor: Theme.of(context).colorScheme.onSurface,
+      side: BorderSide(color: Design.line(context)),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(Design.radiusMedium),
+      ),
+    ),
+    icon: Icon(icon, size: 18),
+    label: Text(label),
+  );
+}
+
+class _Welcome extends StatelessWidget {
+  const _Welcome({
+    required this.setup,
+    required this.connecting,
+    required this.onConnect,
+  });
+
+  /// True when there is no usable connection for this new chat: explain the
+  /// app's purpose and offer the connect action.
+  final bool setup;
+  final bool connecting;
+  final VoidCallback? onConnect;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return LayoutBuilder(
+      builder: (context, constraints) => SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: constraints.maxHeight),
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 18),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 340),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    ExcludeSemantics(
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(17),
+                        child: Image.asset(
+                          'assets/mobilellama-icon.png',
+                          width: 72,
+                          height: 72,
                         ),
-                        const SizedBox(height: 42),
-                        const Text(
-                          'What can I\nhelp with?',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: 32,
-                            height: 1.15,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: -.8,
-                          ),
-                        ),
-                      ],
+                      ),
                     ),
-                  ),
+                    SizedBox(height: setup ? Design.space5 : 42),
+                    Semantics(
+                      header: true,
+                      child: Text(
+                        setup
+                            ? 'Chat with models on your own server.'
+                            : 'What can I\nhelp with?',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: setup ? 26 : 32,
+                          height: 1.15,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: setup ? -.5 : -.8,
+                        ),
+                      ),
+                    ),
+                    if (setup) ...[
+                      const SizedBox(height: Design.space3),
+                      Text(
+                        'Connect Ollama or an OpenAI-compatible API. '
+                        'Models run on that server.',
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.bodyLarge?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: Design.space5),
+                      FilledButton(
+                        onPressed: onConnect,
+                        style: FilledButton.styleFrom(
+                          minimumSize: const Size(0, 48),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: Design.space5,
+                          ),
+                        ),
+                        child: Text(
+                          connecting ? 'Connecting…' : 'Connect a server',
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
           ),
         ),
       ),
-    ),
-  );
+    );
+  }
 }
 
 class _HistoryDrawer extends StatelessWidget {
@@ -583,7 +871,12 @@ class _PendingDocuments extends StatelessWidget {
       height: 56,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.fromLTRB(14, 4, 14, 4),
+        padding: const EdgeInsets.fromLTRB(
+          Design.gutter,
+          Design.space1,
+          Design.gutter,
+          Design.space1,
+        ),
         itemCount: documents.length,
         separatorBuilder: (_, _) => const SizedBox(width: 8),
         itemBuilder: (context, index) {
@@ -593,7 +886,7 @@ class _PendingDocuments extends StatelessWidget {
             decoration: BoxDecoration(
               color: colors.surfaceContainerLow,
               border: Border.all(color: Design.line(context)),
-              borderRadius: BorderRadius.circular(14),
+              borderRadius: BorderRadius.circular(Design.radiusMedium),
             ),
             child: Row(
               mainAxisSize: MainAxisSize.min,
