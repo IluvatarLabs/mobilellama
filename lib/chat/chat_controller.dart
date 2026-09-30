@@ -10,6 +10,7 @@ import '../data/chat_backup.dart';
 import '../data/chat_sync.dart';
 import '../data/document_reader.dart';
 import '../data/settings_store.dart';
+import '../domain/chat_status.dart';
 import '../domain/conversation.dart';
 import '../domain/generation_options.dart';
 import '../domain/message.dart';
@@ -24,6 +25,8 @@ import '../ollama/web_agent.dart';
 import 'activity_disclosure.dart';
 import 'background_execution.dart';
 import 'transcript.dart';
+
+export '../domain/chat_status.dart';
 
 typedef OllamaClientFactory = OllamaClient Function(String baseUrl);
 typedef OpenAiCompatibleClientFactory = OpenAiCompatibleClient Function(
@@ -211,8 +214,10 @@ final class _RunConfiguration {
     required this.thinking,
     required this.webEnabled,
     this.webKey,
+    required this.endpointGeneration,
   });
   final ServerProfile profile;
+  final int endpointGeneration;
   final OllamaClient? ollama;
   final OpenAiCompatibleClient? compatible;
   final bool thinking;
@@ -367,7 +372,7 @@ class ChatController extends ChangeNotifier {
   String? _webApiKey;
   bool _webDisclosureAcknowledged = false;
   bool _initialized = false;
-  bool _modelLoading = false;
+  bool _selectingModel = false;
   bool _profileMutationBusy = false;
   bool _conversationMutationBusy = false;
   bool _isSubmitting = false;
@@ -376,12 +381,23 @@ class ChatController extends ChangeNotifier {
   final Set<String> _queuePausedIds = {};
   final Set<String> _queueStartingIds = {};
   final Set<Future<void>> _queueDrains = {};
-  final Map<String, String> _runErrors = {};
+
+  /// One classified failure per chat; a late error from one chat never
+  /// replaces another chat's failure.
+  final Map<String, ChatFailure> _chatFailures = {};
+  final Map<String, ConnectionStatus> _profileStatus = {};
+  final Map<String, ChatFailure> _profileFailures = {};
+  final Map<String, int> _endpointGenerations = {};
+  final Map<String, Future<_ServerProbe?>> _profileProbes = {};
+  final Set<String> _checkpointIds = {};
+  final Set<String> _modelListRefreshing = {};
+  final Map<String, ChatFailure> _modelListErrors = {};
+  final Map<String, Future<void>> _detailLoads = {};
+  final Map<String, ChatFailure> _detailErrors = {};
   bool get _isStreaming => isConversationRunning(conversation?.id ?? '');
   int _draftScopeRevision = 0;
   Completer<void>? _submissionCompleter;
   Future<void>? _shutdownFuture;
-  ServerConnectionState _connectionState = ServerConnectionState.disconnected;
   String? _errorMessage;
   String? _draftPersistenceError;
   String? _contextNotice;
@@ -391,27 +407,125 @@ class ChatController extends ChangeNotifier {
   final Set<String> _storedServerApiKeySecrets = <String>{};
 
   bool get initialized => _initialized;
+
+  /// Network probes and metadata reads never set this global lock; only
+  /// brief local mutations and submission do.
   bool get _profileChangesBlocked =>
       _isSubmitting ||
       _queueStartingIds.isNotEmpty ||
-      _modelLoading ||
       _profileMutationBusy ||
       _conversationMutationBusy ||
       _shutdownFuture != null;
-  ServerConnectionState get connectionState => _connectionState;
-  bool get isConnected => _connectionState == ServerConnectionState.connected;
-  bool get isConnecting => _connectionState == ServerConnectionState.connecting;
+
+  /// Derived from the active profile's evidence and its live client binding.
+  ServerConnectionState get connectionState {
+    final hasClient = _ollama != null || _openAiCompatible != null;
+    return switch (connectionStatusFor(activeProfileId)) {
+      ConnectionStatus.ready =>
+        hasClient
+            ? ServerConnectionState.connected
+            : ServerConnectionState.disconnected,
+      ConnectionStatus.checking => ServerConnectionState.connecting,
+      ConnectionStatus.saved ||
+      ConnectionStatus.notConfigured => ServerConnectionState.disconnected,
+      _ => ServerConnectionState.error,
+    };
+  }
+
+  bool get isConnected => connectionState == ServerConnectionState.connected;
+  bool get isConnecting => connectionState == ServerConnectionState.connecting;
   bool get profileMutationBusy => _profileMutationBusy;
   bool get conversationMutationBusy => _conversationMutationBusy;
   String? get version => _version?.version;
+
+  /// Compatibility text for existing banners. New UI should render
+  /// [conversationFailure], [conversationConnectionFailure], and
+  /// [draftPersistenceFailure] with their actions instead.
   String? get errorMessage {
-    final errors = [
+    final errors = <String>{
       if (_errorMessage != null) _errorMessage!,
-      if (_runErrors[conversation?.id] case final error?) error,
+      if (conversationConnectionFailure case final failure?) failure.message,
+      if (_chatFailures[conversation?.id] case final failure?) failure.message,
       if (_draftPersistenceError != null) _draftPersistenceError!,
-    ];
+    };
     return errors.isEmpty ? null : errors.join('\n');
   }
+
+  /// True once any saved profile was configured by the user or an existing
+  /// installation. A fresh install starts with an unconfigured bootstrap
+  /// profile ([activeProfileId]), which the first connection form should edit.
+  bool get isConfigured => profiles.any((profile) => profile.configured);
+
+  ConnectionStatus connectionStatusFor(String profileId) {
+    final profile = _profileById(profileId);
+    if (profile == null) return ConnectionStatus.unavailable;
+    if (!profile.configured) return ConnectionStatus.notConfigured;
+    return _profileStatus[profileId] ?? ConnectionStatus.saved;
+  }
+
+  /// Destination of the visible chat, or of a new chat's selected profile.
+  String get conversationDestinationName => conversationProfile.name;
+  ConnectionStatus get conversationConnectionStatus =>
+      connectionStatusFor(conversationProfile.id);
+
+  /// The last probe/request failure for a server, cleared by success.
+  ChatFailure? connectionFailureFor(String profileId) =>
+      _profileFailures[profileId];
+  ChatFailure? get conversationConnectionFailure =>
+      conversationConnected ? null : _profileFailures[conversationProfile.id];
+
+  /// The request failure for one chat, near its [ChatFailure.messageId].
+  ChatFailure? failureFor(String conversationId) =>
+      _chatFailures[conversationId];
+  ChatFailure? get conversationFailure => _chatFailures[conversation?.id];
+
+  /// Dismisses a failure's presentation; message status and data are kept.
+  void dismissFailure(String conversationId) {
+    if (_chatFailures.remove(conversationId) != null) notifyListeners();
+  }
+
+  ChatFailure? get draftPersistenceFailure => _draftPersistenceError == null
+      ? null
+      : ChatFailure(
+          kind: ChatFailureKind.persistence,
+          message: _draftPersistenceError!,
+          actions: const [ChatRecoveryAction.retrySave],
+        );
+
+  /// Retries saving every scoped draft after a local persistence failure.
+  Future<void> retryDraftSave() => flushDrafts();
+
+  bool isDestinationAcknowledged(ServerProfile profile) {
+    try {
+      return _settingsStore.isDestinationAcknowledged(
+        profile.protocol,
+        _canonicalServerBaseUrl(profile.protocol, profile.baseUrl),
+      );
+    } on FormatException {
+      return false;
+    }
+  }
+
+  /// Records that the user accepted sending chat content to this exact
+  /// protocol and canonical endpoint. A changed destination needs it again.
+  Future<bool> acknowledgeDestination(ServerProfile profile) async {
+    try {
+      await _settingsStore.acknowledgeDestination(
+        profile.protocol,
+        _canonicalServerBaseUrl(profile.protocol, profile.baseUrl),
+      );
+      return true;
+    } on Object catch (error) {
+      _errorMessage =
+          'The destination acknowledgement could not be saved: '
+          '${_friendlyError(error)}';
+      return false;
+    } finally {
+      notifyListeners();
+    }
+  }
+
+  int _generationOf(String profileId) => _endpointGenerations[profileId] ?? 0;
 
   LocalSettings? get settings => _settings;
   String get baseUrl => _settings?.baseUrl ?? SettingsStore.defaultBaseUrl;
@@ -474,53 +588,65 @@ class ChatController extends ChangeNotifier {
   OllamaShowResponse? detailsForModel(String model, {String? profileId}) =>
       _modelDetails['${profileId ?? activeProfileId}:$model'];
 
-  /// Read capabilities without changing the conversation's selected model.
+  /// Picker metadata: refreshes the list separately and loads only the
+  /// selected model's details. Never takes a global lock or changes selection.
   Future<void> loadModelCapabilities({String? profileId}) async {
     final id = profileId ?? activeProfileId;
-    if (!canChangeContext) return;
-    final profile = _profileById(id);
-    if (profile == null) return;
+    if (_profileById(id) == null) return;
+    await refreshModelList(profileId: id);
+    final model = id == activeProfileId ? _selectedModel : null;
+    if (model != null) await loadModelDetails(model, profileId: id);
+  }
 
-    _profileMutationBusy = true;
-    _modelManagementBusy = true;
-    _modelManagementProfileId = id;
-    _modelManagementError = null;
-    _modelManagementStatus = 'Loading model details…';
+  /// Loads one model's details on demand. Duplicate in-flight reads for the
+  /// same profile endpoint and model are coalesced, and a result that arrives
+  /// after the endpoint changed is ignored.
+  Future<void> loadModelDetails(String model, {String? profileId}) {
+    final id = profileId ?? activeProfileId;
+    if (_modelDetails.containsKey('$id:$model')) return Future<void>.value();
+    final key = '$id:${_generationOf(id)}:$model';
+    final existing = _detailLoads[key];
+    if (existing != null) return existing;
+    late final Future<void> load;
+    load = _loadModelDetails(id, model).whenComplete(() {
+      if (identical(_detailLoads[key], load)) _detailLoads.remove(key);
+    });
+    _detailLoads[key] = load;
     notifyListeners();
+    return load;
+  }
+
+  Future<void> _loadModelDetails(String profileId, String model) async {
+    final profile = _profileById(profileId);
+    if (profile == null || profileId != activeProfileId) return;
+    final cacheKey = '$profileId:$model';
+    if (profile.protocol == ServerProtocol.openAiCompatible) {
+      final details = _compatibleDetails(model);
+      _modelDetails[cacheKey] = details;
+      if (_selectedModel == model) _selectedModelDetails = details;
+      return;
+    }
+    final client = _ollama;
+    if (client == null) return;
+    final generation = _generationOf(profileId);
+    _detailErrors.remove(cacheKey);
     try {
-      final probe = await _probeServerProfile(profile);
-      if (_shutdownFuture != null) return;
-      _setProfileModels(id, probe.models);
-      if (probe.openAiCompatible != null) {
-        for (final model in probe.models) {
-          _modelDetails['$id:${model.name}'] = _compatibleDetailsForProfile(
-            id,
-            model.name,
-            probe.openAiCompatible,
-          );
-        }
-        _modelManagementStatus = null;
-        notifyListeners();
+      final details = await client.showModel(model);
+      if (generation != _generationOf(profileId) || _shutdownFuture != null) {
         return;
       }
-      final client = probe.ollama!;
-      for (final model in probe.models) {
-        final key = '$id:${model.name}';
-        if (_modelDetails.containsKey(key)) continue;
-        try {
-          _modelDetails[key] = await client.showModel(model.name);
-          notifyListeners();
-        } on Object {
-          // An unavailable capability response must not block model selection.
-        }
+      _modelDetails[cacheKey] = details;
+      if (profileId == activeProfileId && _selectedModel == model) {
+        _selectedModelDetails = details;
       }
-      _modelManagementStatus = null;
     } on Object catch (error) {
-      _modelManagementError = _friendlyError(error);
-      _modelManagementStatus = null;
+      if (generation != _generationOf(profileId)) return;
+      _detailErrors[cacheKey] = _classifyFailure(
+        error,
+        profile: profile,
+        model: model,
+      );
     } finally {
-      _modelManagementBusy = false;
-      _profileMutationBusy = false;
       notifyListeners();
     }
   }
@@ -571,13 +697,32 @@ class ChatController extends ChangeNotifier {
     notifyListeners();
   }
 
-  bool get modelLoading => _modelLoading;
+  /// The active profile's model list is refreshing.
+  bool get modelLoading => _modelListRefreshing.contains(activeProfileId);
+  bool modelListRefreshing(String profileId) =>
+      _modelListRefreshing.contains(profileId);
+
+  /// Last list refresh failure for a profile; cached rows stay usable.
+  ChatFailure? modelListError(String profileId) => _modelListErrors[profileId];
+  bool modelDetailsLoading(String model, {String? profileId}) {
+    final id = profileId ?? activeProfileId;
+    return _detailLoads.containsKey('$id:${_generationOf(id)}:$model');
+  }
+
+  /// A failed detail read is local to that model and can be retried with
+  /// [loadModelDetails].
+  ChatFailure? modelDetailsError(String model, {String? profileId}) =>
+      _detailErrors['${profileId ?? activeProfileId}:$model'];
   bool _modelManagementBusy = false;
   bool get modelManagementBusy => _modelManagementBusy;
   bool get canManageModels =>
-      canChangeContext && isConnected && _ollama != null;
+      canChangeContext &&
+      !_modelManagementBusy &&
+      isConnected &&
+      _ollama != null;
   bool canManageModelsForProfile(String profileId) =>
       canChangeContext &&
+      !_modelManagementBusy &&
       _profileById(profileId)?.protocol == ServerProtocol.ollama;
   String? _modelManagementProfileId;
   String? get modelManagementProfileId => _modelManagementProfileId;
@@ -590,7 +735,8 @@ class ChatController extends ChangeNotifier {
   String? _modelManagementError;
   String? get modelManagementError => _modelManagementError;
   String? modelManagementErrorForProfile(String profileId) =>
-      _modelManagementProfileId == profileId ? _modelManagementError : null;
+      (_modelManagementProfileId == profileId ? _modelManagementError : null) ??
+      _modelListErrors[profileId]?.message;
   double? _modelDownloadProgress;
   double? get modelDownloadProgress => _modelDownloadProgress;
   double? modelDownloadProgressForProfile(String profileId) =>
@@ -619,7 +765,6 @@ class ChatController extends ChangeNotifier {
   }) async {
     if (!canManageModelsForProfile(profileId)) return false;
     final profile = _profileById(profileId)!;
-    _conversationMutationBusy = true;
     _modelManagementBusy = true;
     _modelManagementProfileId = profileId;
     _modelManagementError = null;
@@ -671,7 +816,6 @@ class ChatController extends ChangeNotifier {
     } finally {
       _modelPull = null;
       _modelManagementBusy = false;
-      _conversationMutationBusy = false;
       _modelOperation = null;
       operation.complete();
       notifyListeners();
@@ -702,16 +846,38 @@ class ChatController extends ChangeNotifier {
       (_thread == null ||
           _thread!.conversation.serverProfileId == activeProfileId);
   bool get canChangeContext => !_profileChangesBlocked;
-  bool get canSend =>
-      conversationConnected &&
-      _selectedModel != null &&
-      !_profileChangesBlocked &&
-      !_isStreaming &&
-      queuedPrompts.isEmpty;
-  bool get canQueueOrSend =>
+
+  /// Local draft permission: text entry, selection, copying, draft
+  /// persistence, and attachment removal. Independent of server reachability.
+  bool get canEditDraft =>
+      _initialized && _shutdownFuture == null && !_conversationMutationBusy;
+
+  /// Network submission permission (send, or queue while streaming).
+  bool get canSubmit =>
       conversationConnected &&
       _selectedModel != null &&
       !_profileChangesBlocked;
+
+  /// Compatibility name for [canSubmit].
+  bool get canQueueOrSend => canSubmit;
+
+  /// Why submission is or is not available; [canSubmit] is true exactly for
+  /// [SubmitAvailability.ready], [SubmitAvailability.streaming], and
+  /// [SubmitAvailability.queuePaused].
+  SubmitAvailability get submitAvailability {
+    if (!conversationProfile.configured) return SubmitAvailability.noConnection;
+    if (!conversationConnected) return SubmitAvailability.unavailable;
+    if (_selectedModel == null) return SubmitAvailability.noModel;
+    if (_profileChangesBlocked) return SubmitAvailability.localMutation;
+    if (_isStreaming) return SubmitAvailability.streaming;
+    if (queuePaused) return SubmitAvailability.queuePaused;
+    return SubmitAvailability.ready;
+  }
+
+  /// Image support of the selected model: null while unknown.
+  bool? get imagesSupported => _selectedModelDetails?.supportsVision;
+
+  bool get canSend => canSubmit && !_isStreaming && queuedPrompts.isEmpty;
   bool isConversationRunning(String id) =>
       _runs.containsKey(id) || _queueStartingIds.contains(id);
   List<QueuedPrompt> get queuedPrompts =>
@@ -763,13 +929,23 @@ class ChatController extends ChangeNotifier {
 
   Future<void> initialize() async {
     if (_initialized) return;
-    await _settingsStore.migrateLegacyProfile();
     final savedDrafts = await _conversations.loadDrafts();
+    // Existing history or drafts are migration evidence of a configured
+    // installation; only a fresh install gets an unconfigured bootstrap.
+    await _settingsStore.migrateLegacyProfile(
+      hasLocalHistory:
+          savedDrafts.isNotEmpty ||
+          (await _conversations.listAllConversations(includeEmpty: true))
+              .isNotEmpty,
+    );
     for (final entry in savedDrafts.entries) {
       _drafts[entry.key] = _ChatDraft.fromJson(entry.value);
     }
     await _reloadQueues();
     _queuePausedIds.addAll(_queues.keys);
+    _checkpointIds.addAll(
+      await _conversations.recoveryCheckpointConversationIds(),
+    );
     _settings = _settingsStore.load();
     await _refreshStoredServerApiKeySecrets();
     if (serverProtocol == ServerProtocol.openAiCompatible) {
@@ -808,15 +984,13 @@ class ChatController extends ChangeNotifier {
     }
     notifyListeners();
 
+    if (!activeProfile.configured) return;
     if (isInsecureHttp && !insecureLanAcknowledged) return;
-    await connectToServer(
-      baseUrl,
-      protocol: serverProtocol,
-      acknowledgedInsecureOrigin: acknowledgedInsecureOrigin,
-      persist: false,
-    );
+    await _connectProfile(activeProfileId);
   }
 
+  /// Legacy entry point. `persist: false` reconnects the active profile;
+  /// otherwise the candidate replaces the active profile via Save and connect.
   Future<bool> connectToServer(
     String value, {
     ServerProtocol protocol = ServerProtocol.ollama,
@@ -825,6 +999,7 @@ class ChatController extends ChangeNotifier {
     bool persist = true,
   }) async {
     if (_profileChangesBlocked) return false;
+    if (!persist) return _connectProfile(activeProfileId);
     final currentProfile = activeProfile;
     late final ServerProfile candidate;
     try {
@@ -840,136 +1015,179 @@ class ChatController extends ChangeNotifier {
       notifyListeners();
       return false;
     }
-    final previousConnectionState = _connectionState;
-    _connectionState = ServerConnectionState.connecting;
-    _errorMessage = null;
-    notifyListeners();
-    final connected = persist
-        ? await upsertServerProfile(
-            candidate,
-            serverApiKey: serverApiKey,
-            makeActive: true,
-          )
-        : await _activateUnpersistedProfile(
-            candidate,
-            serverApiKey: serverApiKey,
-          );
-    if (!connected && _connectionState == ServerConnectionState.connecting) {
-      _connectionState = previousConnectionState;
+    final result = await saveAndConnectServerProfile(
+      candidate,
+      serverApiKey: serverApiKey,
+    );
+    if (!result.saved) {
+      _errorMessage = result.message;
       notifyListeners();
     }
-    return connected;
+    return result.connection?.succeeded ?? false;
   }
 
-  Future<bool> testServerProfile(
+  /// Tests a connection form without saving it or changing any status. Uses
+  /// only the version/model APIs; no chat content or attachment is sent.
+  /// A blank [serverApiKey] uses a key already stored for the exact endpoint.
+  Future<ConnectionTestResult> testConnection(
     ServerProfile profile, {
     String? serverApiKey,
   }) async {
-    if (_profileChangesBlocked) return false;
-    _profileMutationBusy = true;
-    _errorMessage = null;
-    notifyListeners();
     try {
-      await _probeServerProfile(profile, serverApiKey: serverApiKey);
-      return true;
-    } on Object catch (error) {
-      _errorMessage = _friendlyError(error);
-      return false;
-    } finally {
-      _profileMutationBusy = false;
-      notifyListeners();
-    }
-  }
-
-  /// Probes before writing either the profile or a newly entered API key.
-  /// Passing a blank key preserves and uses any key stored for the exact URL.
-  Future<bool> upsertServerProfile(
-    ServerProfile profile, {
-    String? serverApiKey,
-    bool makeActive = false,
-    bool preserveConversation = false,
-  }) async {
-    if (_profileChangesBlocked) return false;
-    _profileMutationBusy = true;
-    _errorMessage = null;
-    String? writtenSecret;
-    String? replacedSecretValue;
-    var profilePersisted = false;
-    notifyListeners();
-    try {
-      final previousActiveId = activeProfileId;
-      final previousActiveProfile = activeProfile;
-      final previousProfile = _profileById(profile.id);
-      final activeIdentityChanged =
-          profile.id == previousActiveId &&
-          !_sameServerIdentity(previousActiveProfile, profile);
-      if (previousProfile != null) {
-        final identityChanged = !_sameServerIdentity(previousProfile, profile);
-        if (identityChanged &&
-            await _conversations.hasConversations(profile.id)) {
-          throw const FormatException(
-            'Create a new profile for a different server.',
-          );
-        }
-      }
-      final previousSecret = previousProfile == null
-          ? null
-          : _serverSecretForProfile(previousProfile);
       final probe = await _probeServerProfile(
         profile,
         serverApiKey: serverApiKey,
       );
-      if (_shutdownFuture != null) return false;
-      final shouldActivate = makeActive || profile.id == previousActiveId;
+      return ConnectionTestResult.success(modelCount: probe.models.length);
+    } on Object catch (error) {
+      return ConnectionTestResult.failure(
+        _classifyFailure(error, profile: profile),
+      );
+    }
+  }
 
+  /// Compatibility wrapper for [testConnection].
+  Future<bool> testServerProfile(
+    ServerProfile profile, {
+    String? serverApiKey,
+  }) async {
+    final result = await testConnection(profile, serverApiKey: serverApiKey);
+    _errorMessage = result.failure?.message;
+    notifyListeners();
+    return result.succeeded;
+  }
+
+  /// Save: validates syntax and transport rules and persists the profile and
+  /// any entered key locally, without any network request.
+  ///
+  /// A same-protocol address change on a profile with chats returns
+  /// [ProfileSaveOutcome.confirmationRequired] until called with
+  /// [confirmAddressChange]. The profile ID, chats, drafts, defaults, and
+  /// capability overrides are preserved; queued work for the profile is
+  /// paused; model, capability, and connection caches and the in-memory
+  /// client/key binding are invalidated. A blank [serverApiKey] keeps only a
+  /// key already stored for the exact new endpoint; keys are never copied.
+  Future<ProfileSaveResult> saveServerProfile(
+    ServerProfile profile, {
+    String? serverApiKey,
+    bool confirmAddressChange = false,
+  }) async {
+    if (_profileMutationBusy || _shutdownFuture != null) {
+      return const ProfileSaveResult(
+        ProfileSaveOutcome.rejected,
+        message: 'Wait for the current action to finish.',
+      );
+    }
+    late final ServerProfile normalized;
+    try {
+      normalized = ServerProfile(
+        id: profile.id,
+        name: profile.name,
+        protocol: profile.protocol,
+        baseUrl: _canonicalServerBaseUrl(profile.protocol, profile.baseUrl),
+        acknowledgedInsecureOrigin: profile.acknowledgedInsecureOrigin,
+      );
+      _validateTransport(normalized);
+    } on Object catch (error) {
+      return ProfileSaveResult(
+        ProfileSaveOutcome.rejected,
+        message: _friendlyError(error),
+      );
+    }
+    final previous = _profileById(normalized.id);
+    final identityChanged =
+        previous != null && !_sameServerIdentity(previous, normalized);
+    if (identityChanged) {
+      final bool hasChats;
+      try {
+        hasChats = await _conversations.hasConversations(normalized.id);
+      } on Object catch (error) {
+        return ProfileSaveResult(
+          ProfileSaveOutcome.persistenceFailed,
+          message:
+              'The connection could not be checked: '
+              '${_friendlyError(error)}',
+        );
+      }
+      if (hasChats && previous.protocol != normalized.protocol) {
+        return ProfileSaveResult(
+          ProfileSaveOutcome.rejected,
+          message:
+              'Create a new connection for a different connection type. '
+              'Chats on “${previous.name}” keep their current server.',
+        );
+      }
+      if (_runs.values.any(
+            (run) => run.configuration.profile.id == previous.id,
+          ) ||
+          _history.any(
+            (chat) =>
+                chat.serverProfileId == previous.id &&
+                _queueStartingIds.contains(chat.id),
+          )) {
+        return ProfileSaveResult(
+          ProfileSaveOutcome.rejected,
+          message:
+              'Stop the response on “${previous.name}” before changing its '
+              'address.',
+        );
+      }
+      if (_modelManagementBusy && _modelManagementProfileId == previous.id) {
+        return ProfileSaveResult(
+          ProfileSaveOutcome.rejected,
+          message:
+              'Wait for the model download or deletion on “${previous.name}” '
+              'to finish before changing its address.',
+        );
+      }
+      if (hasChats && !confirmAddressChange) {
+        return ProfileSaveResult(
+          ProfileSaveOutcome.confirmationRequired,
+          message:
+              'Existing chats on “${previous.name}” will use the new address.',
+        );
+      }
+    }
+
+    _profileMutationBusy = true;
+    notifyListeners();
+    String? writtenSecret;
+    String? replacedSecretValue;
+    var profilePersisted = false;
+    try {
+      final previousSecret = previous == null
+          ? null
+          : _serverSecretForProfile(previous);
       final enteredKey = serverApiKey?.trim() ?? '';
-      if (probe.profile.protocol == ServerProtocol.openAiCompatible &&
+      if (normalized.protocol == ServerProtocol.openAiCompatible &&
           enteredKey.isNotEmpty) {
         final secret = _serverApiKeySecret(
-          probe.profile.protocol,
-          probe.profile.baseUrl,
+          normalized.protocol,
+          normalized.baseUrl,
         );
         replacedSecretValue = await _secrets.read(secret);
         await _secrets.write(secret, enteredKey);
         writtenSecret = secret;
         _storedServerApiKeySecrets.add(secret);
-      } else if (probe.profile.protocol == ServerProtocol.openAiCompatible &&
-          (probe.serverApiKey?.isNotEmpty ?? false)) {
-        _storedServerApiKeySecrets.add(
-          _serverApiKeySecret(probe.profile.protocol, probe.profile.baseUrl),
-        );
       }
-      await _settingsStore.upsertProfile(probe.profile);
+      await _settingsStore.upsertProfile(normalized);
       profilePersisted = true;
-      if (activeIdentityChanged) {
-        _draftScopeRevision += 1;
-        notifyListeners();
-      }
-      final currentSecret = _serverSecretForProfile(probe.profile);
+      if (identityChanged) _invalidateEndpoint(normalized.id);
+      if (normalized.id == activeProfileId) _settings = _settingsStore.load();
+      final currentSecret = _serverSecretForProfile(normalized);
       final keyCleanupWarning =
           previousSecret != null && previousSecret != currentSecret
           ? await _deleteServerSecretIfOrphaned(previousSecret)
           : null;
-      if (makeActive) {
-        await _settingsStore.setActiveProfile(probe.profile.id);
-        if (probe.profile.id != previousActiveId) {
-          _draftScopeRevision += 1;
-          notifyListeners();
-        }
-      }
-      if (shouldActivate) {
-        await _commitServerProbe(
-          probe,
-          preserveConversation: preserveConversation,
-        );
-      }
-      if (keyCleanupWarning != null) _errorMessage = keyCleanupWarning;
-      return true;
+      return ProfileSaveResult(
+        ProfileSaveOutcome.saved,
+        message: keyCleanupWarning,
+      );
     } on Object catch (error) {
       if (!profilePersisted && writtenSecret != null) {
         try {
-          final previous = replacedSecretValue?.trim() ?? '';
-          if (previous.isEmpty) {
+          final restored = replacedSecretValue?.trim() ?? '';
+          if (restored.isEmpty) {
             await _secrets.delete(writtenSecret);
             _storedServerApiKeySecrets.remove(writtenSecret);
           } else {
@@ -977,17 +1195,123 @@ class ChatController extends ChangeNotifier {
             _storedServerApiKeySecrets.add(writtenSecret);
           }
         } on Object {
-          // Keep the original save/probe failure as the visible error.
+          // Keep the original save failure as the visible error.
         }
       }
-      _errorMessage = _friendlyError(error);
-      return false;
+      return ProfileSaveResult(
+        ProfileSaveOutcome.persistenceFailed,
+        message: 'The connection could not be saved: ${_friendlyError(error)}',
+      );
     } finally {
       _profileMutationBusy = false;
       notifyListeners();
     }
   }
 
+  /// Save and connect: saves locally, records acknowledgement of this
+  /// destination, optionally makes it the new-chat destination, then checks
+  /// the connection. A failed connection never rolls back the saved profile.
+  Future<ProfileSaveResult> saveAndConnectServerProfile(
+    ServerProfile profile, {
+    String? serverApiKey,
+    bool confirmAddressChange = false,
+    bool makeActive = true,
+    bool preserveConversation = false,
+  }) async {
+    final save = await saveServerProfile(
+      profile,
+      serverApiKey: serverApiKey,
+      confirmAddressChange: confirmAddressChange,
+    );
+    if (!save.saved) return save;
+    final saved = _profileById(profile.id)!;
+    await acknowledgeDestination(saved);
+    if (makeActive &&
+        saved.id != activeProfileId &&
+        !await _activateProfileLocally(
+          saved.id,
+          preserveConversation: preserveConversation,
+        )) {
+      return ProfileSaveResult(
+        ProfileSaveOutcome.saved,
+        message: save.message,
+        connection: ConnectionTestResult.failure(
+          ChatFailure(
+            kind: ChatFailureKind.persistence,
+            message: _errorMessage ?? 'The server could not be selected.',
+            profileId: saved.id,
+          ),
+        ),
+      );
+    }
+    final connected = await _connectProfile(
+      saved.id,
+      preserveConversation: preserveConversation,
+    );
+    return ProfileSaveResult(
+      ProfileSaveOutcome.saved,
+      message: save.message,
+      connection: connected
+          ? ConnectionTestResult.success(
+              modelCount: modelsForProfile(saved.id).length,
+            )
+          : ConnectionTestResult.failure(
+              _profileFailures[saved.id] ??
+                  ChatFailure(
+                    kind: ChatFailureKind.transport,
+                    message: 'Could not reach “${saved.name}”.',
+                    actions: const [
+                      ChatRecoveryAction.retryConnection,
+                      ChatRecoveryAction.editConnection,
+                    ],
+                    profileId: saved.id,
+                  ),
+            ),
+    );
+  }
+
+  /// Compatibility API: saves locally (never rolled back by a failed probe),
+  /// then connects when the profile is or becomes active. An address change
+  /// that needs confirmation returns false with the confirmation text in
+  /// [errorMessage]; use [saveServerProfile] to confirm it.
+  Future<bool> upsertServerProfile(
+    ServerProfile profile, {
+    String? serverApiKey,
+    bool makeActive = false,
+    bool preserveConversation = false,
+  }) async {
+    if (_profileChangesBlocked) return false;
+    _errorMessage = null;
+    final result = await saveServerProfile(profile, serverApiKey: serverApiKey);
+    if (!result.saved) {
+      _errorMessage = result.message;
+      notifyListeners();
+      return false;
+    }
+    if (makeActive &&
+        profile.id != activeProfileId &&
+        !await _activateProfileLocally(
+          profile.id,
+          preserveConversation: preserveConversation,
+        )) {
+      return false;
+    }
+    if (profile.id == activeProfileId) {
+      await _connectProfile(
+        profile.id,
+        preserveConversation: preserveConversation,
+      );
+    }
+    if (result.message != null) {
+      _errorMessage = result.message;
+      notifyListeners();
+    }
+    return true;
+  }
+
+  /// Selects a saved profile as the new-chat destination immediately, even
+  /// offline, then checks connectivity separately. Returns false only when
+  /// the local switch itself failed.
   Future<bool> switchServerProfile(
     String id, {
     bool preserveConversation = false,
@@ -995,30 +1319,15 @@ class ChatController extends ChangeNotifier {
     if (_profileChangesBlocked) return false;
     final profile = _profileById(id);
     if (profile == null) return false;
-    final previousActiveId = activeProfileId;
-    _profileMutationBusy = true;
     _errorMessage = null;
-    notifyListeners();
-    try {
-      final probe = await _probeServerProfile(profile);
-      if (_shutdownFuture != null) return false;
-      await _settingsStore.setActiveProfile(probe.profile.id);
-      if (probe.profile.id != previousActiveId) {
-        _draftScopeRevision += 1;
-        notifyListeners();
-      }
-      await _commitServerProbe(
-        probe,
-        preserveConversation: preserveConversation,
-      );
-      return true;
-    } on Object catch (error) {
-      _errorMessage = _friendlyError(error);
+    if (!await _activateProfileLocally(
+      id,
+      preserveConversation: preserveConversation,
+    )) {
       return false;
-    } finally {
-      _profileMutationBusy = false;
-      notifyListeners();
     }
+    await _connectProfile(id, preserveConversation: preserveConversation);
+    return true;
   }
 
   Future<bool> deleteServerProfile(String id) async {
@@ -1039,7 +1348,14 @@ class ChatController extends ChangeNotifier {
       notifyListeners();
       return false;
     }
+    if (modelManagementBusyForProfile(id)) {
+      _errorMessage =
+          'Wait for the model download or deletion on this server to finish.';
+      notifyListeners();
+      return false;
+    }
 
+    final wasActive = id == activeProfileId;
     _profileMutationBusy = true;
     _errorMessage = null;
     notifyListeners();
@@ -1048,28 +1364,20 @@ class ChatController extends ChangeNotifier {
         throw const FormatException("Delete this profile's chats first.");
       }
       final deletedSecret = _serverSecretForProfile(currentProfiles[index]);
-      _ServerProbe? fallbackProbe;
-      if (id == activeProfileId) {
-        final remaining = List<ServerProfile>.of(currentProfiles)
-          ..removeAt(index);
-        final fallbackIndex = index < remaining.length
-            ? index
-            : remaining.length - 1;
-        final fallback = remaining[fallbackIndex];
-        fallbackProbe = await _probeServerProfile(fallback);
-        if (_shutdownFuture != null) return false;
-      }
       await _settingsStore.deleteProfile(id);
-      if (fallbackProbe != null) {
-        _draftScopeRevision += 1;
-        notifyListeners();
-        await _commitServerProbe(fallbackProbe);
+      _invalidateEndpoint(id);
+      _profileStatus.remove(id);
+      if (wasActive) {
+        _activateLocalState(activeProfileId);
+        if (_thread?.conversation.serverProfileId != activeProfileId) {
+          _thread = null;
+          _contextNotice = null;
+        }
       }
       if (deletedSecret != null) {
         final warning = await _deleteServerSecretIfOrphaned(deletedSecret);
         if (warning != null) _errorMessage = warning;
       }
-      return true;
     } on Object catch (error) {
       _errorMessage = _friendlyError(error);
       return false;
@@ -1077,33 +1385,173 @@ class ChatController extends ChangeNotifier {
       _profileMutationBusy = false;
       notifyListeners();
     }
+    if (wasActive) await _connectProfile(activeProfileId);
+    return true;
   }
 
-  Future<bool> _activateUnpersistedProfile(
-    ServerProfile profile, {
-    String? serverApiKey,
+  /// Makes [id] the new-chat destination without any network request.
+  Future<bool> _activateProfileLocally(
+    String id, {
+    bool preserveConversation = false,
   }) async {
-    if (_profileMutationBusy) return false;
-    final previousProfile = activeProfile;
-    _profileMutationBusy = true;
+    final previousActiveId = activeProfileId;
     try {
-      final probe = await _probeServerProfile(
-        profile,
-        serverApiKey: serverApiKey,
-      );
-      if (_shutdownFuture != null) return false;
-      if (!_sameServerIdentity(previousProfile, probe.profile)) {
-        _draftScopeRevision += 1;
-        notifyListeners();
-      }
-      await _commitServerProbe(probe);
-      return true;
+      await _settingsStore.setActiveProfile(id);
     } on Object catch (error) {
-      _errorMessage = _friendlyError(error);
-      return false;
-    } finally {
-      _profileMutationBusy = false;
+      _errorMessage =
+          'The server could not be selected: ${_friendlyError(error)}';
       notifyListeners();
+      return false;
+    }
+    if (id != previousActiveId) {
+      _activateLocalState(id);
+      if (!preserveConversation &&
+          _thread != null &&
+          _thread!.conversation.serverProfileId != id) {
+        _thread = null;
+        _contextNotice = null;
+      }
+    }
+    _settings = _settingsStore.load();
+    notifyListeners();
+    return true;
+  }
+
+  /// Drops the previous destination's client binding and shows [id]'s
+  /// cached model list until its own connection check completes.
+  void _activateLocalState(String id) {
+    _ollama = null;
+    _openAiCompatible = null;
+    _version = null;
+    _serverApiKey = null;
+    _models = _profileModels[id] ?? const <ChatModelOption>[];
+    _selectedModel = null;
+    _selectedModelDetails = null;
+    _settings = _settingsStore.load();
+    _draftScopeRevision += 1;
+  }
+
+  /// Invalidates caches and bindings after a profile's endpoint changed.
+  void _invalidateEndpoint(String profileId) {
+    _endpointGenerations[profileId] = _generationOf(profileId) + 1;
+    _profileProbes.remove(profileId);
+    _profileModels.remove(profileId);
+    _modelDetails.removeWhere((key, _) => key.startsWith('$profileId:'));
+    _detailErrors.removeWhere((key, _) => key.startsWith('$profileId:'));
+    _modelListErrors.remove(profileId);
+    _profileFailures.remove(profileId);
+    _profileStatus[profileId] = ConnectionStatus.saved;
+    // Queued work never follows a changed destination without Resume.
+    for (final chat in _history) {
+      if (chat.serverProfileId == profileId &&
+          (_queues[chat.id]?.isNotEmpty ?? false)) {
+        _queuePausedIds.add(chat.id);
+      }
+    }
+    if (profileId == activeProfileId) _activateLocalState(profileId);
+  }
+
+  /// Checks [profileId] and, when it is (or becomes, with [activate]) the
+  /// active destination and [stillWanted] holds, binds its client.
+  /// Returns whether the probe succeeded and is still current.
+  Future<bool> _connectProfile(
+    String profileId, {
+    bool activate = false,
+    bool preserveConversation = false,
+    bool Function()? stillWanted,
+  }) async {
+    final profile = _profileById(profileId);
+    if (profile == null || !profile.configured) return false;
+    final probe = await _checkProfile(profile);
+    if (probe == null) return false;
+    if (stillWanted != null && !stillWanted()) return true;
+    if (activate &&
+        profileId != activeProfileId &&
+        !await _activateProfileLocally(
+          profileId,
+          preserveConversation: preserveConversation,
+        )) {
+      return false;
+    }
+    if (profileId == activeProfileId) {
+      await _commitServerProbe(
+        probe,
+        preserveConversation: preserveConversation,
+      );
+    }
+    return true;
+  }
+
+  /// One in-flight probe per profile; records status evidence and ignores a
+  /// result whose profile identity or endpoint generation changed.
+  Future<_ServerProbe?> _checkProfile(ServerProfile profile) {
+    final existing = _profileProbes[profile.id];
+    if (existing != null) return existing;
+    late final Future<_ServerProbe?> probe;
+    probe = _runProfileCheck(profile).whenComplete(() {
+      if (identical(_profileProbes[profile.id], probe)) {
+        _profileProbes.remove(profile.id);
+      }
+    });
+    _profileProbes[profile.id] = probe;
+    return probe;
+  }
+
+  Future<_ServerProbe?> _runProfileCheck(ServerProfile profile) async {
+    final generation = _generationOf(profile.id);
+    bool current() {
+      final latest = _profileById(profile.id);
+      return _shutdownFuture == null &&
+          latest != null &&
+          generation == _generationOf(profile.id) &&
+          _sameServerIdentity(latest, profile);
+    }
+
+    _profileStatus[profile.id] = ConnectionStatus.checking;
+    notifyListeners();
+    try {
+      final probe = await _probeServerProfile(profile);
+      if (!current()) return null;
+      _profileStatus[profile.id] = ConnectionStatus.ready;
+      _profileFailures.remove(profile.id);
+      _modelListErrors.remove(profile.id);
+      if (profile.id != activeProfileId) {
+        _setProfileModels(profile.id, probe.models);
+      }
+      return probe;
+    } on Object catch (error) {
+      if (current()) {
+        _recordProfileFailure(
+          profile.id,
+          _classifyFailure(error, profile: profile),
+        );
+      }
+      return null;
+    } finally {
+      notifyListeners();
+    }
+  }
+
+  void _recordProfileFailure(String profileId, ChatFailure failure) {
+    _profileFailures[profileId] = failure;
+    _profileStatus[profileId] = switch (failure.kind) {
+      ChatFailureKind.authentication => ConnectionStatus.authenticationRequired,
+      ChatFailureKind.localNetworkDenied => ConnectionStatus.localNetworkDenied,
+      _ => ConnectionStatus.unavailable,
+    };
+  }
+
+  static void _validateTransport(ServerProfile profile) {
+    if (Uri.parse(profile.baseUrl).scheme != 'http') return;
+    if (!insecureHttpHostAllowed(profile.baseUrl)) {
+      throw const FormatException(
+        'HTTP is allowed only for localhost, .local hosts, and private or link-local IP addresses. Use HTTPS for other hosts.',
+      );
+    }
+    if (!profile.insecureLanAcknowledged) {
+      throw const FormatException(
+        'Confirm that HTTP traffic is unencrypted before connecting.',
+      );
     }
   }
 
@@ -1117,19 +1565,11 @@ class ChatController extends ChangeNotifier {
       protocol: profile.protocol,
       baseUrl: _canonicalServerBaseUrl(profile.protocol, profile.baseUrl),
       acknowledgedInsecureOrigin: profile.acknowledgedInsecureOrigin,
+      configured: profile.configured,
     );
     final uri = Uri.parse(normalized.baseUrl);
     if (uri.scheme == 'http') {
-      if (!insecureHttpHostAllowed(normalized.baseUrl)) {
-        throw const FormatException(
-          'HTTP is allowed only for localhost, .local hosts, and private or link-local IP addresses. Use HTTPS for other hosts.',
-        );
-      }
-      if (!normalized.insecureLanAcknowledged) {
-        throw const FormatException(
-          'Confirm that HTTP traffic is unencrypted before connecting.',
-        );
-      }
+      _validateTransport(normalized);
       await _localNetworkPreflight?.prepare(
         host: uri.host,
         port: uri.hasPort ? uri.port : 80,
@@ -1189,7 +1629,8 @@ class ChatController extends ChangeNotifier {
     _selectedModel = null;
     _selectedModelDetails = null;
     _settings = _settingsStore.load();
-    _connectionState = ServerConnectionState.connected;
+    _profileStatus[probe.profile.id] = ConnectionStatus.ready;
+    _profileFailures.remove(probe.profile.id);
     _errorMessage = null;
     if (!preserveConversation &&
         _thread != null &&
@@ -1274,69 +1715,81 @@ class ChatController extends ChangeNotifier {
     }
   }
 
-  Future<void> refreshModels() async {
-    final ollama = _ollama;
-    final openAiCompatible = _openAiCompatible;
-    if ((ollama == null && openAiCompatible == null) ||
-        _isStreaming ||
-        _isSubmitting ||
-        _modelLoading ||
-        _profileMutationBusy ||
-        _conversationMutationBusy) {
+  /// Compatibility name for [refreshModelList] on the active profile.
+  Future<void> refreshModels() => refreshModelList();
+
+  /// Refreshes one profile's model list with its own loading and error state.
+  /// Cached rows stay visible; no global lock is taken.
+  Future<void> refreshModelList({String? profileId}) async {
+    final id = profileId ?? activeProfileId;
+    final profile = _profileById(id);
+    if (profile == null ||
+        !profile.configured ||
+        _modelListRefreshing.contains(id)) {
       return;
     }
-    _modelLoading = true;
+    _modelListRefreshing.add(id);
+    _modelListErrors.remove(id);
     notifyListeners();
     try {
-      if (openAiCompatible != null) {
-        final names = await openAiCompatible.listModels();
-        _models = List.unmodifiable(names.map(ChatModelOption.new));
-        _modelDetails.removeWhere(
-          (key, _) => key.startsWith('$activeProfileId:'),
-        );
-        for (final name in names) {
-          _modelDetails['$activeProfileId:$name'] = _compatibleDetails(name);
+      final ollama = _ollama;
+      final compatible = _openAiCompatible;
+      if (id == activeProfileId && isConnected) {
+        final generation = _generationOf(id);
+        final names = compatible != null
+            ? await compatible.listModels()
+            : [for (final model in await ollama!.listModels()) model.name];
+        if (generation != _generationOf(id) ||
+            id != activeProfileId ||
+            _shutdownFuture != null) {
+          return;
         }
-        if (_selectedModel != null) {
-          _selectedModelDetails = _compatibleDetails(_selectedModel!);
+        if (compatible != null) {
+          _modelDetails.removeWhere((key, _) => key.startsWith('$id:'));
+          for (final name in names) {
+            _modelDetails['$id:$name'] = _compatibleDetails(name);
+          }
+          if (_selectedModel != null) {
+            _selectedModelDetails = _compatibleDetails(_selectedModel!);
+          }
         }
-      } else {
-        final models = await ollama!.listModels();
-        _models = List.unmodifiable(
-          models.map((model) => ChatModelOption(model.name)),
+        _setProfileModels(
+          id,
+          List.unmodifiable(names.map(ChatModelOption.new)),
         );
+        _profileStatus[id] = ConnectionStatus.ready;
+        _profileFailures.remove(id);
+      } else if (!await _connectProfile(id)) {
+        final failure = _profileFailures[id];
+        if (failure != null) _modelListErrors[id] = failure;
       }
-      if (_selectedModel != null &&
-          !_models.any((model) => model.name == _selectedModel)) {
-        _selectedModel = null;
-        _selectedModelDetails = null;
-      }
-      _errorMessage = null;
-      notifyListeners();
     } on Object catch (error) {
-      _errorMessage = _friendlyError(error);
+      final failure = _classifyFailure(error, profile: profile);
+      _modelListErrors[id] = failure;
+      if (_isConnectionFailure(failure)) _recordProfileFailure(id, failure);
     } finally {
-      _modelLoading = false;
+      _modelListRefreshing.remove(id);
       notifyListeners();
     }
   }
 
+  /// Persists the model for the visible chat (or new-chat default) and then
+  /// loads its details on demand. Detail failure does not undo the choice.
   Future<bool> selectModel(String model) async {
     if (!conversationConnected ||
         (_isStreaming && model != conversation?.selectedModel) ||
         (queuedPrompts.isNotEmpty && model != conversation?.selectedModel) ||
         _isSubmitting ||
-        _modelLoading ||
+        _selectingModel ||
         !_models.any((candidate) => candidate.name == model)) {
       return false;
     }
-    _modelLoading = true;
+    final profileId = activeProfileId;
+    final scope = draftKey;
+    _selectingModel = true;
     _errorMessage = null;
     notifyListeners();
     try {
-      final details = serverProtocol == ServerProtocol.ollama
-          ? await _ollama!.showModel(model)
-          : _compatibleDetails(model);
       final current = _thread?.conversation;
       if (current != null && current.selectedModel != model) {
         await _conversations.updateConversationContext(
@@ -1344,28 +1797,31 @@ class ChatController extends ChangeNotifier {
           selectedModel: model,
           systemPrompt: current.systemPrompt,
         );
-        _thread = ConversationThread(
-          conversation: _copyConversation(
-            current,
-            selectedModel: model,
-            updatedAt: DateTime.now().toUtc(),
-          ),
-          messages: messages,
-        );
+        if (_thread?.conversation.id == current.id) {
+          _thread = ConversationThread(
+            conversation: _copyConversation(
+              _thread!.conversation,
+              selectedModel: model,
+              updatedAt: DateTime.now().toUtc(),
+            ),
+            messages: messages,
+          );
+        }
         await _reloadHistory();
       }
+      await _settingsStore.rememberModel(profileId, model);
+      if (draftKey != scope || activeProfileId != profileId) return true;
       _selectedModel = model;
-      _selectedModelDetails = details;
-      _modelDetails['$activeProfileId:$model'] = details;
-      await _settingsStore.rememberModel(activeProfileId, model);
-      return true;
+      _selectedModelDetails = _modelDetails['$profileId:$model'];
     } on Object catch (error) {
       _errorMessage = 'Model could not be selected: ${_friendlyError(error)}';
       return false;
     } finally {
-      _modelLoading = false;
+      _selectingModel = false;
       notifyListeners();
     }
+    await loadModelDetails(model, profileId: profileId);
+    return true;
   }
 
   Future<void> newConversation() async {
@@ -1397,7 +1853,7 @@ class ChatController extends ChangeNotifier {
   }
 
   Future<void> discardCurrentDraft() async {
-    if (_profileChangesBlocked) return;
+    if (!canEditDraft || _isSubmitting) return;
     final documents = List.of(_draft.documents);
     await _discardPendingImage();
     _drafts.remove(draftKey);
@@ -1418,6 +1874,9 @@ class ChatController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Loads the chat and its draft locally, releases the local lock, and only
+  /// then checks the chat's own server. A late probe result never changes a
+  /// different visible chat.
   Future<void> openConversation(String id) async {
     if (_profileChangesBlocked || _thread?.conversation.id == id) return;
     final matches = _history.where((chat) => chat.id == id);
@@ -1434,45 +1893,54 @@ class ChatController extends ChangeNotifier {
       );
       _selectedModel = null;
       _selectedModelDetails = null;
-      if (!conversationConnected) {
-        final profile = _profileById(profileId);
-        if (profile == null) {
-          _errorMessage = 'This chat’s server is unavailable.';
-          return;
-        }
-        try {
-          final probe = await _probeServerProfile(profile);
-          if (_shutdownFuture != null) return;
-          await _settingsStore.setActiveProfile(profileId);
-          await _commitServerProbe(probe, preserveConversation: true);
-          return;
-        } on Object catch (error) {
-          _errorMessage =
-              'Could not connect to ${profile.name}. ${_friendlyError(error)}';
-          return;
-        }
-      }
       if (conversationConnected) {
         final stored = _thread!.conversation.selectedModel;
         if (_models.any((model) => model.name == stored)) {
-          if (_isStreaming) {
-            _selectedModel = stored;
-            _selectedModelDetails = _modelDetails['$profileId:$stored'];
-          } else {
-            await selectModel(stored);
-          }
+          _selectedModel = stored;
+          _selectedModelDetails = _modelDetails['$profileId:$stored'];
         }
       }
     } on Object catch (error) {
       _errorMessage = 'Chat could not be opened: ${_friendlyError(error)}';
+      return;
     } finally {
       _conversationMutationBusy = false;
       notifyListeners();
     }
+    if (_thread?.conversation.id != id) return;
+    if (conversationConnected) {
+      if (_selectedModel case final model?) {
+        await loadModelDetails(model, profileId: profileId);
+      }
+      return;
+    }
+    if (_profileById(profileId) == null) {
+      _errorMessage = 'This chat’s server is unavailable.';
+      notifyListeners();
+      return;
+    }
+    await _connectProfile(
+      profileId,
+      activate: true,
+      preserveConversation: true,
+      stillWanted: () => _thread?.conversation.id == id,
+    );
   }
 
-  Future<bool> connectConversation() =>
-      switchServerProfile(conversationProfile.id, preserveConversation: true);
+  /// Retry connection for the visible chat's own server.
+  Future<bool> connectConversation() async {
+    if (_profileChangesBlocked) return false;
+    final chatId = conversation?.id;
+    final profileId = conversationProfile.id;
+    final connected = await _connectProfile(
+      profileId,
+      activate: true,
+      preserveConversation: true,
+      stillWanted: () => conversation?.id == chatId,
+    );
+    return connected && conversationProfile.id == profileId && isConnected;
+  }
+
   Future<bool> renameConversation(String id, String title) =>
       _organize(() => _conversations.rename(id, title));
   Future<bool> pinConversation(String id, bool value) =>
@@ -1650,6 +2118,7 @@ class ChatController extends ChangeNotifier {
         conversationId: change.id,
         receiptToken: change.token,
       );
+      _checkpointIds.remove(change.id);
       _drafts.remove(change.id);
       if (conversation?.id == change.id) {
         _thread = null;
@@ -1688,6 +2157,7 @@ class ChatController extends ChangeNotifier {
         deleteAttachment: _images.deleteReference,
       );
       applied = true;
+      _checkpointIds.remove(change.id);
       if (result.cleanupWarning != null) _errorMessage = result.cleanupWarning;
       await _reloadHistory();
       if (conversation?.id == change.id) {
@@ -1803,7 +2273,8 @@ class ChatController extends ChangeNotifier {
       _drafts.remove(id);
       _queues.remove(id);
       _queuePausedIds.remove(id);
-      _runErrors.remove(id);
+      _chatFailures.remove(id);
+      _checkpointIds.remove(id);
       if (_thread?.conversation.id == id) {
         _thread = null;
         _draftScopeRevision += 1;
@@ -1843,7 +2314,8 @@ class ChatController extends ChangeNotifier {
       _drafts.clear();
       _queues.clear();
       _queuePausedIds.clear();
-      _runErrors.clear();
+      _chatFailures.clear();
+      _checkpointIds.clear();
       _draftPersistenceError = null;
       _history = const [];
       _syncRevision++;
@@ -1930,19 +2402,22 @@ class ChatController extends ChangeNotifier {
       _settingsStore.defaultModel(profileId);
 
   /// Query a settings page's server without replacing the open chat's client.
+  /// Uses the profile's own list state, not a global or model-management lock.
   Future<List<ChatModelOption>> loadModelsForProfile(String id) async {
-    if (!canChangeContext) throw StateError('Wait for the current action.');
     final profile = _profileById(id);
     if (profile == null) throw StateError('This server is unavailable.');
-    _profileMutationBusy = true;
-    _modelManagementBusy = true;
-    _modelManagementProfileId = id;
-    _modelManagementError = null;
-    _modelManagementStatus = 'Loading models…';
+    final generation = _generationOf(id);
+    _modelListRefreshing.add(id);
+    _modelListErrors.remove(id);
     notifyListeners();
     try {
       final probe = await _probeServerProfile(profile);
+      if (generation != _generationOf(id) || _shutdownFuture != null) {
+        throw StateError('This server changed. Refresh its models again.');
+      }
       _setProfileModels(id, probe.models);
+      _profileStatus[id] = ConnectionStatus.ready;
+      _profileFailures.remove(id);
       if (probe.openAiCompatible != null) {
         for (final model in probe.models) {
           _modelDetails['$id:${model.name}'] = _compatibleDetailsForProfile(
@@ -1957,21 +2432,26 @@ class ChatController extends ChangeNotifier {
           final key = '$id:${model.name}';
           if (_modelDetails.containsKey(key)) continue;
           try {
-            _modelDetails[key] = await client.showModel(model.name);
-          } on Object {
-            // An unavailable detail response must not hide installed models.
+            final details = await client.showModel(model.name);
+            if (generation != _generationOf(id)) break;
+            _modelDetails[key] = details;
+          } on Object catch (error) {
+            _detailErrors[key] = _classifyFailure(
+              error,
+              profile: profile,
+              model: model.name,
+            );
           }
         }
       }
-      _modelManagementStatus = null;
       return probe.models;
     } on Object catch (error) {
-      _modelManagementError = _friendlyError(error);
-      _modelManagementStatus = null;
+      final failure = _classifyFailure(error, profile: profile);
+      _modelListErrors[id] = failure;
+      if (_isConnectionFailure(failure)) _recordProfileFailure(id, failure);
       rethrow;
     } finally {
-      _modelManagementBusy = false;
-      _profileMutationBusy = false;
+      _modelListRefreshing.remove(id);
       notifyListeners();
     }
   }
@@ -2126,7 +2606,7 @@ class ChatController extends ChangeNotifier {
       _models = const [];
       _selectedModel = null;
       _selectedModelDetails = null;
-      _connectionState = ServerConnectionState.disconnected;
+      _profileStatus[activeProfileId] = ConnectionStatus.saved;
     }
     notifyListeners();
   }
@@ -2151,7 +2631,7 @@ class ChatController extends ChangeNotifier {
   }
 
   Future<bool> setWebAgentEnabled(bool value) async {
-    if (value && _modelLoading) return false;
+    if (value && modelLoading) return false;
     if (value && (!_webDisclosureAcknowledged || !hasWebApiKey)) {
       return false;
     }
@@ -2167,8 +2647,10 @@ class ChatController extends ChangeNotifier {
     return true;
   }
 
+  /// Local photo selection works offline; it is refused only when the
+  /// selected model is known not to accept images.
   Future<void> pickImage({bool camera = false}) async {
-    if (!canQueueOrSend || !supportsImages) return;
+    if (!canEditDraft || imagesSupported == false) return;
     if (_draft.images.length >= maxRequestImages) {
       _errorMessage = 'Attach up to eight images per message.';
       notifyListeners();
@@ -2216,7 +2698,7 @@ class ChatController extends ChangeNotifier {
   }
 
   Future<void> pickDocument() async {
-    if (!canChangeContext) return;
+    if (!canEditDraft) return;
     if (_draft.documents.length >= DocumentAttachment.maxPerMessage) {
       _errorMessage = 'Attach up to four documents per message.';
       notifyListeners();
@@ -2258,7 +2740,7 @@ class ChatController extends ChangeNotifier {
   }
 
   Future<void> removePendingDocument(String id) async {
-    if (!canChangeContext) return;
+    if (!canEditDraft) return;
     final document = _draft.documents
         .where((document) => document.id == id)
         .firstOrNull;
@@ -2292,6 +2774,7 @@ class ChatController extends ChangeNotifier {
     thinking: _selectedModelDetails?.supportsThinking == true,
     webEnabled: webAgentEffective,
     webKey: _webApiKey,
+    endpointGeneration: _generationOf(conversationProfile.id),
   );
 
   Future<void> _reloadQueues() async {
@@ -2316,7 +2799,12 @@ class ChatController extends ChangeNotifier {
       return false;
     }
     if (submittedDraft.images.isNotEmpty && !supportsImages) {
-      _errorMessage = 'The selected model does not support images.';
+      // Keep the attachments; the user removes them or chooses a model.
+      _errorMessage = _selectedModelDetails == null
+          ? 'Image support for $_selectedModel is not known yet. Refresh the '
+                'model details, remove the image, or choose another model.'
+          : 'The selected model does not support images. Remove the image or '
+                'choose a model that supports images.';
       notifyListeners();
       return false;
     }
@@ -2403,8 +2891,12 @@ class ChatController extends ChangeNotifier {
     QueuedPromptClaim? claim;
     var ownsStart = true;
     try {
+      final checkpointReferences = _checkpointIds.contains(id)
+          ? await _conversations.recoveryCheckpointReferences(id)
+          : const <String>[];
       // Jaz's queue.go uses the same claim-before-dispatch transition. The
-      // SQLite transaction also creates our recoverable transcript placeholders.
+      // SQLite transaction also creates our recoverable transcript placeholders
+      // and ends the previous revision's recovery checkpoint.
       claim = await _conversations.claimQueuedPrompt(
         id,
         userMessageId: _idFactory(),
@@ -2412,6 +2904,11 @@ class ChatController extends ChangeNotifier {
       );
       await _reloadQueues();
       if (claim == null) return;
+      if (_checkpointIds.remove(id)) {
+        for (final reference in checkpointReferences) {
+          await _deleteUnusedAttachment(reference);
+        }
+      }
       if (_queuePausedIds.contains(id) || _shutdownFuture != null) {
         await _conversations.restoreQueuedPrompt(claim);
         await _reloadQueues();
@@ -2441,16 +2938,26 @@ class ChatController extends ChangeNotifier {
       );
     } on Object catch (error) {
       _queuePausedIds.add(id);
-      _runErrors[id] = 'Queue paused: ${_friendlyError(error)}';
+      _chatFailures[id] = ChatFailure(
+        kind: ChatFailureKind.persistence,
+        message: 'Queue paused: ${_friendlyError(error)}',
+        actions: const [ChatRecoveryAction.resume],
+        profileId: configuration.profile.id,
+      );
       if (claim != null && !_runs.containsKey(id)) {
         try {
           await _conversations.restoreQueuedPrompt(claim);
           await _reloadQueues();
           await _refreshVisibleConversation(id, configuration.profile.id);
         } on Object catch (restoreError) {
-          _runErrors[id] =
-              'Queue paused; the submitted message remains in history: '
-              '${_friendlyError(restoreError)}';
+          _chatFailures[id] = ChatFailure(
+            kind: ChatFailureKind.persistence,
+            message:
+                'Queue paused; the submitted message remains in history: '
+                '${_friendlyError(restoreError)}',
+            actions: const [ChatRecoveryAction.resume],
+            profileId: configuration.profile.id,
+          );
         }
       }
     } finally {
@@ -2463,7 +2970,7 @@ class ChatController extends ChangeNotifier {
     final id = conversation?.id;
     if (id == null || !canQueueOrSend || isConversationRunning(id)) return;
     _queuePausedIds.remove(id);
-    _runErrors.remove(id);
+    _chatFailures.remove(id);
     await _drainQueue(id, _captureRunConfiguration());
   }
 
@@ -2528,7 +3035,6 @@ class ChatController extends ChangeNotifier {
   Future<void> retryAssistant(String id) async {
     if (_isStreaming ||
         _isSubmitting ||
-        _modelLoading ||
         _profileMutationBusy ||
         _conversationMutationBusy ||
         !conversationConnected ||
@@ -2561,11 +3067,19 @@ class ChatController extends ChangeNotifier {
         createdAt: timestamp,
         updatedAt: timestamp,
       );
-      await _conversations.replaceConversationTail(
+      // Retrying an empty placeholder keeps any existing checkpoint; useful
+      // partial output is preserved as recovery before it is replaced.
+      final preserve = _hasUsefulContent(target);
+      final released = await _conversations.replaceConversationTail(
         conversationId: target.conversationId,
         fromPosition: target.position,
         replacement: replacement,
+        saveRecoveryCheckpoint: preserve,
       );
+      if (preserve) _checkpointIds.add(target.conversationId);
+      for (final reference in released) {
+        await _deleteUnusedAttachment(reference);
+      }
       _replaceMessages(<Message>[
         for (final message in messages)
           if (message.position < target.position) message,
@@ -2614,12 +3128,9 @@ class ChatController extends ChangeNotifier {
       return false;
     }
     final current = conversation!;
-    final removedImages = messages
+    final preserve = messages
         .skip(index)
-        .expand(
-          (m) => [...m.imageReferences, ...m.documents.map((d) => d.reference)],
-        )
-        .toSet();
+        .any((m) => m.role == MessageRole.user || _hasUsefulContent(m));
     final replacement = editing
         ? target.copyWith(
             content: editedText,
@@ -2632,27 +3143,19 @@ class ChatController extends ChangeNotifier {
     _errorMessage = null;
     notifyListeners();
     var saved = false;
-    String? cleanupWarning;
     try {
-      await _conversations.replaceConversationTail(
+      // If the checkpoint cannot be saved, the transaction leaves the chat
+      // unchanged and no replacement request starts.
+      final released = await _conversations.replaceConversationTail(
         conversationId: current.id,
         fromPosition: target.position,
         replacement: replacement,
+        saveRecoveryCheckpoint: preserve,
       );
       saved = true;
-      for (final reference in removedImages) {
-        if (!_drafts.values.any(
-              (draft) =>
-                  draft.images.contains(reference) ||
-                  draft.documents.any((d) => d.reference == reference),
-            ) &&
-            !await _conversations.isImageReferenceInUse(reference)) {
-          try {
-            await _images.deleteReference(reference);
-          } on Object {
-            cleanupWarning = 'The chat was updated, but an unused attachment could not be removed.';
-          }
-        }
+      if (preserve) _checkpointIds.add(current.id);
+      for (final reference in released) {
+        await _deleteUnusedAttachment(reference);
       }
       _thread = await _conversations.openConversation(
         serverProfileId: current.serverProfileId,
@@ -2666,12 +3169,6 @@ class ChatController extends ChangeNotifier {
           'The response could not be restarted: ${_friendlyError(error)}';
       notifyListeners();
     } finally {
-      if (cleanupWarning != null) {
-        _errorMessage = [
-          _errorMessage,
-          cleanupWarning,
-        ].whereType<String>().join('\n');
-      }
       _isSubmitting = false;
       if (!submission.isCompleted) submission.complete();
       if (identical(_submissionCompleter, submission))
@@ -2689,21 +3186,99 @@ class ChatController extends ChangeNotifier {
     if (run != null) await _stopRun(run);
   }
 
-  Future<void> _stopRun(_ChatRun run, {String? reason}) async {
+  /// Whether [conversationId] retains a one-level recovery checkpoint from
+  /// its latest edit, regenerate, or retry. Valid until the next committed
+  /// user turn, revision, sync replacement, or deletion.
+  bool hasRecoveryCheckpoint(String conversationId) =>
+      _checkpointIds.contains(conversationId);
+
+  /// Restore is available for the visible chat: it has a checkpoint, its
+  /// response is stopped, and no queued follow-up is pending.
+  bool get canRestorePreviousConversation {
+    final id = conversation?.id;
+    return id != null &&
+        hasRecoveryCheckpoint(id) &&
+        !isConversationRunning(id) &&
+        (_queues[id]?.isEmpty ?? true) &&
+        canEditDraft;
+  }
+
+  /// Restores the conversation before its latest revision. Works offline,
+  /// consumes the checkpoint, and preserves the chat ID, server, pins,
+  /// archive state, explicit name, settings, draft, and queue.
+  Future<bool> restorePreviousConversation(String conversationId) async {
+    if (!hasRecoveryCheckpoint(conversationId) ||
+        _conversationMutationBusy ||
+        _shutdownFuture != null) {
+      return false;
+    }
+    if (isConversationRunning(conversationId)) {
+      _errorMessage =
+          'Stop the response before restoring the previous conversation.';
+      notifyListeners();
+      return false;
+    }
+    if (_queues[conversationId]?.isNotEmpty ?? false) {
+      _errorMessage =
+          'Remove the queued messages before restoring the previous '
+          'conversation.';
+      notifyListeners();
+      return false;
+    }
+    _conversationMutationBusy = true;
+    _errorMessage = null;
+    notifyListeners();
+    try {
+      final released = await _conversations.restoreRecoveryCheckpoint(
+        conversationId,
+      );
+      _checkpointIds.remove(conversationId);
+      _chatFailures.remove(conversationId);
+      await _reloadHistory();
+      final chat = _history.where((c) => c.id == conversationId).firstOrNull;
+      if (chat != null) {
+        await _refreshVisibleConversation(conversationId, chat.serverProfileId);
+      }
+      for (final reference in released) {
+        await _deleteUnusedAttachment(reference);
+      }
+      return true;
+    } on Object catch (error) {
+      _errorMessage =
+          'The previous conversation could not be restored: '
+          '${_friendlyError(error)}';
+      return false;
+    } finally {
+      _conversationMutationBusy = false;
+      notifyListeners();
+    }
+  }
+
+  static bool _hasUsefulContent(Message message) =>
+      message.content.isNotEmpty ||
+      (message.reasoning?.isNotEmpty ?? false) ||
+      message.toolCalls.isNotEmpty ||
+      message.imageReferences.isNotEmpty ||
+      message.documents.isNotEmpty;
+
+  Future<void> _stopRun(_ChatRun run, {ChatFailure? failure}) async {
     run.stopRequested = true;
     _queuePausedIds.add(run.conversationId);
-    if (reason != null) _runErrors[run.conversationId] = reason;
+    if (failure != null) _chatFailures[run.conversationId] = failure;
     await run.chat?.cancel();
     await run.agent?.cancel();
     await run.iterator?.cancel();
-    await _finishRun(run, MessageStatus.interrupted, error: reason);
+    await _finishRun(run, MessageStatus.interrupted, failure: failure);
     await run.finished.future;
   }
 
+  /// Dismisses the visible presentation of errors; failed message status
+  /// and preserved data are unchanged.
   void clearError() {
     _errorMessage = null;
     _draftPersistenceError = null;
-    _runErrors.remove(conversation?.id);
+    _chatFailures.remove(conversation?.id);
+    if (!conversationConnected) _profileFailures.remove(conversationProfile.id);
     notifyListeners();
   }
 
@@ -2745,7 +3320,7 @@ class ChatController extends ChangeNotifier {
     _queueStartingIds.remove(run.conversationId);
     if (conversation?.id == run.conversationId) _thread = thread;
     _isSubmitting = false;
-    _runErrors.remove(run.conversationId);
+    _chatFailures.remove(run.conversationId);
     notifyListeners();
     if (_shutdownFuture != null) {
       await _stopRun(run);
@@ -2756,7 +3331,18 @@ class ChatController extends ChangeNotifier {
         run.id,
         onExpiration: () => _stopRun(
           run,
-          reason: 'Background time expired. The partial response is saved. Retry to continue.',
+          failure: ChatFailure(
+            kind: ChatFailureKind.backgroundExpired,
+            message:
+                'Background time expired. The partial response is saved. '
+                'Retry to continue.',
+            actions: const [
+              ChatRecoveryAction.retry,
+              ChatRecoveryAction.resume,
+            ],
+            profileId: run.configuration.profile.id,
+            messageId: run.assistantId,
+          ),
         ),
       );
       if (run.finishing || run.stopRequested) return;
@@ -2771,14 +3357,21 @@ class ChatController extends ChangeNotifier {
         await _runLocalChat(run, context);
       }
     } on Object catch (error) {
+      final cancelled =
+          run.stopRequested ||
+          error is OllamaCancelledException ||
+          error is WebAgentCancelledException;
       await _finishRun(
         run,
-        run.stopRequested ||
-                error is OllamaCancelledException ||
-                error is WebAgentCancelledException
-            ? MessageStatus.interrupted
-            : MessageStatus.failed,
-        error: run.stopRequested ? null : _friendlyError(error),
+        cancelled ? MessageStatus.interrupted : MessageStatus.failed,
+        failure: run.stopRequested
+            ? null
+            : _classifyFailure(
+                error,
+                profile: config.profile,
+                model: run.thread.conversation.selectedModel,
+                messageId: run.assistantId,
+              ),
       );
     }
   }
@@ -2823,8 +3416,16 @@ class ChatController extends ChangeNotifier {
       run.stopRequested || !normal
           ? MessageStatus.interrupted
           : MessageStatus.complete,
-      error: !run.stopRequested && !normal
-          ? '${config.profile.name} stopped before completing the response ($doneReason).'
+      failure: !run.stopRequested && !normal
+          ? ChatFailure(
+              kind: ChatFailureKind.providerRejected,
+              message:
+                  '${config.profile.name} stopped before completing the '
+                  'response ($doneReason).',
+              actions: const [ChatRecoveryAction.retry],
+              profileId: config.profile.id,
+              messageId: run.assistantId,
+            )
           : null,
     );
   }
@@ -3319,8 +3920,14 @@ class ChatController extends ChangeNotifier {
       try {
         await _conversations.updateMessage(snapshot);
       } on Object catch (error) {
-        _runErrors[run.conversationId] =
-            'The partial response could not be saved: $error';
+        _chatFailures[run.conversationId] = ChatFailure(
+          kind: ChatFailureKind.persistence,
+          message:
+              'The partial response could not be saved: '
+              '${_friendlyError(error)}',
+          profileId: run.configuration.profile.id,
+          messageId: run.assistantId,
+        );
         notifyListeners();
       }
     });
@@ -3330,7 +3937,7 @@ class ChatController extends ChangeNotifier {
   Future<void> _finishRun(
     _ChatRun run,
     MessageStatus status, {
-    String? error,
+    ChatFailure? failure,
   }) async {
     if (run.finishing) return run.finished.future;
     run.finishing = true;
@@ -3367,16 +3974,34 @@ class ChatController extends ChangeNotifier {
         }
       }
       saved = true;
-      if (error != null) _runErrors[id] = error;
+      if (failure != null) _chatFailures[id] = failure;
+      _recordRunEvidence(
+        run,
+        failure,
+        completed: status == MessageStatus.complete,
+      );
       await _reloadHistory();
     } on Object catch (persistenceError) {
       _queuePausedIds.add(id);
-      _runErrors[id] = 'The response could not be saved: $persistenceError';
+      _chatFailures[id] = ChatFailure(
+        kind: ChatFailureKind.persistence,
+        message:
+            'The response could not be saved: '
+            '${_friendlyError(persistenceError)}',
+        profileId: run.configuration.profile.id,
+        messageId: run.assistantId,
+      );
     } finally {
       try {
         await _backgroundExecution.end(run.id);
       } on Object catch (releaseError) {
-        _runErrors[id] = 'Background execution could not end: $releaseError';
+        _chatFailures[id] = ChatFailure(
+          kind: ChatFailureKind.other,
+          message:
+              'Background execution could not end: '
+              '${_friendlyError(releaseError)}',
+          profileId: run.configuration.profile.id,
+        );
       }
       if (identical(_runs[id], run)) _runs.remove(id);
       if (!run.finished.isCompleted) run.finished.complete();
@@ -3621,13 +4246,147 @@ class ChatController extends ChangeNotifier {
   static String _excerpt(String value, int limit) =>
       value.length <= limit ? value : '${value.substring(0, limit)}…';
 
-  static String _friendlyError(Object error) {
-    if (error is LocalNetworkPreflightException) return error.message;
-    if (error is OllamaException) return error.message;
-    if (error is WebAgentException) return error.message;
-    if (error is ChatRequestLimitException) return error.message;
-    if (error is FormatException) return error.message.toString();
-    return error.toString();
+  String _friendlyError(Object error) => _redact(switch (error) {
+    LocalNetworkPreflightException() => error.message,
+    OllamaException() => error.message,
+    WebAgentException() => error.message,
+    ChatRequestLimitException() => error.message,
+    FormatException() => error.message,
+    _ => error.toString(),
+  });
+
+  /// Removes credentials from text shown or copied as error detail.
+  String _redact(String text) {
+    var result = text
+        .replaceAllMapped(
+          RegExp(
+            r'(authorization\s*[:=]\s*)(\S+\s+)?\S+',
+            caseSensitive: false,
+          ),
+          (match) => '${match[1]}[redacted]',
+        )
+        .replaceAllMapped(
+          RegExp(r'bearer\s+\S+', caseSensitive: false),
+          (_) => 'Bearer [redacted]',
+        )
+        .replaceAllMapped(
+          RegExp(r'([a-z][a-z0-9+.-]*://)[^/\s@]+@', caseSensitive: false),
+          (match) => match[1]!,
+        );
+    for (final secret in <String?>{
+      _serverApiKey,
+      _webApiKey,
+      for (final run in _runs.values) run.configuration.webKey,
+    }) {
+      if (secret != null && secret.length >= 4) {
+        result = result.replaceAll(secret, '[redacted]');
+      }
+    }
+    return result;
+  }
+
+  static bool _isConnectionFailure(ChatFailure failure) => const {
+    ChatFailureKind.transport,
+    ChatFailureKind.timeout,
+    ChatFailureKind.authentication,
+    ChatFailureKind.localNetworkDenied,
+  }.contains(failure.kind);
+
+  /// Classifies an error using the existing transport exception types so the
+  /// UI can name the destination and offer the right recovery action.
+  ChatFailure _classifyFailure(
+    Object error, {
+    ServerProfile? profile,
+    String? model,
+    String? messageId,
+  }) {
+    final server = profile == null ? 'The server' : '“${profile.name}”';
+    final detail = _friendlyError(error);
+    ChatFailure failure(
+      ChatFailureKind kind,
+      String message,
+      List<ChatRecoveryAction> actions,
+    ) => ChatFailure(
+      kind: kind,
+      message: message,
+      actions: actions,
+      profileId: profile?.id,
+      messageId: messageId,
+      detail: detail,
+    );
+    const connectionActions = [
+      ChatRecoveryAction.retryConnection,
+      ChatRecoveryAction.editConnection,
+    ];
+    return switch (error) {
+      LocalNetworkPreflightException() => failure(
+        ChatFailureKind.localNetworkDenied,
+        detail,
+        const [
+          ChatRecoveryAction.openSystemSettings,
+          ChatRecoveryAction.retryConnection,
+        ],
+      ),
+      OllamaTransportException(cause: TimeoutException()) => failure(
+        ChatFailureKind.timeout,
+        '$server did not respond in time.',
+        connectionActions,
+      ),
+      OllamaTransportException() => failure(
+        ChatFailureKind.transport,
+        'Could not reach $server.',
+        connectionActions,
+      ),
+      OllamaHttpException(statusCode: 401 || 403) => failure(
+        ChatFailureKind.authentication,
+        '$server rejected authentication. Check its API key.',
+        const [ChatRecoveryAction.editConnection],
+      ),
+      OllamaHttpException(statusCode: 404, :final body)
+          when model != null && body.toLowerCase().contains('model') =>
+        failure(
+          ChatFailureKind.missingModel,
+          '“$model” is not available on $server.',
+          const [
+            ChatRecoveryAction.chooseModel,
+            ChatRecoveryAction.refreshModels,
+          ],
+        ),
+      OllamaException() || WebAgentException() => failure(
+        ChatFailureKind.providerRejected,
+        detail,
+        const [ChatRecoveryAction.retry],
+      ),
+      ChatRequestLimitException(:final message)
+          when message.contains('image') || message.contains('attach') =>
+        failure(ChatFailureKind.attachmentIncompatible, detail, const [
+          ChatRecoveryAction.removeAttachment,
+          ChatRecoveryAction.chooseModel,
+        ]),
+      _ => failure(ChatFailureKind.other, detail, const [
+        ChatRecoveryAction.retry,
+      ]),
+    };
+  }
+
+  /// Requests are the source of truth: a transport or authentication failure
+  /// invalidates readiness and a completed response re-establishes it, unless
+  /// the endpoint changed while the response was running.
+  void _recordRunEvidence(
+    _ChatRun run,
+    ChatFailure? failure, {
+    required bool completed,
+  }) {
+    final profileId = run.configuration.profile.id;
+    if (run.configuration.endpointGeneration != _generationOf(profileId)) {
+      return;
+    }
+    if (failure != null && _isConnectionFailure(failure)) {
+      _recordProfileFailure(profileId, failure);
+    } else if (completed && _profileStatus[profileId] != null) {
+      _profileStatus[profileId] = ConnectionStatus.ready;
+      _profileFailures.remove(profileId);
+    }
   }
 
   Future<void> shutdown() {
