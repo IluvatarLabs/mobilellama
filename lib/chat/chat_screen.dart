@@ -89,21 +89,7 @@ class _ChatScreenState extends State<ChatScreen> {
   /// Opens the connection form directly. Returns true only when Save and
   /// connect succeeded.
   Future<bool> _openConnectionForm({ServerProfile? profile}) =>
-      _openServerSettings(); // WIRE: showConnectionForm(context, controller, profile: profile)
-
-  /// Interim entry until the direct connection form is wired.
-  Future<bool> _openServerSettings() async {
-    await Navigator.push<void>(
-      context,
-      MaterialPageRoute(
-        builder: (_) => SettingsSheet(
-          controller: controller,
-          section: SettingsSection.servers,
-        ),
-      ),
-    );
-    return controller.conversationConnected;
-  }
+      showConnectionForm(context, controller, profile: profile);
 
   /// First connection: form, then model selection when no valid model is
   /// configured; the picker returns to the chat with its destination shown.
