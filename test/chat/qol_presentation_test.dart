@@ -43,14 +43,14 @@ void main() {
       expect(find.text('Lab · Ready'), findsNothing);
       expect(find.textContaining('Home · '), findsOneWidget);
       expect(find.text('Original answer'), findsNothing);
-      expect(
-        find.text('Available until you send or revise another message.'),
-        findsOneWidget,
-      );
-
-      await tester.tap(
-        find.widgetWithText(TextButton, 'Restore previous conversation'),
-      );
+      for (var i = 0; i < 5; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 20)),
+        );
+        await tester.pump();
+      }
+      await tester.ensureVisible(find.byTooltip('Previous version'));
+      await tester.tap(find.byTooltip('Previous version'));
       // Restore runs real database work; let it finish between frames.
       for (var i = 0; i < 5; i++) {
         await tester.runAsync(
@@ -59,6 +59,14 @@ void main() {
         await tester.pump();
       }
       expect(find.text('Original answer'), findsOneWidget);
+      await tester.tap(find.text('Continue from this version'));
+      for (var i = 0; i < 5; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 20)),
+        );
+        await tester.pump();
+      }
+      expect(fixture.controller.viewingAlternative, isFalse);
       expect(fixture.controller.hasRecoveryCheckpoint('home-chat'), isFalse);
       await tester.pumpWidget(const SizedBox());
       // Shutdown mixes fake-zone draft writes with real database work.

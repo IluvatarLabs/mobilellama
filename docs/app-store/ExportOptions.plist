@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>destination</key>
+	<string>export</string>
+	<key>generateAppStoreInformation</key>
+	<true/>
+	<key>iCloudContainerEnvironment</key>
+	<string>Production</string>
+	<key>manageAppVersionAndBuildNumber</key>
+	<false/>
+	<key>method</key>
+	<string>app-store-connect</string>
+	<key>provisioningProfiles</key>
+	<dict>
+		<key>app.mobollama.mobollama</key>
+		<string>MobileLlama App Store</string>
+		<key>app.mobollama.mobollama.ShareExtension</key>
+		<string>MobileLlama Share App Store</string>
+	</dict>
+	<key>signingCertificate</key>
+	<string>6AA7121F45E003BD17D01930EB66E06F30EF96D7</string>
+	<key>signingStyle</key>
+	<string>manual</string>
+	<key>stripSwiftSymbols</key>
+	<true/>
+	<key>teamID</key>
+	<string>XU24CNU359</string>
+	<key>uploadSymbols</key>
+	<true/>
+</dict>
+</plist>

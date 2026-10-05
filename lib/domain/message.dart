@@ -1,4 +1,5 @@
 import 'document_attachment.dart';
+import 'source_reference.dart';
 import 'tool_call.dart';
 
 enum MessageRole { system, user, assistant, tool }
@@ -15,6 +16,8 @@ class Message {
     required this.content,
     required this.createdAt,
     required this.updatedAt,
+    this.parentId,
+    this.siblingOrder = 0,
     this.reasoning,
     this.providerTranscriptJson,
     this.imageReferences = const <String>[],
@@ -26,6 +29,8 @@ class Message {
   final String id;
   final String conversationId;
   final int position;
+  final String? parentId;
+  final int siblingOrder;
   final MessageRole role;
   final MessageStatus status;
   final String content;
@@ -38,7 +43,13 @@ class Message {
   final DateTime createdAt;
   final DateTime updatedAt;
 
+  List<SourceReference> get sources =>
+      SourceReference.fromTranscript(providerTranscriptJson);
+
   Message copyWith({
+    String? id,
+    Object? parentId = _notProvided,
+    int? siblingOrder,
     int? position,
     MessageStatus? status,
     String? content,
@@ -48,9 +59,14 @@ class Message {
     List<DocumentAttachment>? documents,
     List<ToolCall>? toolCalls,
     List<ToolResult>? toolResults,
+    DateTime? createdAt,
     DateTime? updatedAt,
   }) => Message(
-    id: id,
+    id: id ?? this.id,
+    parentId: identical(parentId, _notProvided)
+        ? this.parentId
+        : parentId as String?,
+    siblingOrder: siblingOrder ?? this.siblingOrder,
     conversationId: conversationId,
     position: position ?? this.position,
     role: role,
@@ -66,7 +82,7 @@ class Message {
     documents: documents ?? this.documents,
     toolCalls: toolCalls ?? this.toolCalls,
     toolResults: toolResults ?? this.toolResults,
-    createdAt: createdAt,
+    createdAt: createdAt ?? this.createdAt,
     updatedAt: updatedAt ?? this.updatedAt,
   );
 

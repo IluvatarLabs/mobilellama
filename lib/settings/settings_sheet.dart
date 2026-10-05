@@ -199,6 +199,23 @@ class _SettingsSheetState extends State<SettingsSheet> {
                     selectedProfile != null) ...[
                   const SizedBox(height: 24),
                   _buildServerDefaults(controller, selectedProfile),
+                  if (controller.hasServerApiKeyForProfile(selectedProfile.id))
+                    TextButton(
+                      onPressed: _serverBusy
+                          ? null
+                          : () async {
+                              try {
+                                await controller.removeServerApiKey(
+                                  profileId: selectedProfile.id,
+                                );
+                              } on Object catch (error) {
+                                _showMessage(
+                                  'Key could not be removed: $error',
+                                );
+                              }
+                            },
+                      child: const Text('Remove stored API key'),
+                    ),
                 ],
                 if (widget.section == SettingsSection.servers &&
                     selectedProfile?.protocol ==
@@ -212,25 +229,6 @@ class _SettingsSheetState extends State<SettingsSheet> {
                           const Text(
                             'Enable capabilities supported by your server when its model list does not report them.',
                           ),
-                          if (controller.hasServerApiKeyForProfile(
-                            selectedProfile.id,
-                          ))
-                            TextButton(
-                              onPressed: _serverBusy
-                                  ? null
-                                  : () async {
-                                      try {
-                                        await controller.removeServerApiKey(
-                                          profileId: selectedProfile.id,
-                                        );
-                                      } on Object catch (error) {
-                                        _showMessage(
-                                          'Key could not be removed: $error',
-                                        );
-                                      }
-                                    },
-                              child: const Text('Remove stored API key'),
-                            ),
                           for (final entry in const {
                             'vision': 'Image input',
                             'tools': 'Tool calling',
@@ -638,6 +636,28 @@ class _SettingsSheetState extends State<SettingsSheet> {
                   ],
                 ),
                 const SizedBox(height: 16),
+              ],
+              if (!_isDefaults && controller.versionsEnabled) ...[
+                Text(switch (controller.conversation?.instructionSource) {
+                  'folderSnapshot' => 'Saved from folder instructions. Folder edits and moves do not change this chat.',
+                  'profileSnapshot' =>
+                    'Saved from this server profile’s defaults.',
+                  'explicit' => 'Custom instructions for this chat. Empty means no instructions.',
+                  'legacySnapshot' =>
+                    'Instructions preserved from your existing chat.',
+                  _ => 'Saving creates a custom instruction override, including an empty value.',
+                }, style: theme.textTheme.bodySmall),
+                if (controller.currentFolder != null)
+                  TextButton(
+                    onPressed: enabled
+                        ? () => setState(
+                            () => _promptController.text =
+                                controller.currentFolder!.instructions,
+                          )
+                        : null,
+                    child: const Text('Use current folder instructions'),
+                  ),
+                const SizedBox(height: 12),
               ],
               _SettingsField(
                 label: 'Instructions',

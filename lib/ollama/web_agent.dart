@@ -163,6 +163,7 @@ final class WebAgent {
 
         final content = StringBuffer();
         final thinking = StringBuffer();
+        var providerItems = <Map<String, dynamic>>[];
         final toolCalls = _ToolCallAccumulator(maxCalls: maxToolCallsPerTurn);
         final chat = _startChat(
           OllamaChatRequest(
@@ -199,6 +200,13 @@ final class WebAgent {
                 turn: turn,
                 delta: chunk.message.content,
               );
+            }
+            if (chunk.message.providerItems.isNotEmpty) {
+              providerItems = chunk.message.providerItems;
+            }
+            if (chunk.authoritativeContent != null) {
+              content.clear();
+              content.write(chunk.authoritativeContent);
             }
             toolCalls.addAll(chunk.message.toolCalls);
             if (chunk.done) {
@@ -239,6 +247,7 @@ final class WebAgent {
           content: content.toString(),
           thinking: thinking.toString(),
           toolCalls: completedToolCalls,
+          providerItems: providerItems,
         );
         transcript.add(assistant);
 

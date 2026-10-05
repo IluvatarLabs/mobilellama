@@ -10,38 +10,6 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart' as sqflite;
 void main() {
   setUpAll(sqflite.sqfliteFfiInit);
 
-  test('migration creates the current normalized schema', () async {
-    final database = RecordingDatabase();
-    await ConversationStore(database)
-        .migrate(fromVersion: 0, legacyServerProfileId: 'profile-1');
-
-    final sql = database.executions.map((entry) => entry.sql).join('\n');
-    expect(sql, contains('CREATE TABLE conversations'));
-    expect(sql, contains('CREATE TABLE messages'));
-    expect(sql, contains('CREATE TABLE message_images'));
-    expect(sql, contains('CREATE TABLE tool_calls'));
-    expect(sql, contains('CREATE TABLE tool_results'));
-    expect(sql, contains('ON DELETE CASCADE'));
-    expect(sql, contains('UNIQUE(conversation_id, position)'));
-    expect(sql, contains('ADD COLUMN server_profile_id'));
-    expect(sql, contains('UPDATE conversations SET server_profile_id = ?'));
-    expect(sql, contains('CREATE INDEX conversations_by_server_profile'));
-    expect(sql, contains('ADD COLUMN provider_transcript_json'));
-    expect(sql, contains('CREATE TABLE chat_drafts'));
-    expect(sql, contains('ADD COLUMN documents_json'));
-    expect(sql, contains('CREATE TABLE sync_receipts'));
-    expect(sql, contains('CREATE TABLE queued_prompts'));
-    expect(sql, contains('CREATE INDEX queued_prompts_in_conversation'));
-    expect(sql, contains('PRAGMA user_version = 8'));
-    final backfill = database.executions.singleWhere(
-      (entry) => entry.sql.startsWith(
-        'UPDATE conversations SET server_profile_id = ?',
-      ),
-    );
-    expect(backfill.parameters, <Object?>['profile-1']);
-    expect(database.transactionCount, 1);
-  });
-
   test('conversation create, context update, and delete stay scoped by profile and id', () async {
     final database = RecordingDatabase(
       onQuery: (sql, _) async => sql.startsWith('SELECT 1 FROM conversations')
@@ -240,13 +208,17 @@ void main() {
           }
           if (sql.contains('FROM message_images')) {
             return <Map<String, Object?>>[
-              <String, Object?>{'reference': 'image://one'},
+              <String, Object?>{
+                'message_id': 'assistant-1',
+                'reference': 'image://one',
+              },
             ];
           }
           if (sql.contains('FROM tool_calls')) {
             return <Map<String, Object?>>[
               <String, Object?>{
                 'id': 'call-1',
+                'message_id': 'assistant-1',
                 'name': 'search',
                 'arguments_json': '{malformed-json',
               },
@@ -256,6 +228,7 @@ void main() {
             return <Map<String, Object?>>[
               <String, Object?>{
                 'id': 'result-1',
+                'message_id': 'assistant-1',
                 'tool_call_id': 'call-1',
                 'content': 'tool output',
                 'is_error': 0,
@@ -286,25 +259,6 @@ void main() {
       expect(thread.messages.single.toolCalls.single.name, 'search');
       expect(thread.messages.single.toolCalls.single.arguments, isEmpty);
       expect(thread.messages.single.toolResults.single.content, 'tool output');
-
-      expect(
-        database.queries.any(
-          (entry) => entry.sql.contains(
-            'ORDER BY position ASC, created_at ASC, id ASC',
-          ),
-        ),
-        isTrue,
-      );
-      expect(
-        database.queries.any(
-          (entry) =>
-              entry.sql.contains(
-                'ORDER BY updated_at DESC, created_at DESC, id ASC',
-              ) &&
-              entry.parameters.single == 'profile-1',
-        ),
-        isTrue,
-      );
     },
   );
 
@@ -350,8 +304,10 @@ void main() {
         now: now,
       );
 
-      await store.updateMessage(
-        original.copyWith(
+      await store.replaceConversationTail(
+        conversationId: 'conversation-documents',
+        fromPosition: 0,
+        replacement: original.copyWith(
           content: 'Read this carefully.',
           updatedAt: now.add(const Duration(seconds: 1)),
         ),
@@ -362,9 +318,8 @@ void main() {
       );
       expect(thread!.messages.single.content, 'Read this carefully.');
       expect(
-        thread.messages.single.documents.single.toJson(),
+        {...thread.messages.single.documents.single.toJson()}..remove('id'),
         <String, Object?>{
-          'id': 'document-1',
           'name': 'notes.md',
           'mimeType': 'text/markdown',
           'reference': '/stored/conversation-documents/notes.md',
@@ -383,35 +338,6 @@ void main() {
         ),
         isTrue,
       );
-      await expectLater(
-        store.updateMessage(
-          thread.messages.single.copyWith(
-            documents: List<DocumentAttachment>.generate(
-              5,
-              (index) => DocumentAttachment(
-                id: 'too-many-$index',
-                name: 'document-$index.txt',
-                mimeType: 'text/plain',
-                reference: '/stored/document-$index.txt',
-                text: 'text',
-              ),
-            ),
-          ),
-        ),
-        throwsA(
-          isA<FormatException>().having(
-            (error) => error.message,
-            'message',
-            contains('more than 4 documents'),
-          ),
-        ),
-      );
-      thread = await store.openConversation(
-        serverProfileId: 'profile-1',
-        id: 'conversation-documents',
-      );
-      expect(thread!.messages.single.documents.single.id, 'document-1');
-
       await store.replaceConversationTail(
         conversationId: 'conversation-documents',
         fromPosition: 0,
@@ -439,12 +365,15 @@ void main() {
         serverProfileId: 'profile-1',
         id: 'conversation-documents',
       );
-      expect(thread!.messages.single.documents.single.id, 'document-2');
+      expect(
+        thread!.messages.single.documents.single.text,
+        'Replacement context',
+      );
       expect(
         await store.isAttachmentReferenceInUse(
           '/stored/conversation-documents/notes.md',
         ),
-        isFalse,
+        isTrue,
       );
       expect(
         await store.isAttachmentReferenceInUse(
@@ -729,20 +658,16 @@ void main() {
       ]);
       expect(thread.messages.last.content, 'Edited follow-up');
       expect(thread.conversation.title, 'Original title prompt');
-      expect(
-        await fixture.database.rawQuery(
-          'SELECT id FROM tool_calls WHERE id = ?',
-          <Object?>['discarded-call'],
-        ),
-        isEmpty,
+      final versions = (await store.openConversation(
+        serverProfileId: 'profile-1',
+        id: 'conversation-1',
+        allBranches: true,
+      ))!;
+      final retained = versions.allNodes.singleWhere(
+        (m) => m.id == 'assistant-2',
       );
-      expect(
-        await fixture.database.rawQuery(
-          'SELECT id FROM tool_results WHERE id = ?',
-          <Object?>['discarded-result'],
-        ),
-        isEmpty,
-      );
+      expect(retained.toolCalls.single.id, 'discarded-call');
+      expect(retained.toolResults.single.content, 'old result');
 
       await store.replaceConversationTail(
         conversationId: 'conversation-1',

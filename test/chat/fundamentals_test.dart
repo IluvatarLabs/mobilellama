@@ -48,7 +48,7 @@ void main() {
     final profile = target.controller.profiles.singleWhere(
       (p) => p.name == 'Private server',
     );
-    expect(profile.id, isNot('remote-profile'));
+    expect(profile.id, 'remote-profile');
     expect(profile.insecureLanAcknowledged, isFalse);
     expect(target.controller.hasServerApiKeyForProfile(profile.id), isFalse);
     expect(target.controller.activeProfileId, 'home');
@@ -151,11 +151,12 @@ void main() {
         id: 'tool-answer',
         conversationId: 'tools',
         role: MessageRole.assistant,
-        status: MessageStatus.complete,
+        status: MessageStatus.streaming,
         content: 'Done',
       );
       await f.store.updateMessage(
         answer.copyWith(
+          status: MessageStatus.complete,
           providerTranscriptJson: jsonEncode([
             {
               'role': 'assistant',
@@ -498,7 +499,7 @@ void main() {
     },
   );
 
-  test('revision recovery survives failure and relaunch, restores offline, and ends with the next turn', () async {
+  test('retained revisions survive failure and relaunch, restore offline, and remain after later turns', () async {
     final f = ChatFixture();
     await f.open();
     addTearDown(f.close);
@@ -546,15 +547,14 @@ void main() {
     await f.controller.initialize();
     await f.controller.openConversation('rev');
 
-    // Regenerating an older answer fails before output; the removed tail,
-    // including media referenced only by it, is retained for recovery.
+    // Failed regeneration keeps the original branch and its media.
     f.failNextResponses = 1;
     expect(await f.controller.regenerateAssistant('a1'), isTrue);
     expect(f.controller.messages.last.status, MessageStatus.failed);
-    expect(f.controller.hasRecoveryCheckpoint('rev'), isTrue);
+    expect(f.controller.hasRecoveryCheckpoint('rev'), isFalse);
     expect(f.images.deleted, isNot(contains('image:rev:photo')));
     final backup = await f.controller.exportBackup();
-    expect(backup, isNot(contains('Second answer')));
+    expect(backup, contains('Second answer'));
 
     // Relaunch, then restore without any network request.
     await f.controller.shutdown();
@@ -564,8 +564,8 @@ void main() {
     await f.controller.initialize();
     await f.controller.openConversation('rev');
     final requests = f.requests.length;
-    expect(f.controller.canRestorePreviousConversation, isTrue);
-    expect(await f.controller.restorePreviousConversation('rev'), isTrue);
+    await f.controller.viewVersion('a1');
+    await f.controller.continueViewedVersion();
     expect(f.requests, hasLength(requests));
     expect(f.controller.hasRecoveryCheckpoint('rev'), isFalse);
     final restored = (await store.openConversation(
@@ -589,22 +589,22 @@ void main() {
     expect(shape(restored), shape(original));
     expect(shape(f.controller.messages), shape(original));
 
-    // A successful regeneration keeps recovery until the next committed
-    // turn, which ends it without deleting live media.
+    // Further generations and turns keep the old branch and its media.
     f.failedHosts.clear();
     expect(await f.controller.connectConversation(), isTrue);
     expect(await f.controller.regenerateAssistant('a2'), isTrue);
     expect(f.controller.messages.last.status, MessageStatus.complete);
-    expect(f.controller.hasRecoveryCheckpoint('rev'), isTrue);
+    expect(f.controller.hasRecoveryCheckpoint('rev'), isFalse);
     expect(await f.controller.send('Next'), isTrue);
     expect(f.controller.hasRecoveryCheckpoint('rev'), isFalse);
     expect(await store.recoveryCheckpointConversationIds(), isEmpty);
     expect(f.images.deleted, isNot(contains('image:rev:photo')));
 
-    // Deleting the chat deletes its checkpoint.
+    expect(await f.controller.exportBackup(), contains('Second answer'));
+    // Deleting the chat removes all of its versions.
     final latest = f.controller.messages.last.id;
     expect(await f.controller.regenerateAssistant(latest), isTrue);
-    expect(await store.recoveryCheckpointConversationIds(), {'rev'});
+    expect(await f.controller.exportBackup(), contains('First answer'));
     expect(await f.controller.deleteConversation('rev'), isTrue);
     expect(await store.recoveryCheckpointConversationIds(), isEmpty);
   });
@@ -675,64 +675,33 @@ void main() {
     },
   );
 
-  test('address change keeps chats, never reuses the old key, and a failed save changes nothing', () async {
-    final f = ChatFixture();
-    await f.open();
-    addTearDown(f.close);
-    await f.controller.initialize();
-    final a = ServerProfile(
-      id: 'api',
-      name: 'API',
-      protocol: ServerProtocol.openAiCompatible,
-      baseUrl: 'https://a.test/v1',
-    );
-    final connectA = await f.controller.saveAndConnectServerProfile(
-      a,
-      serverApiKey: 'key-a',
-    );
-    expect(connectA.connection!.succeeded, isTrue);
-    expect(await f.controller.send('On A'), isTrue);
-    final chatId = f.controller.conversation!.id;
-    expect(f.requests.last['headers']['authorization'], 'Bearer key-a');
-    expect(f.controller.modelsForProfile('api'), isNotEmpty);
-
-    final b = a.copyWith(baseUrl: 'https://b.test/v1');
-    expect(
-      (await f.controller.saveServerProfile(b)).outcome,
-      ProfileSaveOutcome.confirmationRequired,
-    );
-    f.preferences.failWrites = true;
-    final failed = await f.controller.saveServerProfile(
-      b,
-      confirmAddressChange: true,
-    );
-    f.preferences.failWrites = false;
-    expect(failed.outcome, ProfileSaveOutcome.persistenceFailed);
-    expect(f.controller.activeProfile.baseUrl, 'https://a.test/v1');
-    expect(f.controller.hasServerApiKeyForProfile('api'), isTrue);
-    expect(f.controller.canSend, isTrue);
-
-    final changed = await f.controller.saveServerProfile(
-      b,
-      confirmAddressChange: true,
-    );
-    expect(changed.saved, isTrue);
-    expect(f.controller.activeProfile.baseUrl, 'https://b.test/v1');
-    expect(f.controller.conversation!.id, chatId);
-    expect(f.controller.history.single.serverProfileId, 'api');
-    expect(f.controller.modelsForProfile('api'), isEmpty);
-    expect(f.controller.connectionStatusFor('api'), ConnectionStatus.saved);
-    expect(f.controller.hasServerApiKeyForProfile('api'), isFalse);
-    expect(f.secrets.values.values, isNot(contains('key-a')));
-    expect(f.controller.isDestinationAcknowledged(a), isTrue);
-    expect(f.controller.isDestinationAcknowledged(b), isFalse);
-
-    expect(await f.controller.connectConversation(), isTrue);
-    expect(await f.controller.send('On B'), isTrue);
-    expect(f.controller.conversation!.id, chatId);
-    expect(
-      (f.requests.last['headers'] as Map).containsKey('authorization'),
-      isFalse,
-    );
-  });
+  test(
+    'a changed destination never reassigns existing chats or credentials',
+    () async {
+      final f = ChatFixture();
+      await f.open();
+      addTearDown(f.close);
+      await f.controller.initialize();
+      final a = ServerProfile(
+        id: 'api',
+        name: 'API',
+        protocol: ServerProtocol.openAiCompatible,
+        baseUrl: 'https://a.test/v1',
+      );
+      await f.controller.saveAndConnectServerProfile(a, serverApiKey: 'key-a');
+      expect(await f.controller.send('On A'), isTrue);
+      final chatId = f.controller.conversation!.id;
+      expect(
+        (await f.controller.saveServerProfile(
+          a.copyWith(baseUrl: 'https://b.test/v1'),
+          confirmAddressChange: true,
+        )).outcome,
+        ProfileSaveOutcome.rejected,
+      );
+      expect(f.controller.conversation!.id, chatId);
+      expect(f.controller.activeProfile.baseUrl, a.baseUrl);
+      expect(await f.controller.send('Still on A'), isTrue);
+      expect(f.requests.last['headers']['authorization'], 'Bearer key-a');
+    },
+  );
 }

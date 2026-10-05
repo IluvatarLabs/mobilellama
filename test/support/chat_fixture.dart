@@ -29,6 +29,7 @@ class ChatFixture {
   /// Holds unary requests to a host until the completer completes.
   final holds = <String, Completer<void>>{};
   final requests = <Map<String, dynamic>>[];
+  List<String> Function(Map<String, dynamic>)? compatibleFrames;
   final models = ['qwen3:4b', 'gemma3:4b'];
   bool holdResponse = false;
   int failNextResponses = 0;
@@ -259,13 +260,15 @@ class _CompatibleResponseClient extends http.BaseClient {
       await request.finalize().bytesToString(),
     ) as Map<String, dynamic>;
     fixture.requests.add({...body, 'headers': request.headers});
-    final frames = [
-      'event: hermes.tool.progress\ndata: {"toolCallId":"remote-1","tool":"browser","label":"Read the page","status":"completed"}\n\n',
-      'data: {"choices":[{"index":0,"delta":{"reasoning_content":"Considered the image."},"finish_reason":null}]}\n\n',
-      'data: {"choices":[{"index":0,"delta":{"content":"An image answer."},"finish_reason":null}]}\n\n',
-      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
-      'data: [DONE]\n\n',
-    ];
+    final frames =
+        fixture.compatibleFrames?.call(body) ??
+        [
+          'event: hermes.tool.progress\ndata: {"toolCallId":"remote-1","tool":"browser","label":"Read the page","status":"completed"}\n\n',
+          'data: {"choices":[{"index":0,"delta":{"reasoning_content":"Considered the image."},"finish_reason":null}]}\n\n',
+          'data: {"choices":[{"index":0,"delta":{"content":"An image answer."},"finish_reason":null}]}\n\n',
+          'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+          'data: [DONE]\n\n',
+        ];
     return http.StreamedResponse(
       Stream.fromIterable(frames.map(utf8.encode)),
       200,
@@ -317,8 +320,10 @@ class TestImages implements ImageAttachmentStore {
     required String conversationId,
     required List<int> bytes,
     required String sourceName,
+    String? storageId,
   }) async {
-    final reference = 'image:$conversationId:${++_copies}:$sourceName';
+    final reference =
+        'image:$conversationId:${storageId ?? ++_copies}:$sourceName';
     bytesByReference[reference] = List.of(bytes);
     return reference;
   }
@@ -339,6 +344,7 @@ class TestImages implements ImageAttachmentStore {
   @override
   Future<void> deleteReference(String reference) async {
     deleted.add(reference);
+    bytesByReference.remove(reference);
   }
 
   @override

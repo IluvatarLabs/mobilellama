@@ -1,3 +1,6 @@
+import '../open_webui/accounts.dart';
+import '../open_webui/client.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -8,8 +11,15 @@ import 'package:crypto/crypto.dart';
 import '../data/conversation_store.dart';
 import '../data/chat_backup.dart';
 import '../data/chat_sync.dart';
+import '../data/chat_sync_migration.dart';
+import '../domain/chat_folder.dart';
+import '../domain/message_graph.dart';
 import '../data/document_reader.dart';
 import '../data/settings_store.dart';
+import '../data/profile_credentials.dart';
+import '../data/share_intake.dart';
+import '../ollama/connection_options.dart';
+export '../data/profile_credentials.dart' show SecretStore;
 import '../domain/chat_status.dart';
 import '../domain/conversation.dart';
 import '../domain/generation_options.dart';
@@ -106,12 +116,6 @@ bool _isLocalIpv4(List<int> bytes) {
       (first == 192 && second == 168);
 }
 
-abstract interface class SecretStore {
-  Future<String?> read(String key);
-  Future<void> write(String key, String value);
-  Future<void> delete(String key);
-}
-
 abstract interface class ImageAttachmentStore {
   Future<String?> pickAndCopy({
     required String conversationId,
@@ -125,6 +129,7 @@ abstract interface class ImageAttachmentStore {
     required String conversationId,
     required List<int> bytes,
     required String sourceName,
+    String? storageId,
   });
 }
 
@@ -168,15 +173,28 @@ final class _ChatDraft {
   List<String> images = [];
   List<DocumentAttachment> documents = [];
   String? reservedId;
+  String? folderId;
+  String? parentTip;
+  bool tracksParent = false;
   String? systemPrompt;
   GenerationOptions? options;
+  Set<String> intakeIds = {};
+  Map<String, Map<String, String>> intakeItems = {};
 
   Map<String, Object?> toJson() => {
     'text': text,
     'images': List<String>.of(images),
     'documents': documents.map((document) => document.toJson()).toList(),
     'reservedId': reservedId,
+    'folderId': folderId,
+    'parentTip': parentTip,
+    'tracksParent': tracksParent,
     'systemPrompt': systemPrompt,
+    'intakeIds': intakeIds.toList(),
+    'intakeItems': {
+      for (final entry in intakeItems.entries)
+        entry.key: Map<String, String>.of(entry.value),
+    },
     if (options != null) 'options': options!.toOllamaJson(),
   };
 
@@ -190,7 +208,15 @@ final class _ChatDraft {
         DocumentAttachment.fromJson(Map<String, Object?>.from(value as Map)),
     ]
     ..reservedId = json['reservedId'] as String?
+    ..folderId = json['folderId'] as String?
+    ..parentTip = json['parentTip'] as String?
+    ..tracksParent = json['tracksParent'] == true
     ..systemPrompt = json['systemPrompt'] as String?
+    ..intakeIds = Set<String>.from(json['intakeIds'] as List? ?? const [])
+    ..intakeItems = {
+      for (final entry in (json['intakeItems'] as Map? ?? const {}).entries)
+        entry.key as String: Map<String, String>.from(entry.value as Map),
+    }
     ..options = json['options'] == null
         ? null
         : GenerationOptions.fromJson(
@@ -199,11 +225,13 @@ final class _ChatDraft {
 }
 
 bool _draftHasPersistentContent(_ChatDraft draft) =>
+    draft.intakeIds.isNotEmpty ||
     draft.text.isNotEmpty ||
     draft.images.isNotEmpty ||
     draft.documents.isNotEmpty ||
     draft.systemPrompt != null ||
-    draft.options != null;
+    draft.options != null ||
+    draft.folderId != null;
 
 /// Immutable provider ownership, independent of the selected screen/server.
 final class _RunConfiguration {
@@ -269,6 +297,7 @@ class ChatController extends ChangeNotifier {
     required WebAgentFactory webAgentFactory,
     CompatibleWebAgentFactory? compatibleWebAgentFactory,
     required IdFactory idFactory,
+    this.isTemporary = false,
   }) : _conversations = conversations,
        _settingsStore = settings,
        _secrets = secrets,
@@ -285,6 +314,9 @@ class ChatController extends ChangeNotifier {
        _webAgentFactory = webAgentFactory,
        _compatibleWebAgentFactory = compatibleWebAgentFactory,
        _idFactory = idFactory;
+
+  final bool isTemporary;
+  String? _savedTemporaryId;
 
   static const _webApiKeySecret = 'ollama_web_api_key';
   static const _webDisclosureSecret = 'web_agent_disclosure_acknowledged';
@@ -320,8 +352,288 @@ class ChatController extends ChangeNotifier {
   final Map<String, List<ChatModelOption>> _profileModels = {};
   OllamaShowResponse? _selectedModelDetails;
   String? _selectedModel;
+  List<ChatFolder> _folders = const [];
+  List<ChatFolder> get folders => _folders;
+  ChatFolder? folderById(String? id) =>
+      _folders.where((f) => f.id == id).firstOrNull;
+  ChatFolder? get currentFolder =>
+      folderById(conversation?.folderId ?? _draft.folderId);
+
+  Future<void> saveFolder({
+    String? id,
+    required String name,
+    required String instructions,
+  }) async {
+    if (!_conversations.graphEnabled || !canChangeContext) return;
+    final trimmed = name.trim();
+    if (trimmed.isEmpty ||
+        trimmed.runes.length > 80 ||
+        utf8.encode(instructions).length > maxMessageTextBytes) {
+      throw const FormatException(
+        'Use a folder name up to 80 characters and instructions up to 64 KB.',
+      );
+    }
+    final old = folderById(id);
+    await _conversations.saveFolder(
+      ChatFolder(
+        id: id ?? _idFactory(),
+        name: trimmed,
+        instructions: instructions,
+        revision: (old?.revision ?? 0) + 1,
+      ),
+    );
+    await _reloadHistory();
+    notifyListeners();
+  }
+
+  Future<void> deleteFolder(String id) async {
+    final folder = folderById(id);
+    if (folder == null || !canChangeContext) return;
+    await _conversations.saveFolder(
+      ChatFolder(
+        id: id,
+        name: folder.name,
+        instructions: folder.instructions,
+        revision: folder.revision + 1,
+        deleted: true,
+      ),
+    );
+    for (final draft in _drafts.values) {
+      if (draft.folderId == id) draft.folderId = null;
+    }
+    await flushDrafts();
+    final current = conversation;
+    if (current != null) {
+      await _refreshVisibleConversation(current.id, current.serverProfileId);
+    }
+    await _reloadHistory();
+    notifyListeners();
+  }
+
+  Future<void> moveConversationToFolder(String id, String? folderId) async {
+    if (!canChangeContext) return;
+    await _conversations.moveToFolder(id, folderId);
+    final current = conversation;
+    if (current?.id == id) {
+      await _refreshVisibleConversation(id, current!.serverProfileId);
+    }
+    await _reloadHistory();
+    notifyListeners();
+  }
+
+  Future<void> newConversationInFolder(String? id) async {
+    if (!canChangeContext) return;
+    await newConversation();
+    _draft.folderId = id;
+    await flushDrafts();
+    notifyListeners();
+  }
+
+  Future<bool> applyFolderInstructions() async {
+    final folder = currentFolder;
+    if (folder == null) return false;
+    return updateSystemPrompt(folder.instructions);
+  }
+
   List<Conversation> _history = const [];
+  String? _draftMismatchedScope;
+  bool get draftNeedsBranchChoice => _draftMismatchedScope == draftKey;
+  Future<void> useDraftWithSelectedBranch() async {
+    final current = conversation;
+    if (current == null) return;
+    final stored = await _conversations.openConversation(
+      serverProfileId: current.serverProfileId,
+      id: current.id,
+    );
+    if (stored == null || conversation?.id != current.id) return;
+    _draft.parentTip = stored.conversation.activeTipId;
+    _draft.tracksParent = true;
+    _draftMismatchedScope = null;
+    _errorMessage = null;
+    await flushDrafts();
+    notifyListeners();
+  }
+
+  Future<void> viewDraftBranch() async {
+    final tip = _draft.parentTip;
+    if (tip != null) await viewVersion(tip);
+  }
+
+  String? _previewTip;
+  bool get viewingAlternative => _previewTip != null;
+  bool get versionsEnabled => _conversations.graphEnabled;
+  final _versionCache = <String, Future<List<Message>>>{};
+  Future<List<Message>> versionsOf(String id) =>
+      _versionCache.putIfAbsent(id, () => _conversations.versionsOf(id));
+
+  Future<void> viewVersion(String id) async {
+    final current = conversation;
+    if (current == null || _isStreaming || _isSubmitting || !canChangeContext) {
+      return;
+    }
+    await _conversations.interruptUnfinishedMessages(current.id);
+    final full = await _conversations.openConversation(
+      serverProfileId: current.serverProfileId,
+      id: current.id,
+      allBranches: true,
+    );
+    if (full == null || conversation?.id != current.id) return;
+    final graph = MessageGraph(full.allNodes);
+    if (!graph.nodes.containsKey(id)) return;
+    final descendants = <String>{id};
+    for (final node
+        in full.allNodes.toList()
+          ..sort((a, b) => a.position.compareTo(b.position))) {
+      if (descendants.contains(node.parentId)) descendants.add(node.id);
+    }
+    final active = full.conversation.activeTipId;
+    final tip = descendants.contains(active)
+        ? active!
+        : (full.allNodes
+                  .where(
+                    (m) =>
+                        descendants.contains(m.id) &&
+                        !full.allNodes.any((child) => child.parentId == m.id),
+                  )
+                  .toList()
+                ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt)))
+              .first
+              .id;
+    _previewTip = tip == active ? null : tip;
+    _thread = ConversationThread(
+      conversation: full.conversation,
+      messages: graph.branch(tip),
+    );
+    _historyCursor = null;
+    _presentationLimit = 50;
+    _draftScopeRevision++;
+    notifyListeners();
+  }
+
+  Future<void> continueViewedVersion() async {
+    final current = conversation;
+    final tip = _previewTip;
+    if (current == null || tip == null || _isStreaming || !canChangeContext) {
+      return;
+    }
+    if (queuedPrompts.isNotEmpty) {
+      _errorMessage =
+          'Finish or remove queued messages before changing the continuation.';
+      notifyListeners();
+      return;
+    }
+    await _conversations.selectTip(current.id, tip);
+    _draft.parentTip = tip;
+    _draft.tracksParent = true;
+    _draftMismatchedScope = null;
+    await flushDrafts();
+    _previewTip = null;
+    await _openConversationInternal(
+      current.id,
+      profileId: current.serverProfileId,
+      advanceDraftScope: true,
+    );
+    await _reloadHistory();
+  }
+
+  Future<void> returnToContinuation() async {
+    final current = conversation;
+    if (current == null) return;
+    _previewTip = null;
+    await _openConversationInternal(
+      current.id,
+      profileId: current.serverProfileId,
+      advanceDraftScope: true,
+    );
+  }
+
   ConversationThread? _thread;
+  String? _historyCursor;
+  bool _loadingOlder = false;
+  int _presentationLimit = 50;
+  bool get loadingOlderMessages => _loadingOlder;
+  bool get hasOlderMessages =>
+      conversation != null &&
+      (messages.length > _presentationLimit || _historyCursor != null);
+
+  Future<void> loadOlderMessages() async {
+    final current = _thread;
+    if (current == null || _loadingOlder || !hasOlderMessages) return;
+    if (messages.length > _presentationLimit) {
+      _presentationLimit += 50;
+      notifyListeners();
+      return;
+    }
+    final cursor = _historyCursor;
+    if (cursor == null) return;
+    _loadingOlder = true;
+    notifyListeners();
+    try {
+      final page = await _conversations.openWindow(
+        serverProfileId: current.conversation.serverProfileId,
+        id: current.conversation.id,
+        before: cursor,
+      );
+      if (page == null ||
+          conversation?.id != current.conversation.id ||
+          _historyCursor != cursor) {
+        return;
+      }
+      final present = messages.map((message) => message.id).toSet();
+      _thread = ConversationThread(
+        conversation: _thread!.conversation,
+        messages: [
+          ...page.thread.messages.where(
+            (message) => !present.contains(message.id),
+          ),
+          ...messages,
+        ],
+      );
+      _historyCursor = page.previousCursor;
+      _presentationLimit += 50;
+    } on ConversationCursorChanged {
+      // A known run may have advanced the tip while a page was loading.
+      final full = await _conversations.openConversation(
+        serverProfileId: current.conversation.serverProfileId,
+        id: current.conversation.id,
+      );
+      if (conversation?.id == current.conversation.id && full != null) {
+        _thread = _runs[current.conversation.id]?.thread ?? full;
+        _historyCursor = null;
+        _presentationLimit += 50;
+      }
+    } on Object catch (error) {
+      _errorMessage =
+          'Older messages could not be loaded: ${_friendlyError(error)}';
+    } finally {
+      _loadingOlder = false;
+      notifyListeners();
+    }
+  }
+
+  /// Find is an explicit full-history read, independent of the initial window.
+  Future<void> prepareFindInChat() async {
+    final current = _thread;
+    if (current == null) return;
+    if (viewingAlternative) {
+      _historyCursor = null;
+      _presentationLimit = current.messages.length;
+      notifyListeners();
+      return;
+    }
+    final full =
+        _runs[current.conversation.id]?.thread ??
+        await _conversations.openConversation(
+          serverProfileId: current.conversation.serverProfileId,
+          id: current.conversation.id,
+        );
+    if (conversation?.id != current.conversation.id || full == null) return;
+    _thread = full;
+    _historyCursor = null;
+    _presentationLimit = full.messages.length;
+    notifyListeners();
+  }
+
   final Map<String, _ChatDraft> _drafts = {};
   String get draftKey => _thread?.conversation.id ?? 'new:$activeProfileId';
   _ChatDraft get _draft => _drafts.putIfAbsent(draftKey, _ChatDraft.new);
@@ -333,17 +645,27 @@ class ChatController extends ChangeNotifier {
 
   String? get _pendingImageReference => _draft.images.firstOrNull;
   Future<void> _draftWriteTail = Future<void>.value();
+  final Set<String> _pendingIntakeReceipts = {};
 
   /// Queue immutable snapshots so rapid typing cannot commit out of order.
   Future<void> flushDrafts() {
+    if (_conversations.graphEnabled &&
+        conversation != null &&
+        hasDraft &&
+        !_draft.tracksParent) {
+      _draft.parentTip = conversation!.activeTipId ?? messages.lastOrNull?.id;
+      _draft.tracksParent = true;
+    }
     final snapshot = {
       for (final entry in _drafts.entries)
         if (_draftHasPersistentContent(entry.value))
           entry.key: entry.value.toJson(),
     };
+    final receipts = Set<String>.of(_pendingIntakeReceipts);
     _draftWriteTail = _draftWriteTail.then((_) async {
       try {
-        await _conversations.saveDrafts(snapshot);
+        await _conversations.saveDrafts(snapshot, intakeReceipts: receipts);
+        _pendingIntakeReceipts.removeAll(receipts);
         final hadError = _draftPersistenceError != null;
         _draftPersistenceError = null;
         if (hadError) notifyListeners();
@@ -535,6 +857,7 @@ class ChatController extends ChangeNotifier {
     ServerProtocol.ollama =>
       version == null || version!.isEmpty ? 'Ollama' : 'Ollama $version',
     ServerProtocol.openAiCompatible => 'OpenAI-compatible',
+    ServerProtocol.openWebUi => 'Open WebUI',
   };
   ThemePreference get themePreference =>
       _settings?.theme ?? ThemePreference.system;
@@ -547,19 +870,36 @@ class ChatController extends ChangeNotifier {
     return uri?.scheme == 'http';
   }
 
-  List<ServerProfile> get profiles => _settingsStore.listProfiles();
+  List<ServerProfile> get profiles => _settingsStore
+      .listProfiles()
+      .where((profile) => profile.protocol != ServerProtocol.openWebUi)
+      .toList();
+  late final WebUiAccounts webUiAccounts = WebUiAccounts(
+    _settingsStore,
+    ProfileCredentials(_secrets),
+    _conversations.webUi,
+    prepareConnection: (profile) async {
+      _validateTransport(profile);
+      final uri = Uri.parse(profile.baseUrl);
+      if (uri.scheme == 'http') {
+        await _localNetworkPreflight?.prepare(
+          host: uri.host,
+          port: uri.hasPort ? uri.port : 80,
+        );
+      }
+    },
+  );
   String get activeProfileId => _settingsStore.activeProfileId;
   ServerProfile get activeProfile => _settingsStore.activeProfile;
 
   bool hasServerApiKeyForProfile(String id) {
     final profile = _profileById(id);
-    if (profile == null ||
-        profile.protocol != ServerProtocol.openAiCompatible) {
+    if (profile == null) {
       return false;
     }
     try {
       return _storedServerApiKeySecrets.contains(
-        _serverApiKeySecret(profile.protocol, profile.baseUrl),
+        ProfileCredentials.key(profile.id),
       );
     } on FormatException {
       return false;
@@ -684,15 +1024,17 @@ class ChatController extends ChangeNotifier {
   }) async {
     final id = profileId ?? activeProfileId;
     if (!canChangeContext ||
-        _profileById(id)?.protocol != ServerProtocol.openAiCompatible)
+        _profileById(id)?.protocol != ServerProtocol.openAiCompatible) {
       return;
+    }
     final values = Set<String>.of(compatibleCapabilitiesForProfile(id));
     enabled ? values.add(capability) : values.remove(capability);
     await _settingsStore.setCompatibleCapabilities(id, values);
     if (id == activeProfileId) {
       _modelDetails.clear();
-      if (_selectedModel != null)
+      if (_selectedModel != null) {
         _selectedModelDetails = _compatibleDetails(_selectedModel!);
+      }
     }
     notifyListeners();
   }
@@ -794,8 +1136,9 @@ class ChatController extends ChangeNotifier {
           _modelManagementStatus = 'Download cancelled.';
           return false;
         }
-        if (!success)
+        if (!success) {
           throw StateError('The server did not finish the download.');
+        }
         _modelManagementStatus = 'Downloaded ${name.trim()}.';
       }
       final installed = await client.listModels();
@@ -854,6 +1197,7 @@ class ChatController extends ChangeNotifier {
 
   /// Network submission permission (send, or queue while streaming).
   bool get canSubmit =>
+      !viewingAlternative &&
       conversationConnected &&
       _selectedModel != null &&
       !_profileChangesBlocked;
@@ -868,7 +1212,9 @@ class ChatController extends ChangeNotifier {
     if (!conversationProfile.configured) return SubmitAvailability.noConnection;
     if (!conversationConnected) return SubmitAvailability.unavailable;
     if (_selectedModel == null) return SubmitAvailability.noModel;
-    if (_profileChangesBlocked) return SubmitAvailability.localMutation;
+    if (_profileChangesBlocked || viewingAlternative) {
+      return SubmitAvailability.localMutation;
+    }
     if (_isStreaming) return SubmitAvailability.streaming;
     if (queuePaused) return SubmitAvailability.queuePaused;
     return SubmitAvailability.ready;
@@ -877,7 +1223,11 @@ class ChatController extends ChangeNotifier {
   /// Image support of the selected model: null while unknown.
   bool? get imagesSupported => _selectedModelDetails?.supportsVision;
 
-  bool get canSend => canSubmit && !_isStreaming && queuedPrompts.isEmpty;
+  bool get canSend =>
+      canSubmit &&
+      !_isStreaming &&
+      queuedPrompts.isEmpty &&
+      !viewingAlternative;
   bool isConversationRunning(String id) =>
       _runs.containsKey(id) || _queueStartingIds.contains(id);
   List<QueuedPrompt> get queuedPrompts =>
@@ -891,7 +1241,9 @@ class ChatController extends ChangeNotifier {
   String get systemPrompt =>
       _thread?.conversation.systemPrompt ??
       _draft.systemPrompt ??
-      chatDefaults.systemPrompt;
+      ((currentFolder?.instructions.isNotEmpty ?? false)
+          ? currentFolder!.instructions
+          : chatDefaults.systemPrompt);
   GenerationOptions get generationOptions =>
       _thread?.conversation.generationOptions ??
       _draft.options ??
@@ -913,6 +1265,11 @@ class ChatController extends ChangeNotifier {
 
   List<TranscriptMessageView> get transcriptMessages {
     final visible = messages
+        .skip(
+          messages.length > _presentationLimit
+              ? messages.length - _presentationLimit
+              : 0,
+        )
         .where((message) => message.role != MessageRole.tool)
         .toList(growable: false);
     final latestAssistant = visible.lastIndexWhere(
@@ -925,6 +1282,165 @@ class ChatController extends ChangeNotifier {
           canRetry: index == latestAssistant,
         ),
     ]);
+  }
+
+  /// Uses the same chat flow, with no durable settings, secrets, or sync bridge.
+  Future<ChatController> temporaryController({
+    required ConversationStore store,
+    required ImageAttachmentStore images,
+  }) async {
+    final profile = conversationProfile;
+    final settings = SettingsStore(_TemporaryPreferences());
+    await settings.upsertProfile(profile);
+    await settings.setActiveProfile(profile.id);
+    await settings.setChatDefaults(chatDefaults);
+    await settings.setTheme(themePreference);
+    await settings.setDefaultModel(profile.id, selectedModel);
+    await settings.setCompatibleCapabilities(
+      profile.id,
+      _settingsStore.compatibleCapabilities(profile.id),
+    );
+    if (_settingsStore.isDestinationAcknowledged(
+      profile.protocol,
+      profile.baseUrl,
+    )) {
+      await settings.acknowledgeDestination(profile.protocol, profile.baseUrl);
+    }
+    final secrets = _TemporarySecrets();
+    await ProfileCredentials(secrets)
+        .write(profile, await ProfileCredentials(_secrets).options(profile));
+    final controller = ChatController(
+      conversations: store,
+      settings: settings,
+      secrets: secrets,
+      images: images,
+      documentReader: _documentReader,
+      localNetworkPreflight: _localNetworkPreflight,
+      ollamaClientFactory: _ollamaClientFactory,
+      openAiCompatibleClientFactory: _openAiCompatibleClientFactory,
+      webAgentFactory: _webAgentFactory,
+      compatibleWebAgentFactory: _compatibleWebAgentFactory,
+      idFactory: _idFactory,
+      isTemporary: true,
+    );
+    await controller.initialize();
+    return controller;
+  }
+
+  /// Explicit Save copies media first, then commits the chat and its draft in
+  /// one SQLite transaction. The original controller and its draft stay intact.
+  Future<String> saveTemporaryTo(ChatController destination) async {
+    if (!isTemporary) throw StateError('This is not a temporary session.');
+    if (_savedTemporaryId case final id?) return id;
+    if (!canChangeContext ||
+        isStreaming ||
+        queuedPrompts.isNotEmpty ||
+        !destination.canChangeContext) {
+      throw StateError(
+        'Stop the response and finish or remove queued messages before saving.',
+      );
+    }
+    final profile = conversationProfile;
+    final target = destination._profileById(profile.id);
+    if (target == null ||
+        target.baseUrl != profile.baseUrl ||
+        target.protocol != profile.protocol) {
+      throw StateError(
+        'The original connection changed. Restore it before saving this chat.',
+      );
+    }
+    if (conversation == null) {
+      await _createConversation(
+        model: selectedModel ?? '',
+        systemPrompt: systemPrompt,
+      );
+    }
+    await flushDrafts();
+    await destination.flushDrafts();
+    _conversationMutationBusy = true;
+    destination._conversationMutationBusy = true;
+    notifyListeners();
+    destination.notifyListeners();
+    final draftReferences = <String>[];
+    var committed = false;
+    late String importedId;
+    late _ChatDraft importedDraft;
+    try {
+      final json = await ChatBackup(_conversations).exportJson(
+        serverProfiles: [
+          BackupServerProfile(
+            id: profile.id,
+            name: profile.name,
+            protocol: profile.protocol.name,
+            compatibleApi: profile.compatibleApi.name,
+            baseUrl: profile.baseUrl,
+          ),
+        ],
+        conversationIds: {conversation!.id},
+        includeFolders: false,
+        readAttachment: (ref) async =>
+            base64Decode(await _images.readAsBase64(ref)),
+      );
+      await ChatBackup(destination._conversations).importJson(
+        json: json,
+        serverProfileMappings: {profile.id: profile.id},
+        allocateId: destination._idFactory,
+        writeAttachment: (attachment, id) => destination._images.writeBytes(
+          conversationId: id,
+          bytes: attachment.bytes,
+          sourceName: attachment.sourceName,
+        ),
+        deleteAttachment: destination._images.deleteReference,
+        prepareDrafts: (ids, nodes) async {
+          importedId = ids[conversation!.id]!;
+          importedDraft = _ChatDraft.fromJson(_draft.toJson())
+            ..reservedId = null
+            ..folderId = null
+            ..parentTip = nodes[_draft.parentTip]
+            ..images = []
+            ..documents = [];
+          for (final ref in _draft.images) {
+            final copy = await destination._images.writeBytes(
+              conversationId: importedId,
+              bytes: base64Decode(await _images.readAsBase64(ref)),
+              sourceName: ref,
+            );
+            draftReferences.add(copy);
+            importedDraft.images.add(copy);
+          }
+          for (final document in _draft.documents) {
+            final copy = await destination._images.writeBytes(
+              conversationId: importedId,
+              bytes: base64Decode(
+                await _images.readAsBase64(document.reference),
+              ),
+              sourceName: document.name,
+            );
+            draftReferences.add(copy);
+            importedDraft.documents.add(
+              document.copyWith(id: destination._idFactory(), reference: copy),
+            );
+          }
+          return {importedId: importedDraft.toJson()};
+        },
+      );
+      committed = true;
+      _savedTemporaryId = importedId;
+      destination._drafts[importedId] = importedDraft;
+    } finally {
+      if (!committed) {
+        for (final ref in draftReferences) {
+          await destination._images.deleteReference(ref);
+        }
+      }
+      _conversationMutationBusy = false;
+      destination._conversationMutationBusy = false;
+      notifyListeners();
+      destination.notifyListeners();
+    }
+    await destination._reloadHistory();
+    await destination.openConversation(importedId);
+    return importedId;
   }
 
   Future<void> initialize() async {
@@ -941,23 +1457,43 @@ class ChatController extends ChangeNotifier {
     for (final entry in savedDrafts.entries) {
       _drafts[entry.key] = _ChatDraft.fromJson(entry.value);
     }
+    // Anchor legacy drafts before cloud adoption can replace the active tip.
+    if (_conversations.graphEnabled) {
+      for (final chat in await _conversations.listAllConversations(
+        includeEmpty: true,
+      )) {
+        final draft = _drafts[chat.id];
+        if (draft != null &&
+            !draft.tracksParent &&
+            _draftHasPersistentContent(draft)) {
+          draft.parentTip = chat.activeTipId;
+          draft.tracksParent = true;
+        }
+      }
+      await flushDrafts();
+    }
     await _reloadQueues();
     _queuePausedIds.addAll(_queues.keys);
     _checkpointIds.addAll(
       await _conversations.recoveryCheckpointConversationIds(),
     );
     _settings = _settingsStore.load();
+    await ProfileCredentials(_secrets).migrate(profiles);
     await _refreshStoredServerApiKeySecrets();
-    if (serverProtocol == ServerProtocol.openAiCompatible) {
-      _serverApiKey = (await _secrets.read(
-        _serverApiKeySecret(serverProtocol, baseUrl),
-      ))?.trim();
-    }
+    _serverApiKey = (await ProfileCredentials(_secrets).options(activeProfile))
+        .apiKey;
     _webApiKey = (await _secrets.read(_webApiKeySecret))?.trim();
     _webDisclosureAcknowledged =
         await _secrets.read(_webDisclosureSecret) == 'true';
     await _reloadHistory();
     _initialized = true;
+    if (_conversations.graphEnabled &&
+        await _conversations.migrationValue('legacyBaseline') == null) {
+      await _conversations.setMigrationValue(
+        'legacyBaseline',
+        _settingsStore.syncBaseline,
+      );
+    }
     if (_syncBridge != null) {
       _chatSync = ChatSyncService(
         bridge: _syncBridge,
@@ -977,8 +1513,20 @@ class ChatController extends ChangeNotifier {
         exportChat: _exportSyncChat,
         applyChange: _applySyncChange,
         hasReceipt: _conversations.hasSyncReceipt,
-        loadBaseline: () => _settingsStore.syncBaseline,
-        saveBaseline: _settingsStore.saveSyncBaseline,
+        loadBaseline: () => _conversations.graphEnabled
+            ? _settingsStore.syncBaselineV2
+            : _settingsStore.syncBaseline,
+        saveBaseline: _conversations.graphEnabled
+            ? _settingsStore.saveSyncBaselineV2
+            : _settingsStore.saveSyncBaseline,
+        adoptMigration: !_conversations.graphEnabled
+            ? null
+            : ChatSyncMigration(
+                store: _conversations,
+                exportLocal: _exportMigrationLocal,
+                apply: _applySyncChange,
+                allocateId: _idFactory,
+              ).adopt,
       )..addListener(notifyListeners);
       await _chatSync!.initialize();
     }
@@ -1028,15 +1576,17 @@ class ChatController extends ChangeNotifier {
 
   /// Tests a connection form without saving it or changing any status. Uses
   /// only the version/model APIs; no chat content or attachment is sent.
-  /// A blank [serverApiKey] uses a key already stored for the exact endpoint.
+  /// A blank [serverApiKey] uses a key already stored for this profile and exact destination.
   Future<ConnectionTestResult> testConnection(
     ServerProfile profile, {
     String? serverApiKey,
+    Map<String, String>? customHeaders,
   }) async {
     try {
       final probe = await _probeServerProfile(
         profile,
         serverApiKey: serverApiKey,
+        customHeaders: customHeaders,
       );
       return ConnectionTestResult.success(modelCount: probe.models.length);
     } on Object catch (error) {
@@ -1060,16 +1610,14 @@ class ChatController extends ChangeNotifier {
   /// Save: validates syntax and transport rules and persists the profile and
   /// any entered key locally, without any network request.
   ///
-  /// A same-protocol address change on a profile with chats returns
-  /// [ProfileSaveOutcome.confirmationRequired] until called with
-  /// [confirmAddressChange]. The profile ID, chats, drafts, defaults, and
-  /// capability overrides are preserved; queued work for the profile is
-  /// paused; model, capability, and connection caches and the in-memory
-  /// client/key binding are invalidated. A blank [serverApiKey] keeps only a
-  /// key already stored for the exact new endpoint; keys are never copied.
+  /// A connection that owns chats keeps its destination and inference API.
+  /// New destinations use a new connection. Editing a configuration invalidates
+  /// active clients but retains the last known model inventory for that server.
+  /// Credential values are bound to this profile and its exact destination.
   Future<ProfileSaveResult> saveServerProfile(
     ServerProfile profile, {
     String? serverApiKey,
+    Map<String, String>? customHeaders,
     bool confirmAddressChange = false,
   }) async {
     if (_profileMutationBusy || _shutdownFuture != null) {
@@ -1080,12 +1628,9 @@ class ChatController extends ChangeNotifier {
     }
     late final ServerProfile normalized;
     try {
-      normalized = ServerProfile(
-        id: profile.id,
-        name: profile.name,
-        protocol: profile.protocol,
+      normalized = profile.copyWith(
         baseUrl: _canonicalServerBaseUrl(profile.protocol, profile.baseUrl),
-        acknowledgedInsecureOrigin: profile.acknowledgedInsecureOrigin,
+        configured: true,
       );
       _validateTransport(normalized);
     } on Object catch (error) {
@@ -1095,6 +1640,15 @@ class ChatController extends ChangeNotifier {
       );
     }
     final previous = _profileById(normalized.id);
+    if (_runs.values.any(
+      (run) => run.configuration.profile.id == normalized.id,
+    )) {
+      return const ProfileSaveResult(
+        ProfileSaveOutcome.rejected,
+        message:
+            'Stop this connection’s response before editing its configuration.',
+      );
+    }
     final identityChanged =
         previous != null && !_sameServerIdentity(previous, normalized);
     if (identityChanged) {
@@ -1109,11 +1663,11 @@ class ChatController extends ChangeNotifier {
               '${_friendlyError(error)}',
         );
       }
-      if (hasChats && previous.protocol != normalized.protocol) {
+      if (hasChats) {
         return ProfileSaveResult(
           ProfileSaveOutcome.rejected,
           message:
-              'Create a new connection for a different connection type. '
+              'Create a new connection for a different address or inference API. '
               'Chats on “${previous.name}” keep their current server.',
         );
       }
@@ -1140,13 +1694,6 @@ class ChatController extends ChangeNotifier {
               'to finish before changing its address.',
         );
       }
-      if (hasChats && !confirmAddressChange) {
-        return ProfileSaveResult(
-          ProfileSaveOutcome.confirmationRequired,
-          message:
-              'Existing chats on “${previous.name}” will use the new address.',
-        );
-      }
     }
 
     _profileMutationBusy = true;
@@ -1158,21 +1705,24 @@ class ChatController extends ChangeNotifier {
       final previousSecret = previous == null
           ? null
           : _serverSecretForProfile(previous);
-      final enteredKey = serverApiKey?.trim() ?? '';
-      if (normalized.protocol == ServerProtocol.openAiCompatible &&
-          enteredKey.isNotEmpty) {
-        final secret = _serverApiKeySecret(
-          normalized.protocol,
-          normalized.baseUrl,
-        );
-        replacedSecretValue = await _secrets.read(secret);
-        await _secrets.write(secret, enteredKey);
-        writtenSecret = secret;
+      final credentials = ProfileCredentials(_secrets);
+      final options = await credentials.options(
+        normalized,
+        apiKey: serverApiKey,
+        customHeaders: customHeaders,
+      );
+      final secret = ProfileCredentials.key(normalized.id);
+      replacedSecretValue = await _secrets.read(secret);
+      await credentials.write(normalized, options);
+      writtenSecret = secret;
+      if (options.apiKey.isNotEmpty) {
         _storedServerApiKeySecrets.add(secret);
+      } else {
+        _storedServerApiKeySecrets.remove(secret);
       }
       await _settingsStore.upsertProfile(normalized);
       profilePersisted = true;
-      if (identityChanged) _invalidateEndpoint(normalized.id);
+      _invalidateEndpoint(normalized.id, preserveModels: !identityChanged);
       if (normalized.id == activeProfileId) _settings = _settingsStore.load();
       final currentSecret = _serverSecretForProfile(normalized);
       final keyCleanupWarning =
@@ -1214,6 +1764,7 @@ class ChatController extends ChangeNotifier {
   Future<ProfileSaveResult> saveAndConnectServerProfile(
     ServerProfile profile, {
     String? serverApiKey,
+    Map<String, String>? customHeaders,
     bool confirmAddressChange = false,
     bool makeActive = true,
     bool preserveConversation = false,
@@ -1221,6 +1772,7 @@ class ChatController extends ChangeNotifier {
     final save = await saveServerProfile(
       profile,
       serverApiKey: serverApiKey,
+      customHeaders: customHeaders,
       confirmAddressChange: confirmAddressChange,
     );
     if (!save.saved) return save;
@@ -1370,14 +1922,13 @@ class ChatController extends ChangeNotifier {
       if (wasActive) {
         _activateLocalState(activeProfileId);
         if (_thread?.conversation.serverProfileId != activeProfileId) {
+          _previewTip = null;
           _thread = null;
           _contextNotice = null;
         }
       }
-      if (deletedSecret != null) {
-        final warning = await _deleteServerSecretIfOrphaned(deletedSecret);
-        if (warning != null) _errorMessage = warning;
-      }
+      final warning = await _deleteServerSecretIfOrphaned(deletedSecret);
+      if (warning != null) _errorMessage = warning;
     } on Object catch (error) {
       _errorMessage = _friendlyError(error);
       return false;
@@ -1408,6 +1959,7 @@ class ChatController extends ChangeNotifier {
       if (!preserveConversation &&
           _thread != null &&
           _thread!.conversation.serverProfileId != id) {
+        _previewTip = null;
         _thread = null;
         _contextNotice = null;
       }
@@ -1432,10 +1984,10 @@ class ChatController extends ChangeNotifier {
   }
 
   /// Invalidates caches and bindings after a profile's endpoint changed.
-  void _invalidateEndpoint(String profileId) {
+  void _invalidateEndpoint(String profileId, {bool preserveModels = false}) {
     _endpointGenerations[profileId] = _generationOf(profileId) + 1;
     _profileProbes.remove(profileId);
-    _profileModels.remove(profileId);
+    if (!preserveModels) _profileModels.remove(profileId);
     _modelDetails.removeWhere((key, _) => key.startsWith('$profileId:'));
     _detailErrors.removeWhere((key, _) => key.startsWith('$profileId:'));
     _modelListErrors.remove(profileId);
@@ -1558,14 +2110,10 @@ class ChatController extends ChangeNotifier {
   Future<_ServerProbe> _probeServerProfile(
     ServerProfile profile, {
     String? serverApiKey,
+    Map<String, String>? customHeaders,
   }) async {
-    final normalized = ServerProfile(
-      id: profile.id,
-      name: profile.name,
-      protocol: profile.protocol,
+    final normalized = profile.copyWith(
       baseUrl: _canonicalServerBaseUrl(profile.protocol, profile.baseUrl),
-      acknowledgedInsecureOrigin: profile.acknowledgedInsecureOrigin,
-      configured: profile.configured,
     );
     final uri = Uri.parse(normalized.baseUrl);
     if (uri.scheme == 'http') {
@@ -1576,32 +2124,39 @@ class ChatController extends ChangeNotifier {
       );
     }
 
+    final options = await ProfileCredentials(
+      _secrets,
+    ).options(normalized, apiKey: serverApiKey, customHeaders: customHeaders);
     switch (normalized.protocol) {
+      case ServerProtocol.openWebUi:
+        throw const WebUiException('Open this connection from Shared chats.');
       case ServerProtocol.ollama:
-        final client = _ollamaClientFactory(normalized.baseUrl);
+        final client = _ollamaClientFactory(normalized.baseUrl)
+            .withConnectionOptions(options);
         final version = await client.getVersion();
         final models = await client.listModels();
         return _ServerProbe(
           profile: normalized,
           ollama: client,
           version: version,
+          serverApiKey: options.apiKey,
           models: List<ChatModelOption>.unmodifiable(
             models.map((model) => ChatModelOption(model.name)),
           ),
         );
       case ServerProtocol.openAiCompatible:
-        final enteredKey = serverApiKey?.trim() ?? '';
-        final key = enteredKey.isNotEmpty
-            ? enteredKey
-            : (await _secrets.read(
-                    _serverApiKeySecret(
-                      normalized.protocol,
-                      normalized.baseUrl,
-                    ),
-                  ))?.trim() ??
-                  '';
-        final client = _openAiCompatibleClientFactory(normalized.baseUrl, key);
-        final models = await client.listModels();
+        final key = options.apiKey;
+        final client = _openAiCompatibleClientFactory(
+          normalized.baseUrl,
+          key,
+        ).withConnectionOptions(options);
+        final List<String> models;
+        if (normalized.manualModels.isNotEmpty) {
+          await client.probeReachability();
+          models = normalized.manualModels;
+        } else {
+          models = await client.listModels();
+        }
         return _ServerProbe(
           profile: normalized,
           openAiCompatible: client,
@@ -1635,6 +2190,7 @@ class ChatController extends ChangeNotifier {
     if (!preserveConversation &&
         _thread != null &&
         _thread!.conversation.serverProfileId != activeProfileId) {
+      _previewTip = null;
       _thread = null;
       _draftScopeRevision += 1;
     }
@@ -1662,6 +2218,7 @@ class ChatController extends ChangeNotifier {
     ServerProtocol protocol,
     String value,
   ) => switch (protocol) {
+    ServerProtocol.openWebUi => OpenWebUiClient.canonicalRoot(value).toString(),
     ServerProtocol.ollama => OllamaClient.normalizeBaseUrl(value).toString(),
     ServerProtocol.openAiCompatible => OpenAiCompatibleClient.normalizeBaseUrl(
       value,
@@ -1670,14 +2227,9 @@ class ChatController extends ChangeNotifier {
 
   static bool _sameServerIdentity(ServerProfile first, ServerProfile second) =>
       first.protocol == second.protocol &&
+      first.compatibleApi == second.compatibleApi &&
       _canonicalServerBaseUrl(first.protocol, first.baseUrl) ==
           _canonicalServerBaseUrl(second.protocol, second.baseUrl);
-
-  static String _serverApiKeySecret(ServerProtocol protocol, String value) {
-    final canonical = _canonicalServerBaseUrl(protocol, value);
-    final encoded = base64Url.encode(utf8.encode(canonical));
-    return 'server_api_key:${protocol.name}:$encoded';
-  }
 
   ServerProfile? _profileById(String id) {
     for (final profile in profiles) {
@@ -1689,17 +2241,15 @@ class ChatController extends ChangeNotifier {
   Future<void> _refreshStoredServerApiKeySecrets() async {
     _storedServerApiKeySecrets.clear();
     for (final profile in profiles) {
-      if (profile.protocol != ServerProtocol.openAiCompatible) continue;
-      final secret = _serverApiKeySecret(profile.protocol, profile.baseUrl);
-      final value = (await _secrets.read(secret))?.trim() ?? '';
+      final secret = ProfileCredentials.key(profile.id);
+      final value = (await ProfileCredentials(_secrets).options(profile))
+          .apiKey;
       if (value.isNotEmpty) _storedServerApiKeySecrets.add(secret);
     }
   }
 
-  String? _serverSecretForProfile(ServerProfile profile) =>
-      profile.protocol == ServerProtocol.openAiCompatible
-      ? _serverApiKeySecret(profile.protocol, profile.baseUrl)
-      : null;
+  String _serverSecretForProfile(ServerProfile profile) =>
+      ProfileCredentials.key(profile.id);
 
   Future<String?> _deleteServerSecretIfOrphaned(String secret) async {
     final stillUsed = profiles.any(
@@ -1737,7 +2287,9 @@ class ChatController extends ChangeNotifier {
       if (id == activeProfileId && isConnected) {
         final generation = _generationOf(id);
         final names = compatible != null
-            ? await compatible.listModels()
+            ? (profile.manualModels.isNotEmpty
+                  ? profile.manualModels
+                  : await compatible.listModels())
             : [for (final model in await ollama!.listModels()) model.name];
         if (generation != _generationOf(id) ||
             id != activeProfileId ||
@@ -1826,6 +2378,7 @@ class ChatController extends ChangeNotifier {
 
   Future<void> newConversation() async {
     if (_profileChangesBlocked || _thread == null) return;
+    _previewTip = null;
     _thread = null;
     _contextNotice = null;
     _draftScopeRevision += 1;
@@ -1834,8 +2387,9 @@ class ChatController extends ChangeNotifier {
   }
 
   Future<bool> newConversationOnServer(String id) async {
-    if (!await switchServerProfile(id, preserveConversation: true))
+    if (!await switchServerProfile(id, preserveConversation: true)) {
       return false;
+    }
     await newConversation();
     return _thread == null && activeProfileId == id;
   }
@@ -1854,11 +2408,19 @@ class ChatController extends ChangeNotifier {
 
   Future<void> discardCurrentDraft() async {
     if (!canEditDraft || _isSubmitting) return;
+    final intakes = Set<String>.of(_draft.intakeIds);
     final documents = List.of(_draft.documents);
     await _discardPendingImage();
     _drafts.remove(draftKey);
     await flushDrafts();
     if (_draftPersistenceError == null) {
+      for (final intake in intakes) {
+        try {
+          await ShareIntake.removeId(intake);
+        } on Object {
+          _errorMessage = 'Draft discarded, but shared staging could not be removed. Discard it from Shared content.';
+        }
+      }
       for (final document in documents) {
         if (!await _conversations.isImageReferenceInUse(document.reference)) {
           try {
@@ -1950,8 +2512,9 @@ class ChatController extends ChangeNotifier {
 
   Future<String> conversationMarkdown(String id) async {
     final chat = _history.where((item) => item.id == id).firstOrNull;
-    if (chat == null)
+    if (chat == null) {
       throw const FormatException('Conversation no longer exists.');
+    }
     return ChatBackup(_conversations).exportConversationMarkdown(
       serverProfileId: chat.serverProfileId,
       conversationId: id,
@@ -1970,6 +2533,7 @@ class ChatController extends ChangeNotifier {
               id: profile.id,
               name: profile.name,
               protocol: profile.protocol.name,
+              compatibleApi: profile.compatibleApi.name,
               baseUrl: profile.baseUrl,
             ),
         ],
@@ -1982,7 +2546,10 @@ class ChatController extends ChangeNotifier {
     }
   }
 
-  Future<int> importBackup(String json) async {
+  ChatBackupInspection inspectBackup(String json) =>
+      ChatBackup(_conversations).inspectJson(json);
+
+  Future<int> importBackup(String json, {String? localDestinationId}) async {
     if (!canChangeContext) throw StateError('Finish the current action first.');
     _conversationMutationBusy = true;
     notifyListeners();
@@ -1991,7 +2558,20 @@ class ChatController extends ChangeNotifier {
     try {
       final backup = ChatBackup(_conversations);
       final inspection = backup.inspectJson(json);
-      final mappings = await _mapBackupProfiles(inspection, createdProfiles);
+      final destination = profiles
+          .where((profile) => profile.id == localDestinationId)
+          .firstOrNull;
+      if (inspection.requiresLocalDestination && destination == null) {
+        throw const FormatException(
+          'Choose an existing direct connection for this local snapshot.',
+        );
+      }
+      final mappings = inspection.requiresLocalDestination
+          ? <String, String>{
+              for (final profile in inspection.profiles)
+                profile.id: destination!.id,
+            }
+          : await _mapBackupProfiles(inspection, createdProfiles);
       final result = await backup.importJson(
         json: json,
         serverProfileMappings: mappings,
@@ -2022,12 +2602,20 @@ class ChatController extends ChangeNotifier {
 
   Future<Map<String, String>> _syncLocalVersions() async {
     final versions = <String, String>{};
+    if (_conversations.graphEnabled) {
+      for (final folder in await _conversations.folders(includeDeleted: true)) {
+        versions['folder:${folder.id}'] = sha256
+            .convert(utf8.encode(jsonEncode(folder.toJson())))
+            .toString();
+      }
+    }
     for (final chat in await _conversations.listAllConversations(
       includeEmpty: true,
     )) {
       final thread = await _conversations.openConversation(
         serverProfileId: chat.serverProfileId,
         id: chat.id,
+        allBranches: _conversations.graphEnabled,
       );
       if (thread == null) continue;
       final profile = _profileById(chat.serverProfileId);
@@ -2039,16 +2627,27 @@ class ChatController extends ChangeNotifier {
         chat.title,
         chat.selectedModel,
         chat.systemPrompt,
+        if (_conversations.graphEnabled) ...[
+          chat.activeTipId,
+          chat.folderId,
+          chat.instructionSource,
+          chat.instructionSourceId,
+          chat.instructionSourceRevision,
+        ],
         chat.isPinned,
         chat.isArchived,
         chat.isRenamed,
         chat.generationOptions.toOllamaJson(),
         chat.createdAt.toUtc().toIso8601String(),
         chat.updatedAt.toUtc().toIso8601String(),
-        for (final message in thread.messages)
+        for (final message in thread.allNodes)
           [
             message.id,
             message.position,
+            if (_conversations.graphEnabled) ...[
+              message.parentId,
+              message.siblingOrder,
+            ],
             message.role.name,
             message.status.name,
             message.content,
@@ -2062,26 +2661,55 @@ class ChatController extends ChangeNotifier {
             message.updatedAt.toUtc().toIso8601String(),
           ],
       ];
-      versions[chat.id] = sha256
-          .convert(utf8.encode(jsonEncode(value)))
-          .toString();
+      versions[_conversations.graphEnabled ? 'chat:${chat.id}' : chat.id] =
+          sha256.convert(utf8.encode(jsonEncode(value))).toString();
+    }
+    if (_conversations.graphEnabled) {
+      for (final id in await _conversations.migrationDeletions(
+        _chatSync?.state.accountScope ?? '',
+      )) {
+        versions.putIfAbsent(id, () => 'deleted');
+      }
     }
     return versions;
   }
 
-  Future<String> _exportSyncChat(String id) async {
+  Future<String?> _exportSyncChat(String id) async {
+    if (_conversations.graphEnabled &&
+        (await _conversations.migrationDeletions(
+          _chatSync?.state.accountScope ?? '',
+        )).contains(id)) {
+      if (id.startsWith('chat:') &&
+          !(await _conversations.listAllConversations(includeEmpty: true))
+              .any((c) => c.id == id.substring(5))) {
+        return null;
+      }
+    }
+    if (_conversations.graphEnabled && id.startsWith('folder:')) {
+      final folder = (await _conversations.folders(includeDeleted: true))
+          .firstWhere((f) => f.id == id.substring(7));
+      return jsonEncode({
+        'format': 'mobilellama-folder',
+        'version': 2,
+        'folder': folder.toJson(),
+      });
+    }
+    final localId = _conversations.graphEnabled ? id.substring(5) : id;
     final chat = (await _conversations.listAllConversations(includeEmpty: true))
-        .firstWhere((chat) => chat.id == id);
+        .firstWhere((chat) => chat.id == localId);
     final profile = _profileById(chat.serverProfileId);
-    if (profile == null)
+    if (profile == null) {
       throw StateError('The chat server profile is missing.');
+    }
     final json = await ChatBackup(_conversations).exportJson(
-      conversationIds: {id},
+      conversationIds: {localId},
+      includeFolders: false,
       serverProfiles: [
         BackupServerProfile(
           id: profile.id,
           name: profile.name,
           protocol: profile.protocol.name,
+          compatibleApi: profile.compatibleApi.name,
           baseUrl: profile.baseUrl,
         ),
       ],
@@ -2094,8 +2722,78 @@ class ChatController extends ChangeNotifier {
     return jsonEncode(value);
   }
 
+  Future<String?> _exportMigrationLocal(String id) async {
+    if (id.startsWith('folder:')) {
+      if (!(await _conversations.folders(includeDeleted: true))
+          .any((f) => f.id == id.substring(7))) {
+        return null;
+      }
+    } else if (id.startsWith('chat:')) {
+      if (!(await _conversations.listAllConversations(includeEmpty: true))
+          .any((c) => c.id == id.substring(5))) {
+        return null;
+      }
+    } else {
+      throw const FormatException('Invalid migration identity.');
+    }
+    return _exportSyncChat(id);
+  }
+
+  Future<void> _applySyncFolder(ChatSyncChange change) async {
+    final id = change.id.substring(7);
+    final old = (await _conversations.folders(includeDeleted: true))
+        .where((f) => f.id == id)
+        .firstOrNull;
+    late final ChatFolder folder;
+    if (change.deleted) {
+      folder = ChatFolder(
+        id: id,
+        name: old?.name ?? 'Deleted folder',
+        instructions: old?.instructions ?? '',
+        revision: (old?.revision ?? 0) + 1,
+        deleted: true,
+      );
+    } else {
+      final value = jsonDecode(change.json!) as Map;
+      if (value['format'] != 'mobilellama-folder' || value['version'] != 2) {
+        throw const FormatException('Unsupported folder format.');
+      }
+      final source = ChatFolder.fromJson(value['folder'] as Map);
+      if (!change.conflict && source.id != id) {
+        throw const FormatException('Folder identity does not match.');
+      }
+      folder = ChatFolder(
+        id: id,
+        name: change.conflict ? '${source.name} (recovered)' : source.name,
+        instructions: source.instructions,
+        revision: source.revision,
+        deleted: source.deleted,
+      );
+    }
+    await _conversations.saveFolder(folder, receipt: change.token);
+    await _reloadHistory();
+  }
+
   Future<void> _applySyncChange(ChatSyncChange change) async {
     if (await _conversations.hasSyncReceipt(change.token)) return;
+    if (_conversations.graphEnabled) {
+      if (change.id.startsWith('folder:')) {
+        await _applySyncFolder(change);
+        return;
+      }
+      if (!change.id.startsWith('chat:')) {
+        throw const FormatException('Invalid versioned sync identity.');
+      }
+      change = ChatSyncChange(
+        token: change.token,
+        id: change.id.substring(5),
+        json: change.json,
+        deleted: change.deleted,
+        conflict: change.conflict,
+        source: change.source,
+        accountScope: change.accountScope,
+      );
+    }
     if (isConversationRunning(change.id) ||
         (_queues[change.id]?.isNotEmpty ?? false)) {
       throw StateError(
@@ -2121,6 +2819,7 @@ class ChatController extends ChangeNotifier {
       _checkpointIds.remove(change.id);
       _drafts.remove(change.id);
       if (conversation?.id == change.id) {
+        _previewTip = null;
         _thread = null;
         _draftScopeRevision++;
         _contextNotice = null;
@@ -2134,8 +2833,9 @@ class ChatController extends ChangeNotifier {
       return;
     }
     final json = change.json;
-    if (json == null)
+    if (json == null) {
       throw const FormatException('A synced chat has no content.');
+    }
     final backup = ChatBackup(_conversations);
     final inspection = backup.inspectJson(json);
     final createdProfiles = <String>[];
@@ -2196,25 +2896,31 @@ class ChatController extends ChangeNotifier {
       final protocol = ServerProtocol.values
           .where((p) => p.name == source.protocol)
           .firstOrNull;
-      if (protocol == null)
+      if (protocol == null) {
         throw const FormatException('Unsupported backup server protocol.');
+      }
       final url = _canonicalServerBaseUrl(protocol, source.baseUrl);
       final existing = profiles
           .where(
             (p) =>
+                p.id == source.id &&
                 p.protocol == protocol &&
+                p.compatibleApi.name == source.compatibleApi &&
                 _canonicalServerBaseUrl(p.protocol, p.baseUrl) == url,
           )
           .firstOrNull;
       if (existing != null) {
         mappings[source.id] = existing.id;
       } else {
-        final id = _idFactory();
+        final id = profiles.any((p) => p.id == source.id)
+            ? _idFactory()
+            : source.id;
         await _settingsStore.upsertProfile(
           ServerProfile(
             id: id,
             name: source.name,
             protocol: protocol,
+            compatibleApi: CompatibleApi.values.byName(source.compatibleApi),
             baseUrl: url,
           ),
         );
@@ -2276,6 +2982,7 @@ class ChatController extends ChangeNotifier {
       _chatFailures.remove(id);
       _checkpointIds.remove(id);
       if (_thread?.conversation.id == id) {
+        _previewTip = null;
         _thread = null;
         _draftScopeRevision += 1;
         await _restoreNewChatModel();
@@ -2310,6 +3017,7 @@ class ChatController extends ChangeNotifier {
       };
       await _draftWriteTail;
       await _conversations.deleteAllConversations();
+      _previewTip = null;
       _thread = null;
       _drafts.clear();
       _queues.clear();
@@ -2501,8 +3209,9 @@ class ChatController extends ChangeNotifier {
     if (_profileById(profileId) == null) return false;
     try {
       await _settingsStore.setDefaultModel(profileId, model);
-      if (profileId == activeProfileId && _thread == null && canChangeContext)
+      if (profileId == activeProfileId && _thread == null && canChangeContext) {
         await _restoreNewChatModel();
+      }
       _errorMessage = null;
       notifyListeners();
       return true;
@@ -2523,11 +3232,13 @@ class ChatController extends ChangeNotifier {
       updateConversationSettings(
         systemPrompt: systemPrompt,
         generationOptions: value,
+        explicitInstructions: false,
       );
 
   Future<bool> updateConversationSettings({
     required String systemPrompt,
     required GenerationOptions generationOptions,
+    bool explicitInstructions = true,
   }) async {
     final current = _thread?.conversation;
     final model = current?.selectedModel;
@@ -2544,7 +3255,7 @@ class ChatController extends ChangeNotifier {
     try {
       generationOptions.validate();
       if (current == null || model == null) {
-        _draft.systemPrompt = prompt;
+        if (explicitInstructions) _draft.systemPrompt = prompt;
         _draft.options = generationOptions;
         await flushDrafts();
         notifyListeners();
@@ -2557,16 +3268,11 @@ class ChatController extends ChangeNotifier {
         systemPrompt: prompt,
         generationOptions: generationOptions,
         now: updatedAt,
+        explicitInstructions: explicitInstructions,
       );
-      _thread = ConversationThread(
-        conversation: _copyConversation(
-          current,
-          selectedModel: model,
-          systemPrompt: prompt,
-          generationOptions: generationOptions,
-          updatedAt: updatedAt,
-        ),
-        messages: messages,
+      _thread = await _conversations.openConversation(
+        serverProfileId: current.serverProfileId,
+        id: current.id,
       );
       await _reloadHistory();
       _errorMessage = null;
@@ -2593,21 +3299,22 @@ class ChatController extends ChangeNotifier {
 
   Future<void> removeServerApiKey({String? profileId}) async {
     final profile = _profileById(profileId ?? activeProfileId);
-    if (_profileChangesBlocked ||
-        profile?.protocol != ServerProtocol.openAiCompatible) {
+    if (_profileChangesBlocked || profile == null) {
       return;
     }
-    final secret = _serverApiKeySecret(profile!.protocol, profile.baseUrl);
-    await _secrets.delete(secret);
+    final secret = ProfileCredentials.key(profile.id);
+    final options = await ProfileCredentials(_secrets).options(profile);
+    await ProfileCredentials(_secrets).write(
+      profile,
+      ConnectionOptions(
+        authentication: options.authentication,
+        apiVersion: options.apiVersion,
+        compatibleApi: options.compatibleApi,
+        customHeaders: options.customHeaders,
+      ),
+    );
     _storedServerApiKeySecrets.remove(secret);
-    if (_serverSecretForProfile(activeProfile) == secret) {
-      _serverApiKey = null;
-      _openAiCompatible = null;
-      _models = const [];
-      _selectedModel = null;
-      _selectedModelDetails = null;
-      _profileStatus[activeProfileId] = ConnectionStatus.saved;
-    }
+    _invalidateEndpoint(profile.id, preserveModels: true);
     notifyListeners();
   }
 
@@ -2649,8 +3356,13 @@ class ChatController extends ChangeNotifier {
 
   /// Local photo selection works offline; it is refused only when the
   /// selected model is known not to accept images.
-  Future<void> pickImage({bool camera = false}) async {
-    if (!canEditDraft || imagesSupported == false) return;
+  Future<void> pickImage({bool camera = false, List<int>? imageBytes}) async {
+    if (!canEditDraft) return;
+    if (imagesSupported == false) {
+      _errorMessage = 'This model cannot read images. Choose an image-capable model before attaching.';
+      notifyListeners();
+      return;
+    }
     if (_draft.images.length >= maxRequestImages) {
       _errorMessage = 'Attach up to eight images per message.';
       notifyListeners();
@@ -2663,7 +3375,19 @@ class ChatController extends ChangeNotifier {
       final draft = _draft;
       final key = draftKey;
       final id = conversation?.id ?? (draft.reservedId ??= _idFactory());
-      added = await _images.pickAndCopy(conversationId: id, camera: camera);
+      if (imageBytes != null &&
+          (imageBytes.isEmpty || imageBytes.length > maxImageBytes)) {
+        throw const ChatRequestLimitException(
+          'An image must be between 1 byte and 8 MB.',
+        );
+      }
+      added = imageBytes == null
+          ? await _images.pickAndCopy(conversationId: id, camera: camera)
+          : await _images.writeBytes(
+              conversationId: id,
+              bytes: imageBytes,
+              sourceName: 'Pasted image.png',
+            );
       if (added == null) return;
       if (draftKey != key) {
         await _images.deleteReference(added);
@@ -2695,6 +3419,257 @@ class ChatController extends ChangeNotifier {
       _conversationMutationBusy = false;
       notifyListeners();
     }
+  }
+
+  /// Transfers each item and its receipt together with the durable draft.
+  /// Failed items remain in App Group staging and can be retried independently.
+  String? sharedIntakeDraftScope(String intakeId) => _drafts.entries
+      .where((entry) => entry.value.intakeIds.contains(intakeId))
+      .firstOrNull
+      ?.key;
+
+  Future<void> discardSharedContent(ShareIntake intake) async {
+    final scope = sharedIntakeDraftScope(intake.id);
+    final draft = scope == null ? null : _drafts[scope];
+    final before = draft == null ? null : _ChatDraft.fromJson(draft.toJson());
+    draft?.intakeIds.remove(intake.id);
+    draft?.intakeItems.removeWhere((key, _) => key.startsWith('${intake.id}:'));
+    await flushDrafts();
+    if (_draftPersistenceError != null) {
+      if (scope != null && before != null) _drafts[scope] = before;
+      throw StateError(_draftPersistenceError!);
+    }
+    await intake.remove();
+    notifyListeners();
+  }
+
+  Future<List<String>> importSharedContent(
+    ShareIntake intake, {
+    required bool newDraft,
+  }) async {
+    if (!canEditDraft || !isConfigured) {
+      return [
+        'Connect a server before importing. Your shared content is saved.',
+      ];
+    }
+    final previousScope = sharedIntakeDraftScope(intake.id);
+    if (previousScope != null && previousScope != draftKey) {
+      if (previousScope.startsWith('new:')) {
+        await newConversationOnServer(previousScope.substring(4));
+      } else {
+        await openConversation(previousScope);
+      }
+      if (draftKey != previousScope) {
+        return ['Open the original shared draft before retrying this import.'];
+      }
+    }
+    final errors = <String>[];
+    _conversationMutationBusy = true;
+    notifyListeners();
+    try {
+      final remaining = <int>[];
+      for (var i = 0; i < intake.items.length; i++) {
+        final receipt = '${intake.id}:$i';
+        if (!_pendingIntakeReceipts.contains(receipt) &&
+            !await _conversations.hasIntakeReceipt(receipt)) {
+          remaining.add(i);
+        }
+      }
+      if (remaining.isEmpty && previousScope == null) {
+        await intake.remove();
+        return errors;
+      }
+      if (remaining.isNotEmpty && newDraft && previousScope == null) {
+        final id = _idFactory();
+        final defaults = _settingsStore.chatDefaults;
+        final chat = await _conversations.createConversation(
+          id: id,
+          serverProfileId: activeProfileId,
+          selectedModel: _selectedModel ?? '',
+          systemPrompt: defaults.systemPrompt,
+          generationOptions: defaults.generationOptions,
+        );
+        _historyCursor = null;
+        _presentationLimit = 50;
+        _thread = ConversationThread(conversation: chat, messages: const []);
+        _draftScopeRevision++;
+      }
+      final draft = _draft;
+      final owner = conversation?.id ?? (draft.reservedId ??= _idFactory());
+      draft.intakeIds.add(intake.id);
+      // Commit the destination before preparing files. A restarted import
+      // always resumes in the same draft, even before its first item commits.
+      await flushDrafts();
+      if (_draftPersistenceError != null) return [_draftPersistenceError!];
+      final before = _ChatDraft.fromJson(draft.toJson());
+      final prepared = <String>[];
+      final receipts = <String>{};
+      for (final i in remaining) {
+        final item = intake.items[i];
+        final receipt = '${intake.id}:$i';
+        final following = <Map<String, String>>[
+          for (var next = i + 1; next < intake.items.length; next++)
+            if (draft.intakeItems['${intake.id}:$next'] case final value?)
+              if (value['kind'] == item.kind) value,
+        ];
+        String? copied;
+        try {
+          if (item.error != null) throw FormatException(item.error!);
+          switch (item.kind) {
+            case 'text':
+              var insertion = draft.text.length;
+              for (final placement in following) {
+                final anchor = placement['text']!;
+                final at = draft.text.indexOf(anchor);
+                if (at < 0) continue;
+                if (at != draft.text.lastIndexOf(anchor)) {
+                  throw const FormatException(
+                    'The shared text was edited. Add this remaining text manually, then discard it from Shared content.',
+                  );
+                }
+                insertion = at;
+                break;
+              }
+              final text = insertion == draft.text.length
+                  ? [
+                      if (draft.text.isNotEmpty) draft.text,
+                      item.text ?? '',
+                    ].join('\n\n')
+                  : draft.text.replaceRange(
+                      insertion,
+                      insertion,
+                      '${item.text ?? ''}\n\n',
+                    );
+              if (utf8.encode(text).length > maxMessageTextBytes) {
+                throw const FormatException('The draft would exceed 64 KB.');
+              }
+              draft.text = text;
+              draft.intakeItems[receipt] = {
+                'kind': item.kind,
+                'text': item.text ?? '',
+              };
+            case 'image':
+              if (imagesSupported == false) {
+                throw const FormatException(
+                  'Choose an image-capable model to import this image.',
+                );
+              }
+              if (draft.images.length >= maxRequestImages) {
+                throw const FormatException(
+                  'A draft can contain at most eight images.',
+                );
+              }
+              final bytes = await item.readBytes();
+              var size = bytes.length;
+              for (final reference in draft.images) {
+                size += await _images.sizeInBytes(reference);
+              }
+              if (bytes.isEmpty ||
+                  bytes.length > maxImageBytes ||
+                  size > maxRequestImageBytes) {
+                throw const FormatException(
+                  'Images can be at most 8 MB each and 24 MB in total.',
+                );
+              }
+              copied = await _images.writeBytes(
+                conversationId: owner,
+                bytes: bytes,
+                sourceName: item.file ?? 'Shared image.png',
+                storageId:
+                    'intake-${sha256.convert(utf8.encode('${intake.id}:$i'))}',
+              );
+              prepared.add(copied);
+              final next = following
+                  .map((p) => draft.images.indexOf(p['reference']!))
+                  .where((index) => index >= 0)
+                  .firstOrNull;
+              draft.images = List.of(draft.images)
+                ..insert(next ?? draft.images.length, copied);
+              draft.intakeItems[receipt] = {
+                'kind': item.kind,
+                'reference': copied,
+              };
+              copied = null;
+            case 'document':
+              if (draft.documents.length >= DocumentAttachment.maxPerMessage) {
+                throw const FormatException(
+                  'A draft can contain at most four documents.',
+                );
+              }
+              final document = await _documentReader.extract(
+                bytes: await item.readBytes(),
+                name: item.name,
+              );
+              copied = await _images.writeBytes(
+                conversationId: owner,
+                bytes: document.bytes,
+                sourceName: document.name,
+                storageId:
+                    'intake-${sha256.convert(utf8.encode('${intake.id}:$i'))}',
+              );
+              prepared.add(copied);
+              final next = following
+                  .map(
+                    (p) => draft.documents.indexWhere(
+                      (d) => d.reference == p['reference'],
+                    ),
+                  )
+                  .where((index) => index >= 0)
+                  .firstOrNull;
+              draft.documents = List.of(draft.documents)
+                ..insert(
+                  next ?? draft.documents.length,
+                  DocumentAttachment(
+                    id: _idFactory(),
+                    name: document.name,
+                    mimeType: document.mimeType,
+                    reference: copied,
+                    text: document.text,
+                  ),
+                );
+              draft.intakeItems[receipt] = {
+                'kind': item.kind,
+                'reference': copied,
+              };
+              copied = null;
+            default:
+              throw const FormatException('Unsupported shared content.');
+          }
+          receipts.add(receipt);
+          _pendingIntakeReceipts.add(receipt);
+        } on Object catch (error) {
+          if (copied != null) await _images.deleteReference(copied);
+          errors.add('${item.name}: ${_friendlyError(error)}');
+        }
+      }
+      // Finalize the association in the same transaction as content/receipts;
+      // remove native staging only after that transaction succeeds.
+      if (errors.isEmpty) {
+        draft.intakeIds.remove(intake.id);
+        draft.intakeItems.removeWhere(
+          (key, _) => key.startsWith('${intake.id}:'),
+        );
+      }
+      await flushDrafts();
+      if (_draftPersistenceError != null) {
+        errors.add(_draftPersistenceError!);
+        _drafts[draftKey] = before;
+        _pendingIntakeReceipts.removeAll(receipts);
+        for (final reference in prepared) {
+          await _images.deleteReference(reference);
+        }
+      } else if (errors.isEmpty) {
+        await intake.remove();
+      }
+      _draftScopeRevision++;
+      await _reloadHistory();
+    } on Object catch (error) {
+      errors.add(_friendlyError(error));
+    } finally {
+      _conversationMutationBusy = false;
+      notifyListeners();
+    }
+    return errors;
   }
 
   Future<void> pickDocument() async {
@@ -2791,8 +3766,9 @@ class ChatController extends ChangeNotifier {
     if ((text.isEmpty &&
             submittedDraft.images.isEmpty &&
             submittedDraft.documents.isEmpty) ||
-        !canQueueOrSend)
+        !canQueueOrSend) {
       return false;
+    }
     if (utf8.encode(text).length > maxMessageTextBytes) {
       _errorMessage = 'A message can be at most 64 KB.';
       notifyListeners();
@@ -2828,12 +3804,16 @@ class ChatController extends ChangeNotifier {
         id: _idFactory(),
         conversationId: id,
         text: text,
+        parentId: submittedDraft.parentTip,
+        tracksParent: submittedDraft.tracksParent,
         imageReferences: List.of(submittedDraft.images),
         documents: List.of(submittedDraft.documents),
         createdAt: DateTime.now().toUtc(),
       );
       await _conversations.enqueuePrompt(prompt);
       acceptedConversation = id;
+      submittedDraft.tracksParent = false;
+      submittedDraft.parentTip = null;
       submittedDraft.images = [];
       submittedDraft.documents = [];
       if (submittedDraft.text.trim() == text) submittedDraft.text = '';
@@ -2841,6 +3821,7 @@ class ChatController extends ChangeNotifier {
       await _reloadQueues();
       await _reloadHistory();
     } on Object catch (error) {
+      if (error is DraftBranchChanged) _draftMismatchedScope = draftKey;
       _errorMessage =
           'The message could not be queued: ${_friendlyError(error)}';
     } finally {
@@ -2884,8 +3865,9 @@ class ChatController extends ChangeNotifier {
   }) async {
     if (_shutdownFuture != null ||
         isConversationRunning(id) ||
-        _queuePausedIds.contains(id))
+        _queuePausedIds.contains(id)) {
       return;
+    }
     _queueStartingIds.add(id);
     notifyListeners();
     QueuedPromptClaim? claim;
@@ -2918,8 +3900,9 @@ class ChatController extends ChangeNotifier {
         serverProfileId: configuration.profile.id,
         id: id,
       );
-      if (thread == null)
+      if (thread == null) {
         throw StateError('The queued conversation is unavailable.');
+      }
       await _reloadHistory();
       if (_queuePausedIds.contains(id) || _shutdownFuture != null) {
         await _conversations.restoreQueuedPrompt(claim);
@@ -3050,6 +4033,11 @@ class ChatController extends ChangeNotifier {
         messages[index].status == MessageStatus.complete) {
       return;
     }
+    if (_conversations.graphEnabled) {
+      if (viewingAlternative) return;
+      await _createAnswerVersion(messages[index]);
+      return;
+    }
     _isSubmitting = true;
     final submission = Completer<void>();
     _submissionCompleter = submission;
@@ -3103,6 +4091,50 @@ class ChatController extends ChangeNotifier {
     }
   }
 
+  Future<bool> _createAnswerVersion(
+    Message target, {
+    String? editedText,
+  }) async {
+    _isSubmitting = true;
+    final submission = Completer<void>();
+    _submissionCompleter = submission;
+    notifyListeners();
+    try {
+      final answer = await _conversations.createAlternative(
+        targetId: target.id,
+        assistantId: _idFactory(),
+        editedText: editedText,
+        editedId: editedText == null ? null : _idFactory(),
+      );
+      if (!hasDraft) {
+        _draft.parentTip = null;
+        _draft.tracksParent = false;
+        _draftMismatchedScope = null;
+        await flushDrafts();
+      }
+      _versionCache.clear();
+      _thread = await _conversations.openConversation(
+        serverProfileId: conversation!.serverProfileId,
+        id: target.conversationId,
+      );
+      await _reloadHistory();
+      notifyListeners();
+      await _startAssistantResponse(persistedAssistant: answer);
+      return true;
+    } on Object catch (error) {
+      _errorMessage =
+          'The new version could not be started: ${_friendlyError(error)}';
+      return false;
+    } finally {
+      _isSubmitting = false;
+      if (!submission.isCompleted) submission.complete();
+      if (identical(_submissionCompleter, submission)) {
+        _submissionCompleter = null;
+      }
+      notifyListeners();
+    }
+  }
+
   Future<bool> editAndResend(String id, String text) =>
       _reviseConversation(id, editedText: text.trim());
 
@@ -3115,8 +4147,9 @@ class ChatController extends ChangeNotifier {
     final target = messages[index];
     final editing = editedText != null;
     if ((editing && target.role != MessageRole.user) ||
-        (!editing && target.role != MessageRole.assistant))
+        (!editing && target.role != MessageRole.assistant)) {
       return false;
+    }
     if (editing &&
         ((editedText.isEmpty &&
                 target.imageReferences.isEmpty &&
@@ -3126,6 +4159,9 @@ class ChatController extends ChangeNotifier {
           'Enter a message or keep an attachment, up to 64 KB of text.';
       notifyListeners();
       return false;
+    }
+    if (_conversations.graphEnabled) {
+      return _createAnswerVersion(target, editedText: editedText);
     }
     final current = conversation!;
     final preserve = messages
@@ -3171,8 +4207,9 @@ class ChatController extends ChangeNotifier {
     } finally {
       _isSubmitting = false;
       if (!submission.isCompleted) submission.complete();
-      if (identical(_submissionCompleter, submission))
+      if (identical(_submissionCompleter, submission)) {
         _submissionCompleter = null;
+      }
       notifyListeners();
     }
     return saved;
@@ -3291,6 +4328,14 @@ class ChatController extends ChangeNotifier {
   }) async {
     var thread = sourceThread ?? _thread;
     if (thread == null) return;
+    if (sourceThread == null) {
+      thread = await _conversations.openConversation(
+        serverProfileId: thread.conversation.serverProfileId,
+        id: thread.conversation.id,
+      );
+      if (thread == null) return;
+    }
+    _historyCursor = null;
     final config = configuration ?? _captureRunConfiguration();
     if (config.ollama == null && config.compatible == null) return;
     final assistant =
@@ -3390,6 +4435,9 @@ class ChatController extends ChangeNotifier {
       options: run.thread.conversation.generationOptions.toOllamaJson(),
     );
     final chat = switch (config.profile.protocol) {
+      ServerProtocol.openWebUi => throw StateError(
+        'Shared chats require the server run owner.',
+      ),
       ServerProtocol.ollama => config.ollama!.startChat(request),
       ServerProtocol.openAiCompatible => config.compatible!.startChat(request),
     };
@@ -3443,8 +4491,9 @@ class ChatController extends ChangeNotifier {
             client: config.compatible!,
             apiKey: key,
           );
-    if (agent == null)
+    if (agent == null) {
       throw StateError('Web Agent transport is not configured.');
+    }
     final run = agent.run(
       model: active.thread.conversation.selectedModel,
       messages: context,
@@ -3580,12 +4629,47 @@ class ChatController extends ChangeNotifier {
         }
       }
       return message.copyWith(
-        content: message.content + chunk.message.content,
+        content:
+            chunk.authoritativeContent ??
+            message.content + chunk.message.content,
+        providerTranscriptJson: _providerTranscript(message, chunk),
         reasoning: '${message.reasoning ?? ''}${chunk.message.thinking}',
         toolCalls: calls,
         toolResults: results,
       );
     });
+  }
+
+  String? _providerTranscript(Message message, OllamaChatChunk chunk) {
+    if (chunk.message.providerItems.isEmpty &&
+        chunk.message.sources.isEmpty &&
+        message.providerTranscriptJson == null) {
+      return null;
+    }
+    final previous = message.providerTranscriptJson == null
+        ? <dynamic>[]
+        : jsonDecode(message.providerTranscriptJson!) as List;
+    final items = chunk.message.providerItems.isNotEmpty
+        ? chunk.message.providerItems
+        : previous.isEmpty
+        ? <Map<String, dynamic>>[]
+        : (previous.last['provider_items'] as List? ?? const [])
+              .map((item) => Map<String, dynamic>.from(item as Map))
+              .toList();
+    final sources = {
+      for (final source in message.sources) source.id: source,
+      for (final source in chunk.message.sources) source.id: source,
+    };
+    return jsonEncode([
+      OllamaChatMessage(
+        role: OllamaRole.assistant,
+        content:
+            chunk.authoritativeContent ??
+            message.content + chunk.message.content,
+        providerItems: items,
+        sources: sources.values.toList(),
+      ).toJson(),
+    ]);
   }
 
   void _applyWebToolEvent(_ChatRun run, WebAgentToolActivity event) {
@@ -3706,6 +4790,9 @@ class ChatController extends ChangeNotifier {
           turnRequestCount += restored.length;
           for (final item in restored) {
             pieces.addAll([item.content, item.thinking]);
+            if (item.providerItems.isNotEmpty) {
+              pieces.add(jsonEncode(item.providerItems));
+            }
             for (final call in item.toolCalls) {
               pieces.addAll([call.name, jsonEncode(call.arguments)]);
             }
@@ -3809,15 +4896,22 @@ class ChatController extends ChangeNotifier {
       }
     }
 
-    if (repairedMessages.isNotEmpty) {
+    if (repairedMessages.isNotEmpty && !_conversations.graphEnabled) {
       for (final repaired in repairedMessages.values) {
-        await _conversations.updateMessage(repaired);
+        if (!_conversations.graphEnabled) {
+          await _conversations.updateMessage(repaired);
+        }
       }
       _replaceRunMessages(run, <Message>[
         for (final message in run.thread.messages)
           repairedMessages[message.id] ?? message,
       ]);
       notifyListeners();
+    }
+    if (recoveredLostImage && _conversations.graphEnabled) {
+      throw const ChatRequestLimitException(
+        'An original image is unavailable on this device. Start a new chat and attach it again. The retained conversation has not been changed.',
+      );
     }
     if (recoveredLostImage) {
       throw const ChatRequestLimitException(
@@ -4036,6 +5130,22 @@ class ChatController extends ChangeNotifier {
       serverProfileId: activeProfileId,
       selectedModel: model,
       systemPrompt: systemPrompt,
+      folderId: _draft.folderId,
+      instructionSource: _draft.systemPrompt != null
+          ? 'explicit'
+          : (currentFolder?.instructions.isNotEmpty ?? false)
+          ? 'folderSnapshot'
+          : 'profileSnapshot',
+      instructionSourceId: _draft.systemPrompt != null
+          ? null
+          : (currentFolder?.instructions.isNotEmpty ?? false)
+          ? currentFolder!.id
+          : activeProfileId,
+      instructionSourceRevision: _draft.systemPrompt != null
+          ? null
+          : (currentFolder?.instructions.isNotEmpty ?? false)
+          ? currentFolder!.revision
+          : null,
       generationOptions: draft.options ?? chatDefaults.generationOptions,
     );
     _drafts.remove(oldKey);
@@ -4045,6 +5155,8 @@ class ChatController extends ChangeNotifier {
       _draftScopeRevision += 1;
       _contextNotice = null;
     }
+    _historyCursor = null;
+    _presentationLimit = 50;
     _thread = ConversationThread(
       conversation: conversation,
       messages: const [],
@@ -4059,42 +5171,35 @@ class ChatController extends ChangeNotifier {
     String? profileId,
     bool advanceDraftScope = false,
   }) async {
+    _previewTip = null;
     final live = _runs[id];
     if (live != null) {
+      _historyCursor = null;
+      _presentationLimit = 50;
       _thread = live.thread;
       if (advanceDraftScope) _draftScopeRevision += 1;
       notifyListeners();
       return;
     }
-    var thread = await _conversations.openConversation(
+    await _conversations.interruptUnfinishedMessages(id);
+    final window = await _conversations.openWindow(
       serverProfileId: profileId ?? activeProfileId,
       id: id,
     );
-    if (thread == null) return;
-    final normalized = <Message>[];
-    for (final message in thread.messages) {
-      if (message.status == MessageStatus.streaming ||
-          message.status == MessageStatus.queued) {
-        final interrupted = message.copyWith(
-          status: MessageStatus.interrupted,
-          updatedAt: DateTime.now().toUtc(),
-        );
-        await _conversations.updateMessage(interrupted);
-        normalized.add(interrupted);
-      } else {
-        normalized.add(message);
-      }
-    }
-    thread = ConversationThread(
-      conversation: thread.conversation,
-      messages: List.unmodifiable(normalized),
-    );
+    if (window == null) return;
+    final thread = window.thread;
+    _historyCursor = window.previousCursor;
+    _presentationLimit = 50;
     if (advanceDraftScope) _draftScopeRevision += 1;
     _thread = thread;
     notifyListeners();
   }
 
   Future<void> _reloadHistory() async {
+    _versionCache.clear();
+    if (_conversations.graphEnabled) {
+      _folders = List.unmodifiable(await _conversations.folders());
+    }
     _history = List.unmodifiable(await _conversations.listAllConversations());
     _syncRevision++;
   }
@@ -4123,8 +5228,9 @@ class ChatController extends ChangeNotifier {
                 (document) => document.reference == reference,
               ),
         ) ||
-        await _conversations.isAttachmentReferenceInUse(reference))
+        await _conversations.isAttachmentReferenceInUse(reference)) {
       return;
+    }
     try {
       await _images.deleteReference(reference);
     } on Object catch (error) {
@@ -4158,11 +5264,16 @@ class ChatController extends ChangeNotifier {
       status: _transcriptStatus(message.status),
       canRetry: canRetry,
       canEdit: message.role == MessageRole.user,
-      editRemovesLaterMessages: message.position < messages.last.position,
+      editRemovesLaterMessages:
+          !_conversations.graphEnabled &&
+          message.position < messages.last.position,
       canRegenerate: message.role == MessageRole.assistant,
-      regenerateRemovesLaterMessages: message.position < messages.last.position,
+      regenerateRemovesLaterMessages:
+          !_conversations.graphEnabled &&
+          message.position < messages.last.position,
       content: message.content,
       thinking: message.reasoning,
+      sources: message.sources,
       imageReferences: message.imageReferences,
       documents: message.documents,
       toolCalls: [
@@ -4227,6 +5338,11 @@ class ChatController extends ChangeNotifier {
     id: source.id,
     serverProfileId: source.serverProfileId,
     title: title ?? source.title,
+    activeTipId: source.activeTipId,
+    folderId: source.folderId,
+    instructionSource: source.instructionSource,
+    instructionSourceId: source.instructionSourceId,
+    instructionSourceRevision: source.instructionSourceRevision,
     isPinned: source.isPinned,
     isArchived: source.isArchived,
     isRenamed: source.isRenamed,
@@ -4411,5 +5527,37 @@ class ChatController extends ChangeNotifier {
     _chatSync?.removeListener(notifyListeners);
     _chatSync?.dispose();
     super.dispose();
+  }
+}
+
+final class _TemporaryPreferences implements PreferencesDriver {
+  final _values = <String, Object>{};
+  @override
+  String? getString(String key) => _values[key] as String?;
+  @override
+  bool? getBool(String key) => _values[key] as bool?;
+  @override
+  Future<void> setString(String key, String value) async {
+    _values[key] = value;
+  }
+
+  @override
+  Future<void> setBool(String key, bool value) async {
+    _values[key] = value;
+  }
+}
+
+final class _TemporarySecrets implements SecretStore {
+  final _values = <String, String>{};
+  @override
+  Future<String?> read(String key) async => _values[key];
+  @override
+  Future<void> write(String key, String value) async {
+    _values[key] = value;
+  }
+
+  @override
+  Future<void> delete(String key) async {
+    _values.remove(key);
   }
 }

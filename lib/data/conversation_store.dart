@@ -1,12 +1,20 @@
 import 'dart:convert';
 
+import 'package:uuid/uuid.dart';
+
+import '../domain/chat_folder.dart';
+import '../domain/message_graph.dart';
+
 import 'attachment_reference_codec.dart';
+import '../open_webui/store.dart';
 import '../domain/conversation.dart';
 import '../domain/document_attachment.dart';
 import '../domain/generation_options.dart';
 import '../domain/message.dart';
 import '../domain/queued_prompt.dart';
 import '../domain/tool_call.dart';
+
+part 'conversation_graph.dart';
 
 abstract interface class SqliteDatabase {
   Future<void> execute(String sql, [List<Object?> parameters = const []]);
@@ -20,9 +28,29 @@ abstract interface class SqliteDatabase {
 }
 
 final class ConversationSearchResult {
-  const ConversationSearchResult(this.conversation, this.excerpt);
+  const ConversationSearchResult(
+    this.conversation,
+    this.excerpt, {
+    this.messageId,
+  });
   final Conversation conversation;
   final String? excerpt;
+  final String? messageId;
+}
+
+final class ConversationWindow {
+  const ConversationWindow(this.thread, this.previousCursor);
+  final ConversationThread thread;
+  final String? previousCursor;
+}
+
+final class ConversationCursorChanged implements Exception {}
+
+final class DraftBranchChanged implements Exception {
+  const DraftBranchChanged();
+  @override
+  String toString() =>
+      'This draft was written for a different answer version. Choose where to continue before sending.';
 }
 
 class ConversationStore {
@@ -32,7 +60,10 @@ class ConversationStore {
         const IdentityAttachmentReferenceCodec(),
   }) : _referenceCodec = referenceCodec;
 
-  static const schemaVersion = 9;
+  static const schemaVersion = 13;
+  bool _graphEnabled = false;
+  bool get graphEnabled => _graphEnabled;
+  WebUiStore get webUi => WebUiStore(_database);
   final SqliteDatabase _database;
   final AttachmentReferenceCodec _referenceCodec;
 
@@ -49,6 +80,7 @@ class ConversationStore {
       );
     }
 
+    _graphEnabled = fromVersion >= 13;
     await _database.execute('PRAGMA foreign_keys = ON');
     if (fromVersion == toVersion) return;
     final legacyProfileId = legacyServerProfileId.trim();
@@ -60,63 +92,66 @@ class ConversationStore {
       );
     }
 
-    await _database.transaction((database) async {
-      if (fromVersion < 1 && toVersion >= 1) {
-        for (final statement in _schemaVersionOne) {
-          await database.execute(statement);
+    final graphMigration = fromVersion < 13 && toVersion >= 13;
+    if (graphMigration) await _database.execute('PRAGMA foreign_keys = OFF');
+    try {
+      await _database.transaction((database) async {
+        if (fromVersion < 1 && toVersion >= 1) {
+          for (final statement in _schemaVersionOne) {
+            await database.execute(statement);
+          }
+          await database.execute('PRAGMA user_version = 1');
         }
-        await database.execute('PRAGMA user_version = 1');
-      }
-      if (fromVersion < 2 && toVersion >= 2) {
-        await database.execute('''ALTER TABLE conversations
+        if (fromVersion < 2 && toVersion >= 2) {
+          await database.execute('''ALTER TABLE conversations
              ADD COLUMN generation_options_json TEXT NOT NULL DEFAULT '{}' ''');
-        await database.execute('PRAGMA user_version = 2');
-      }
-      if (fromVersion < 3 && toVersion >= 3) {
-        await database.execute('''ALTER TABLE conversations
+          await database.execute('PRAGMA user_version = 2');
+        }
+        if (fromVersion < 3 && toVersion >= 3) {
+          await database.execute('''ALTER TABLE conversations
              ADD COLUMN server_profile_id TEXT NOT NULL DEFAULT '' ''');
-        await database.execute(
-          '''UPDATE conversations SET server_profile_id = ?
+          await database.execute(
+            '''UPDATE conversations SET server_profile_id = ?
              WHERE server_profile_id = '' ''',
-          <Object?>[legacyProfileId],
-        );
-        await database.execute('''CREATE INDEX conversations_by_server_profile
+            <Object?>[legacyProfileId],
+          );
+          await database.execute('''CREATE INDEX conversations_by_server_profile
              ON conversations(
                server_profile_id, updated_at DESC, created_at DESC, id ASC
              )''');
-        await database.execute('''ALTER TABLE messages
+          await database.execute('''ALTER TABLE messages
              ADD COLUMN provider_transcript_json TEXT''');
-        await database.execute('PRAGMA user_version = 3');
-      }
-      if (fromVersion < 4 && toVersion >= 4) {
-        for (final field in ['is_pinned', 'is_archived', 'is_renamed']) {
-          await database.execute(
-            'ALTER TABLE conversations ADD COLUMN $field '
-            'INTEGER NOT NULL DEFAULT 0 CHECK($field IN (0, 1))',
-          );
+          await database.execute('PRAGMA user_version = 3');
         }
-        await database.execute('PRAGMA user_version = 4');
-      }
-      if (fromVersion < 5 && toVersion >= 5) {
-        await database.execute('''CREATE TABLE chat_drafts(
+        if (fromVersion < 4 && toVersion >= 4) {
+          for (final field in ['is_pinned', 'is_archived', 'is_renamed']) {
+            await database.execute(
+              'ALTER TABLE conversations ADD COLUMN $field '
+              'INTEGER NOT NULL DEFAULT 0 CHECK($field IN (0, 1))',
+            );
+          }
+          await database.execute('PRAGMA user_version = 4');
+        }
+        if (fromVersion < 5 && toVersion >= 5) {
+          await database.execute('''CREATE TABLE chat_drafts(
              scope TEXT PRIMARY KEY,
              data_json TEXT NOT NULL
            )''');
-        await database.execute('PRAGMA user_version = 5');
-      }
-      if (fromVersion < 6 && toVersion >= 6) {
-        await database.execute('''ALTER TABLE messages
+          await database.execute('PRAGMA user_version = 5');
+        }
+        if (fromVersion < 6 && toVersion >= 6) {
+          await database.execute('''ALTER TABLE messages
              ADD COLUMN documents_json TEXT NOT NULL DEFAULT '[]' ''');
-        await database.execute('PRAGMA user_version = 6');
-      }
-      if (fromVersion < 7 && toVersion >= 7) {
-        await database.execute('''CREATE TABLE sync_receipts(
+          await database.execute('PRAGMA user_version = 6');
+        }
+        if (fromVersion < 7 && toVersion >= 7) {
+          await database.execute('''CREATE TABLE sync_receipts(
              token TEXT PRIMARY KEY
            )''');
-        await database.execute('PRAGMA user_version = 7');
-      }
-      if (fromVersion < 8 && toVersion >= 8) {
-        await database.execute('''CREATE TABLE queued_prompts(
+          await database.execute('PRAGMA user_version = 7');
+        }
+        if (fromVersion < 8 && toVersion >= 8) {
+          await database.execute('''CREATE TABLE queued_prompts(
              id TEXT PRIMARY KEY,
              conversation_id TEXT NOT NULL
                REFERENCES conversations(id) ON DELETE CASCADE,
@@ -127,24 +162,46 @@ class ConversationStore {
              created_at INTEGER NOT NULL,
              UNIQUE(conversation_id, position)
            )''');
-        await database.execute('''CREATE INDEX queued_prompts_in_conversation
+          await database.execute('''CREATE INDEX queued_prompts_in_conversation
              ON queued_prompts(
                conversation_id, position ASC, created_at ASC, id ASC
              )''');
-        await database.execute('PRAGMA user_version = 8');
-      }
-      if (fromVersion < 9 && toVersion >= 9) {
-        // One local-only recovery snapshot per chat for the latest revision.
-        await database.execute('''CREATE TABLE recovery_checkpoints(
+          await database.execute('PRAGMA user_version = 8');
+        }
+        if (fromVersion < 9 && toVersion >= 9) {
+          // One local-only recovery snapshot per chat for the latest revision.
+          await database.execute('''CREATE TABLE recovery_checkpoints(
              conversation_id TEXT PRIMARY KEY
                REFERENCES conversations(id) ON DELETE CASCADE,
              from_position INTEGER NOT NULL CHECK(from_position >= 0),
              messages_json TEXT NOT NULL,
              created_at INTEGER NOT NULL
            )''');
-        await database.execute('PRAGMA user_version = 9');
-      }
-    });
+          await database.execute('PRAGMA user_version = 9');
+        }
+        if (fromVersion < 10 && toVersion >= 10) {
+          await database.execute(
+            'CREATE TABLE intake_receipts(item_id TEXT PRIMARY KEY)',
+          );
+          await database.execute('PRAGMA user_version = 10');
+        }
+        if (fromVersion < 11 && toVersion >= 11) {
+          await WebUiStore.migrate(database);
+          await database.execute('PRAGMA user_version = 11');
+        }
+        if (fromVersion < 12 && toVersion >= 12) {
+          await WebUiStore.migrateBindings(database);
+          await database.execute('PRAGMA user_version = 12');
+        }
+        if (graphMigration) {
+          await _migrateGraph(database);
+          await database.execute('PRAGMA user_version = 13');
+        }
+      });
+      _graphEnabled = toVersion >= 13;
+    } finally {
+      if (graphMigration) await _database.execute('PRAGMA foreign_keys = ON');
+    }
   }
 
   Future<Conversation> createConversation({
@@ -154,6 +211,10 @@ class ConversationStore {
     required String systemPrompt,
     GenerationOptions generationOptions = const GenerationOptions(),
     DateTime? now,
+    String? folderId,
+    String instructionSource = 'profileSnapshot',
+    String? instructionSourceId,
+    int? instructionSourceRevision,
   }) async {
     final profileId = serverProfileId.trim();
     if (profileId.isEmpty) {
@@ -168,34 +229,61 @@ class ConversationStore {
       id: id,
       serverProfileId: profileId,
       title: 'New chat',
+      folderId: folderId,
+      instructionSource: instructionSource,
+      instructionSourceId: instructionSourceId,
+      instructionSourceRevision: instructionSourceRevision,
       selectedModel: selectedModel,
       systemPrompt: systemPrompt,
       generationOptions: generationOptions,
       createdAt: timestamp,
       updatedAt: timestamp,
     );
-    await _database.execute(
-      '''INSERT INTO conversations(
+    await _database.transaction((database) async {
+      await database.execute(
+        '''INSERT INTO conversations(
            id, server_profile_id, title, title_from_first_user, selected_model,
            system_prompt, generation_options_json, created_at, updated_at
          ) VALUES(?, ?, ?, 0, ?, ?, ?, ?, ?)''',
-      <Object?>[
-        conversation.id,
-        conversation.serverProfileId,
-        conversation.title,
-        conversation.selectedModel,
-        conversation.systemPrompt,
-        jsonEncode(conversation.generationOptions.toOllamaJson()),
-        _toEpoch(conversation.createdAt),
-        _toEpoch(conversation.updatedAt),
-      ],
-    );
+        <Object?>[
+          conversation.id,
+          conversation.serverProfileId,
+          conversation.title,
+          conversation.selectedModel,
+          conversation.systemPrompt,
+          jsonEncode(conversation.generationOptions.toOllamaJson()),
+          _toEpoch(conversation.createdAt),
+          _toEpoch(conversation.updatedAt),
+        ],
+      );
+      if (_graphEnabled) {
+        if (folderId != null &&
+            (await database.query(
+              'SELECT id FROM folders WHERE id=? AND deleted=0',
+              [folderId],
+            )).isEmpty) {
+          throw const FormatException('This folder no longer exists.');
+        }
+        await database.execute(
+          'UPDATE conversations SET folder_id=?,instruction_source=?,instruction_source_id=?,instruction_source_revision=? WHERE id=?',
+          [
+            folderId,
+            instructionSource,
+            instructionSourceId,
+            instructionSourceRevision,
+            id,
+          ],
+        );
+      }
+    });
     return conversation;
   }
 
   Future<ConversationThread?> openConversation({
     required String serverProfileId,
     required String id,
+    bool allBranches = false,
+    String? tipId,
   }) async {
     final rows = await _database.query(
       '''SELECT * FROM conversations
@@ -204,21 +292,160 @@ class ConversationStore {
     );
     if (rows.isEmpty) return null;
 
-    final messageRows = await _database.query(
-      '''SELECT * FROM messages
-         WHERE conversation_id = ?
-         ORDER BY position ASC, created_at ASC, id ASC''',
-      <Object?>[id],
-    );
-    final messages = <Message>[];
-    for (final row in messageRows) {
-      messages.add(await _messageFromRow(row));
-    }
-
+    final tip = tipId ?? rows.single['active_tip_id'] as String?;
+    final messageRows = _graphEnabled && !allBranches
+        ? await _branchRows(_database, id, tip)
+        : await _database.query(
+            'SELECT * FROM messages WHERE conversation_id=? ORDER BY position,${_graphEnabled ? 'sibling_order,' : ''}created_at,id',
+            [id],
+          );
+    final nodes = await _messagesFromRows(_database, messageRows);
     return ConversationThread(
       conversation: _conversationFromRow(rows.single),
-      messages: List<Message>.unmodifiable(messages),
+      messages: List.unmodifiable(
+        _graphEnabled && allBranches ? MessageGraph(nodes).branch(tip) : nodes,
+      ),
+      nodes: allBranches ? List.unmodifiable(nodes) : null,
     );
+  }
+
+  /// Keyset pagination: the external cursor contains identities, never a
+  /// linear position. The selected tip fences it against a branch change.
+  Future<ConversationWindow?> openWindow({
+    required String serverProfileId,
+    required String id,
+    String? before,
+    int limit = 50,
+  }) => _database.transaction((database) async {
+    if (limit < 1 || limit > 100) throw ArgumentError.value(limit, 'limit');
+    final chats = await database.query(
+      'SELECT * FROM conversations WHERE id = ? AND server_profile_id = ?',
+      [id, serverProfileId],
+    );
+    if (chats.isEmpty) return null;
+    if (_graphEnabled) {
+      final tip = chats.single['active_tip_id'] as String?;
+      String? anchor;
+      if (before != null) {
+        final cursor = jsonDecode(utf8.decode(base64Url.decode(before))) as Map;
+        if (cursor['chat'] != id || cursor['tip'] != tip) {
+          throw ConversationCursorChanged();
+        }
+        anchor = cursor['anchor'] as String;
+      }
+      final rows = await _branchRows(
+        database,
+        id,
+        tip,
+        before: anchor,
+        limit: limit + 1,
+      );
+      final more = rows.length > limit;
+      final selected = rows.take(limit).toList().reversed.toList();
+      return ConversationWindow(
+        ConversationThread(
+          conversation: _conversationFromRow(chats.single),
+          messages: await _messagesFromRows(database, selected),
+        ),
+        more
+            ? base64Url.encode(
+                utf8.encode(
+                  jsonEncode({
+                    'chat': id,
+                    'tip': tip,
+                    'anchor': selected.first['id'],
+                  }),
+                ),
+              )
+            : null,
+      );
+    }
+    final tips = await database.query(
+      'SELECT id FROM messages WHERE conversation_id = ? ORDER BY position DESC LIMIT 1',
+      [id],
+    );
+    final tip = tips.isEmpty ? null : tips.single['id'];
+    int? anchorPosition;
+    if (before != null) {
+      final cursor = jsonDecode(utf8.decode(base64Url.decode(before))) as Map;
+      if (cursor['chat'] != id || cursor['tip'] != tip) {
+        throw ConversationCursorChanged();
+      }
+      final anchors = await database.query(
+        'SELECT position FROM messages WHERE conversation_id = ? AND id = ?',
+        [id, cursor['anchor']],
+      );
+      if (anchors.isEmpty) throw ConversationCursorChanged();
+      anchorPosition = _readInt(anchors.single['position']);
+    }
+    final rows = await database.query(
+      'SELECT * FROM messages WHERE conversation_id = ? ${anchorPosition == null ? '' : 'AND position < ?'} ORDER BY position DESC LIMIT ?',
+      [id, if (anchorPosition != null) anchorPosition, limit + 1],
+    );
+    final more = rows.length > limit;
+    final selected = rows.take(limit).toList().reversed.toList();
+    final messages = await _messagesFromRows(database, selected);
+    return ConversationWindow(
+      ConversationThread(
+        conversation: _conversationFromRow(chats.single),
+        messages: List.unmodifiable(messages),
+      ),
+      more
+          ? base64Url.encode(
+              utf8.encode(
+                jsonEncode({
+                  'chat': id,
+                  'tip': tip,
+                  'anchor': selected.first['id'],
+                }),
+              ),
+            )
+          : null,
+    );
+  });
+
+  Future<List<Message>> _messagesFromRows(
+    SqliteDatabase database,
+    List<Map<String, Object?>> rows,
+  ) async {
+    final messages = <Message>[];
+    // Bound the SQLite IN clause even for explicit full export/context reads.
+    for (var start = 0; start < rows.length; start += 400) {
+      final batch = rows.skip(start).take(400).toList();
+      final ids = batch.map((row) => row['id']).toList();
+      final placeholders = List.filled(ids.length, '?').join(',');
+      Future<Map<String, List<Map<String, Object?>>>> parts(
+        String table,
+        String order,
+      ) async {
+        final result = <String, List<Map<String, Object?>>>{};
+        for (final part in await database.query(
+          'SELECT * FROM $table WHERE message_id IN ($placeholders) ORDER BY $order',
+          ids,
+        )) {
+          (result[part['message_id'] as String] ??= []).add(part);
+        }
+        return result;
+      }
+
+      final images = await parts(
+        'message_images',
+        'position ASC, reference ASC',
+      );
+      final calls = await parts('tool_calls', 'position ASC, id ASC');
+      final results = await parts('tool_results', 'position ASC, id ASC');
+      for (final row in batch) {
+        messages.add(
+          _messageFromParts(
+            row,
+            images[row['id']] ?? const [],
+            calls[row['id']] ?? const [],
+            results[row['id']] ?? const [],
+          ),
+        );
+      }
+    }
+    return messages;
   }
 
   Future<List<Conversation>> listConversations(String serverProfileId) async {
@@ -239,6 +466,14 @@ class ConversationStore {
     );
     return rows.isNotEmpty;
   }
+
+  /// Only the controller owning no live run for this chat may call this.
+  /// A restarted or imported local run cannot keep streaming on this device.
+  Future<void> interruptUnfinishedMessages(String conversationId) =>
+      _database.execute(
+        "UPDATE messages SET status='interrupted',updated_at=? WHERE conversation_id=? AND status IN ('streaming','queued')",
+        [_toEpoch(DateTime.now().toUtc()), conversationId],
+      );
 
   Future<bool> isImageReferenceInUse(String reference) =>
       isAttachmentReferenceInUse(reference);
@@ -336,6 +571,22 @@ class ConversationStore {
     }
     final fromPosition = _readInt(rows.single['from_position']);
     final restored = _decodeCheckpointMessages(rows.single['messages_json']);
+    if (_graphEnabled) {
+      final saved = await database.query(
+        'SELECT tip_id FROM checkpoint_branches WHERE conversation_id=?',
+        [conversationId],
+      );
+      if (saved.isEmpty) {
+        throw const FormatException(
+          'This chat has no migrated recovery branch.',
+        );
+      }
+      await database.execute(
+        'UPDATE conversations SET active_tip_id=?,updated_at=? WHERE id=?',
+        [saved.single['tip_id'], _toEpoch(DateTime.now()), conversationId],
+      );
+      return <String>[];
+    }
     final conversationRows = await database.query(
       'SELECT is_renamed FROM conversations WHERE id = ? LIMIT 1',
       <Object?>[conversationId],
@@ -375,6 +626,8 @@ class ConversationStore {
           ) OR EXISTS (
             SELECT 1 FROM queued_prompts
             WHERE conversation_id = conversations.id
+          ) OR EXISTS (
+            SELECT 1 FROM chat_drafts WHERE scope = conversations.id
           )''';
     final rows = await _database.query('''SELECT * FROM conversations
         WHERE $visibility
@@ -386,19 +639,19 @@ class ConversationStore {
     final term = query.trim();
     if (term.isEmpty) return const [];
     final rows = await _database.query('''SELECT c.*,
-        (SELECT content FROM messages m WHERE m.conversation_id = c.id
-          AND m.role IN ('user', 'assistant')
-          AND instr(lower(m.content), lower(?)) > 0
-          ORDER BY m.position LIMIT 1) AS matching_content
+        (SELECT content FROM messages m WHERE m.conversation_id=c.id
+          AND m.role IN ('user','assistant') AND instr(lower(m.content),lower(?))>0
+          ORDER BY m.position,m.created_at,m.id LIMIT 1) AS matching_content,
+        (SELECT id FROM messages m WHERE m.conversation_id=c.id
+          AND m.role IN ('user','assistant') AND instr(lower(m.content),lower(?))>0
+          ORDER BY m.position,m.created_at,m.id LIMIT 1) AS matching_message_id
         FROM conversations c
-        WHERE instr(lower(c.title), lower(?)) > 0
-          OR EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id
-            AND m.role IN ('user', 'assistant')
-            AND instr(lower(m.content), lower(?)) > 0)
-        ORDER BY CASE WHEN lower(c.title) = lower(?) THEN 0
-          WHEN instr(lower(c.title), lower(?)) = 1 THEN 1
-          WHEN instr(lower(c.title), lower(?)) > 0 THEN 2 ELSE 3 END,
-          c.updated_at DESC, c.id ASC''', List<Object?>.filled(6, term));
+        WHERE instr(lower(c.title),lower(?))>0 OR EXISTS (
+          SELECT 1 FROM messages m WHERE m.conversation_id=c.id AND m.role IN ('user','assistant') AND instr(lower(m.content),lower(?))>0)
+        ORDER BY CASE WHEN lower(c.title)=lower(?) THEN 0
+          WHEN instr(lower(c.title),lower(?))=1 THEN 1
+          WHEN instr(lower(c.title),lower(?))>0 THEN 2 ELSE 3 END,
+          c.updated_at DESC,c.id ASC''', List<Object?>.filled(7, term));
     return rows
         .map((row) {
           final content = row['matching_content'] as String?;
@@ -410,7 +663,13 @@ class ConversationStore {
             excerpt =
                 '${start > 0 ? '…' : ''}${content.substring(start, end).replaceAll(RegExp(r'\s+'), ' ')}${end < content.length ? '…' : ''}';
           }
-          return ConversationSearchResult(_conversationFromRow(row), excerpt);
+          return ConversationSearchResult(
+            _conversationFromRow(row),
+            excerpt,
+            messageId: _graphEnabled
+                ? row['matching_message_id'] as String?
+                : null,
+          );
         })
         .toList(growable: false);
   }
@@ -499,7 +758,15 @@ class ConversationStore {
     return Map<String, Map<String, Object?>>.unmodifiable(drafts);
   }
 
-  Future<void> saveDrafts(Map<String, Map<String, Object?>> drafts) async {
+  Future<bool> hasIntakeReceipt(String id) async => (await _database.query(
+    'SELECT 1 FROM intake_receipts WHERE item_id = ?',
+    [id],
+  )).isNotEmpty;
+
+  Future<void> saveDrafts(
+    Map<String, Map<String, Object?>> drafts, {
+    Set<String> intakeReceipts = const {},
+  }) async {
     final encoded = <String, String>{};
     for (final entry in drafts.entries) {
       if (entry.key.trim().isEmpty) {
@@ -514,6 +781,12 @@ class ConversationStore {
         await database.execute(
           'INSERT INTO chat_drafts(scope, data_json) VALUES(?, ?)',
           <Object?>[entry.key, entry.value],
+        );
+      }
+      for (final id in intakeReceipts) {
+        await database.execute(
+          'INSERT OR IGNORE INTO intake_receipts(item_id) VALUES(?)',
+          [id],
         );
       }
     });
@@ -543,9 +816,28 @@ class ConversationStore {
       imageReferences: prompt.imageReferences,
       documents: prompt.documents,
       createdAt: prompt.createdAt.toUtc(),
+      parentId: prompt.parentId,
+      tracksParent: prompt.tracksParent,
     );
     return _database.transaction((database) async {
       await _requireConversation(database, normalized.conversationId);
+      if (_graphEnabled &&
+          normalized.tracksParent &&
+          normalized.parentId != null) {
+        final tip =
+            (await database.query(
+                  'SELECT active_tip_id FROM conversations WHERE id=?',
+                  [normalized.conversationId],
+                )).single['active_tip_id']
+                as String?;
+        if (!(await _branchRows(
+          database,
+          normalized.conversationId,
+          tip,
+        )).any((row) => row['id'] == normalized.parentId)) {
+          throw const DraftBranchChanged();
+        }
+      }
       final duplicate = await database.query(
         'SELECT conversation_id FROM queued_prompts WHERE id = ? LIMIT 1',
         <Object?>[normalized.id],
@@ -568,7 +860,9 @@ class ConversationStore {
         'UPDATE conversations SET updated_at = ? WHERE id = ?',
         <Object?>[_toEpoch(normalized.createdAt), normalized.conversationId],
       );
-      return normalized;
+      return _graphEnabled
+          ? (await _loadQueuedPromptById(database, normalized.id))!.prompt
+          : normalized;
     });
   }
 
@@ -702,16 +996,6 @@ class ConversationStore {
     }
     return _database.transaction((database) async {
       await _requireConversation(database, conversationId);
-      final running = await database.query(
-        '''SELECT 1 FROM messages WHERE conversation_id = ?
-           AND role = 'assistant' AND status = 'streaming' LIMIT 1''',
-        <Object?>[conversationId],
-      );
-      if (running.isNotEmpty) {
-        throw const FormatException(
-          'Cannot claim a queued prompt while a response is streaming.',
-        );
-      }
       final rows = await database.query(
         '''SELECT * FROM queued_prompts WHERE conversation_id = ?
            ORDER BY position ASC, created_at ASC, id ASC LIMIT 1''',
@@ -720,6 +1004,42 @@ class ConversationStore {
       if (rows.isEmpty) return null;
       final prompt = _queuedPromptFromRow(rows.single);
       final originalPosition = _readInt(rows.single['position']);
+      final activeTip = _graphEnabled
+          ? (await database.query(
+                  'SELECT active_tip_id FROM conversations WHERE id=?',
+                  [conversationId],
+                )).single['active_tip_id']
+                as String?
+          : null;
+      final path = _graphEnabled
+          ? await _branchRows(database, conversationId, activeTip)
+          : const <Map<String, Object?>>[];
+      final running = _graphEnabled
+          ? path
+                .where(
+                  (node) =>
+                      node['role'] == 'assistant' &&
+                      node['status'] == 'streaming',
+                )
+                .isNotEmpty
+          : (await database.query(
+              "SELECT 1 FROM messages WHERE conversation_id=? AND role='assistant' AND status='streaming' LIMIT 1",
+              [conversationId],
+            )).isNotEmpty;
+      if (running) {
+        throw const FormatException(
+          'Cannot claim a queued prompt while a response is streaming.',
+        );
+      }
+      if (_graphEnabled &&
+          prompt.tracksParent &&
+          prompt.parentId != null &&
+          !path.any((node) => node['id'] == prompt.parentId)) {
+        throw const FormatException(
+          'The queued prompt belongs to another answer version. Review the queue before continuing.',
+        );
+      }
+
       final collisions = await database.query(
         'SELECT id FROM messages WHERE id IN (?, ?)',
         <Object?>[userMessageId, assistantMessageId],
@@ -732,7 +1052,9 @@ class ConversationStore {
            FROM messages WHERE conversation_id = ?''',
         <Object?>[conversationId],
       );
-      final userPosition = nextRows.isEmpty
+      final userPosition = _graphEnabled
+          ? path.length
+          : nextRows.isEmpty
           ? 0
           : _readInt(nextRows.single['next_position']);
       final timestamp = (now ?? DateTime.now()).toUtc();
@@ -740,6 +1062,7 @@ class ConversationStore {
         id: userMessageId,
         conversationId: conversationId,
         position: userPosition,
+        parentId: activeTip,
         role: MessageRole.user,
         status: MessageStatus.complete,
         content: prompt.text,
@@ -752,6 +1075,7 @@ class ConversationStore {
         id: assistantMessageId,
         conversationId: conversationId,
         position: userPosition + 1,
+        parentId: userMessageId,
         role: MessageRole.assistant,
         status: MessageStatus.streaming,
         content: '',
@@ -784,10 +1108,12 @@ class ConversationStore {
         <Object?>[conversationId, prompt.id, originalPosition],
       );
       // A committed new user turn ends the previous revision's recovery.
-      await database.execute(
-        'DELETE FROM recovery_checkpoints WHERE conversation_id = ?',
-        <Object?>[conversationId],
-      );
+      if (!_graphEnabled) {
+        await database.execute(
+          'DELETE FROM recovery_checkpoints WHERE conversation_id = ?',
+          <Object?>[conversationId],
+        );
+      }
       return QueuedPromptClaim(
         prompt: prompt,
         userMessage: user,
@@ -820,11 +1146,25 @@ class ConversationStore {
       if (conversationRows.isEmpty) {
         throw FormatException('Conversation $conversationId does not exist.');
       }
-      final tailRows = await database.query(
-        '''SELECT * FROM messages WHERE conversation_id = ? AND position >= ?
+      final activeTip = _graphEnabled
+          ? (await database.query(
+                  'SELECT active_tip_id FROM conversations WHERE id=?',
+                  [conversationId],
+                )).single['active_tip_id']
+                as String?
+          : null;
+      final tailRows = _graphEnabled
+          ? (await _branchRows(database, conversationId, activeTip))
+                .where(
+                  (row) =>
+                      _readInt(row['position']) >= claim.userMessage.position,
+                )
+                .toList()
+          : await database.query(
+              '''SELECT * FROM messages WHERE conversation_id = ? AND position >= ?
            ORDER BY position ASC, created_at ASC, id ASC''',
-        <Object?>[conversationId, claim.userMessage.position],
-      );
+              <Object?>[conversationId, claim.userMessage.position],
+            );
       if (tailRows.length != 2) {
         throw const FormatException(
           'Claimed prompt is no longer the untouched conversation tail.',
@@ -849,10 +1189,35 @@ class ConversationStore {
         );
       }
 
-      await database.execute(
-        'DELETE FROM messages WHERE conversation_id = ? AND position >= ?',
-        <Object?>[conversationId, claim.userMessage.position],
-      );
+      if (_graphEnabled) {
+        final children = await database.query(
+          'SELECT id FROM messages WHERE parent_id IN (?,?) AND id NOT IN (?,?)',
+          [
+            claim.userMessage.id,
+            claim.assistantMessage.id,
+            claim.userMessage.id,
+            claim.assistantMessage.id,
+          ],
+        );
+        if (children.isNotEmpty) {
+          throw const FormatException(
+            'The claimed prompt has another continuation.',
+          );
+        }
+        await database.execute('DELETE FROM messages WHERE id IN (?,?)', [
+          claim.userMessage.id,
+          claim.assistantMessage.id,
+        ]);
+        await database.execute(
+          'UPDATE conversations SET active_tip_id=? WHERE id=?',
+          [storedUser.parentId, conversationId],
+        );
+      } else {
+        await database.execute(
+          'DELETE FROM messages WHERE conversation_id = ? AND position >= ?',
+          <Object?>[conversationId, claim.userMessage.position],
+        );
+      }
       await database.execute(
         'DELETE FROM queued_prompts WHERE conversation_id = ?',
         <Object?>[conversationId],
@@ -862,37 +1227,11 @@ class ConversationStore {
         await _insertQueuedPrompt(database, remaining[index], index + 1);
       }
 
-      final timestamp = DateTime.now().toUtc();
-      final explicitlyRenamed =
-          _readInt(conversationRows.single['is_renamed']) == 1;
-      if (explicitlyRenamed) {
-        await database.execute(
-          'UPDATE conversations SET updated_at = ? WHERE id = ?',
-          <Object?>[_toEpoch(timestamp), conversationId],
-        );
-      } else {
-        final firstUserRows = await database.query(
-          '''SELECT content FROM messages
-             WHERE conversation_id = ? AND role = 'user'
-             ORDER BY position ASC LIMIT 1''',
-          <Object?>[conversationId],
-        );
-        await database.execute(
-          '''UPDATE conversations
-             SET title = ?, title_from_first_user = ?, updated_at = ?
-             WHERE id = ?''',
-          <Object?>[
-            firstUserRows.isEmpty
-                ? 'New chat'
-                : titleFromFirstUserText(
-                    firstUserRows.single['content']! as String,
-                  ),
-            firstUserRows.isEmpty ? 0 : 1,
-            _toEpoch(timestamp),
-            conversationId,
-          ],
-        );
-      }
+      await _updateTitleAfterTailChange(
+        database,
+        conversationId,
+        explicitlyRenamed: _readInt(conversationRows.single['is_renamed']) == 1,
+      );
     });
   }
 
@@ -937,6 +1276,7 @@ class ConversationStore {
     required String systemPrompt,
     required GenerationOptions generationOptions,
     DateTime? now,
+    bool explicitInstructions = true,
   }) => _database.transaction((database) async {
     final timestamp = (now ?? DateTime.now()).toUtc();
     await database.execute(
@@ -952,6 +1292,12 @@ class ConversationStore {
         id,
       ],
     );
+    if (_graphEnabled && explicitInstructions) {
+      await database.execute(
+        "UPDATE conversations SET instruction_source='explicit',instruction_source_id=NULL,instruction_source_revision=NULL WHERE id=?",
+        [id],
+      );
+    }
   });
 
   Future<void> deleteConversation({
@@ -986,12 +1332,23 @@ class ConversationStore {
     List<ToolResult> toolResults = const <ToolResult>[],
     DateTime? now,
   }) => _database.transaction((database) async {
+    final activeRows = _graphEnabled
+        ? await database.query(
+            'SELECT m.id,m.position FROM conversations c LEFT JOIN messages m ON m.id=c.active_tip_id WHERE c.id=?',
+            [conversationId],
+          )
+        : const <Map<String, Object?>>[];
+    final parent = activeRows.firstOrNull?['id'] as String?;
     final positionRows = await database.query(
       '''SELECT COALESCE(MAX(position), -1) + 1 AS next_position
              FROM messages WHERE conversation_id = ?''',
       <Object?>[conversationId],
     );
-    final position = positionRows.isEmpty
+    final position = _graphEnabled
+        ? parent == null
+              ? 0
+              : _readInt(activeRows.single['position']) + 1
+        : positionRows.isEmpty
         ? 0
         : _readInt(positionRows.single['next_position']);
     final timestamp = (now ?? DateTime.now()).toUtc();
@@ -999,6 +1356,10 @@ class ConversationStore {
       id: id,
       conversationId: conversationId,
       position: position,
+      parentId: parent,
+      siblingOrder: _graphEnabled
+          ? await _nextSiblingOrder(database, conversationId, parent)
+          : 0,
       role: role,
       status: status,
       content: content,
@@ -1030,10 +1391,12 @@ class ConversationStore {
           conversationId,
         ],
       );
-      await database.execute(
-        'DELETE FROM recovery_checkpoints WHERE conversation_id = ?',
-        <Object?>[conversationId],
-      );
+      if (!_graphEnabled) {
+        await database.execute(
+          'DELETE FROM recovery_checkpoints WHERE conversation_id = ?',
+          <Object?>[conversationId],
+        );
+      }
     }
     return message;
   });
@@ -1077,6 +1440,10 @@ class ConversationStore {
         );
       }
       _validateMessage(replacement);
+    }
+
+    if (_graphEnabled) {
+      return _replaceGraphTail(conversationId, fromPosition, replacement);
     }
 
     return _database.transaction((database) async {
@@ -1194,12 +1561,25 @@ class ConversationStore {
       );
       return;
     }
-    final firstUserRows = await database.query(
-      '''SELECT content FROM messages
+    final tip = _graphEnabled
+        ? (await database.query(
+                'SELECT active_tip_id FROM conversations WHERE id=?',
+                [conversationId],
+              )).single['active_tip_id']
+              as String?
+        : null;
+    final firstUserRows = _graphEnabled
+        ? (await _branchRows(
+            database,
+            conversationId,
+            tip,
+          )).where((row) => row['role'] == 'user').take(1).toList()
+        : await database.query(
+            '''SELECT content FROM messages
          WHERE conversation_id = ? AND role = 'user'
          ORDER BY position ASC LIMIT 1''',
-      <Object?>[conversationId],
-    );
+            <Object?>[conversationId],
+          );
     final hasUserMessage = firstUserRows.isNotEmpty;
     final title = hasUserMessage
         ? titleFromFirstUserText(firstUserRows.single['content']! as String)
@@ -1281,11 +1661,33 @@ class ConversationStore {
     updatedAt: _fromEpoch(json['updatedAt']),
   );
 
-  Future<void> importThreadsAtomically(List<ConversationThread> threads) async {
+  Future<void> importThreadsAtomically(
+    List<ConversationThread> threads, {
+    List<ChatFolder> folders = const [],
+    Map<String, Map<String, Object?>> drafts = const {},
+  }) async {
     _validateImportedThreads(threads);
+    if (!_graphEnabled &&
+        (folders.isNotEmpty || threads.any((thread) => thread.nodes != null))) {
+      throw const FormatException('History upgrade is required.');
+    }
     await _database.transaction((database) async {
+      for (final folder in folders) {
+        await _putFolder(database, folder);
+      }
       for (final thread in threads) {
         await _insertThread(database, thread);
+      }
+      for (final entry in drafts.entries) {
+        if (!threads.any((t) => t.conversation.id == entry.key)) {
+          throw const FormatException(
+            'Imported draft must belong to an imported chat.',
+          );
+        }
+        await database.execute(
+          'INSERT INTO chat_drafts(scope, data_json) VALUES(?, ?)',
+          [entry.key, jsonEncode(_encodeDraft(entry.value))],
+        );
       }
     });
   }
@@ -1319,6 +1721,24 @@ class ConversationStore {
   Future<void> updateMessage(Message message) async {
     _validateMessage(message);
     await _database.transaction((database) async {
+      if (_graphEnabled) {
+        final rows = await database.query(
+          'SELECT * FROM messages WHERE id=? AND conversation_id=?',
+          [message.id, message.conversationId],
+        );
+        if (rows.isEmpty) {
+          throw const FormatException('Message no longer exists.');
+        }
+        final existing = await _messageFromDatabase(database, rows.single);
+        if (existing.status != MessageStatus.streaming &&
+            existing.status != MessageStatus.queued &&
+            !_sameCheckpointContent(existing, message)) {
+          throw StateError(
+            'Settled message versions are immutable. Create a new version.',
+          );
+        }
+      }
+
       await database.execute(
         '''UPDATE messages
              SET status = ?, content = ?, reasoning = ?,
@@ -1344,11 +1764,26 @@ class ConversationStore {
     });
   }
 
-  Future<void> deleteMessage(String id) =>
-      _database.execute('DELETE FROM messages WHERE id = ?', <Object?>[id]);
-
-  Future<Message> _messageFromRow(Map<String, Object?> row) =>
-      _messageFromDatabase(_database, row);
+  Future<void> deleteMessage(String id) => _database.transaction((db) async {
+    if (_graphEnabled) {
+      final node = (await db.query('SELECT * FROM messages WHERE id=?', [
+        id,
+      ])).firstOrNull;
+      if (node == null) return;
+      if ((await db.query('SELECT id FROM messages WHERE parent_id=? LIMIT 1', [
+        id,
+      ])).isNotEmpty) {
+        throw const FormatException(
+          'A message with retained continuations cannot be removed.',
+        );
+      }
+      await db.execute(
+        'UPDATE conversations SET active_tip_id=? WHERE id=? AND active_tip_id=?',
+        [node['parent_id'], node['conversation_id'], id],
+      );
+    }
+    await db.execute('DELETE FROM messages WHERE id=?', [id]);
+  });
 
   Future<Message> _messageFromDatabase(
     SqliteDatabase database,
@@ -1371,10 +1806,22 @@ class ConversationStore {
       <Object?>[id],
     );
 
+    return _messageFromParts(row, imageRows, callRows, resultRows);
+  }
+
+  Message _messageFromParts(
+    Map<String, Object?> row,
+    List<Map<String, Object?>> imageRows,
+    List<Map<String, Object?>> callRows,
+    List<Map<String, Object?>> resultRows,
+  ) {
+    final id = row['id']! as String;
     return Message(
       id: id,
       conversationId: row['conversation_id']! as String,
       position: _readInt(row['position']),
+      parentId: row['parent_id'] as String?,
+      siblingOrder: row['sibling_order'] as int? ?? 0,
       role: _enumByName(MessageRole.values, row['role']! as String),
       status: _enumByName(MessageStatus.values, row['status']! as String),
       content: row['content']! as String,
@@ -1412,27 +1859,33 @@ class ConversationStore {
     );
   }
 
-  static Conversation _conversationFromRow(Map<String, Object?> row) =>
-      Conversation(
-        id: row['id']! as String,
-        serverProfileId: row['server_profile_id']! as String,
-        title: row['title']! as String,
-        isPinned: row['is_pinned'] == 1,
-        isArchived: row['is_archived'] == 1,
-        isRenamed: row['is_renamed'] == 1,
-        selectedModel: row['selected_model']! as String,
-        systemPrompt: row['system_prompt']! as String,
-        generationOptions: _decodeGenerationOptions(
-          row['generation_options_json'],
-        ),
-        createdAt: _fromEpoch(row['created_at']),
-        updatedAt: _fromEpoch(row['updated_at']),
-      );
+  static Conversation _conversationFromRow(
+    Map<String, Object?> row,
+  ) => Conversation(
+    id: row['id']! as String,
+    serverProfileId: row['server_profile_id']! as String,
+    title: row['title']! as String,
+    isPinned: row['is_pinned'] == 1,
+    isArchived: row['is_archived'] == 1,
+    isRenamed: row['is_renamed'] == 1,
+    selectedModel: row['selected_model']! as String,
+    systemPrompt: row['system_prompt']! as String,
+    activeTipId: row['active_tip_id'] as String?,
+    folderId: row['folder_id'] as String?,
+    instructionSource: row['instruction_source'] as String? ?? 'legacySnapshot',
+    instructionSourceId: row['instruction_source_id'] as String?,
+    instructionSourceRevision: row['instruction_source_revision'] as int?,
+    generationOptions: _decodeGenerationOptions(row['generation_options_json']),
+    createdAt: _fromEpoch(row['created_at']),
+    updatedAt: _fromEpoch(row['updated_at']),
+  );
 
   QueuedPrompt _queuedPromptFromRow(Map<String, Object?> row) => QueuedPrompt(
     id: row['id']! as String,
     conversationId: row['conversation_id']! as String,
     text: row['text']! as String,
+    parentId: row['parent_id'] as String?,
+    tracksParent: row['tracks_parent'] == 1,
     imageReferences: _decodeImageReferences(row['images_json']),
     documents: _decodeDocuments(row['documents_json']),
     createdAt: _fromEpoch(row['created_at']),
@@ -1457,7 +1910,7 @@ class ConversationStore {
     SqliteDatabase database,
     QueuedPrompt prompt,
     int position,
-  ) {
+  ) async {
     if (position < 0) {
       throw const FormatException(
         'Queued prompt position must not be negative.',
@@ -1465,7 +1918,7 @@ class ConversationStore {
     }
     final imagesJson = _encodeImageReferences(prompt.imageReferences);
     final documentsJson = _encodeDocuments(prompt.documents);
-    return database.execute(
+    await database.execute(
       '''INSERT INTO queued_prompts(
            id, conversation_id, position, text, images_json,
            documents_json, created_at
@@ -1480,6 +1933,19 @@ class ConversationStore {
         _toEpoch(prompt.createdAt),
       ],
     );
+    if (_graphEnabled) {
+      final parent = prompt.tracksParent
+          ? prompt.parentId
+          : (await database.query(
+                  'SELECT active_tip_id FROM conversations WHERE id=?',
+                  [prompt.conversationId],
+                )).single['active_tip_id']
+                as String?;
+      await database.execute(
+        'UPDATE queued_prompts SET parent_id=?,tracks_parent=1 WHERE id=?',
+        [parent, prompt.id],
+      );
+    }
   }
 
   static Future<void> _requireConversation(
@@ -1560,26 +2026,52 @@ class ConversationStore {
     return true;
   }
 
-  Future<void> _insertMessage(SqliteDatabase database, Message message) =>
-      database.execute(
-        '''INSERT INTO messages(
+  Future<void> _insertMessage(SqliteDatabase database, Message message) async {
+    if (_graphEnabled) {
+      final parent =
+          message.parentId ??
+          (message.position == 0
+              ? null
+              : (await database.query(
+                      'SELECT active_tip_id FROM conversations WHERE id=?',
+                      [message.conversationId],
+                    )).single['active_tip_id']
+                    as String?);
+      final node = message.copyWith(
+        parentId: parent,
+        siblingOrder: await _nextSiblingOrder(
+          database,
+          message.conversationId,
+          parent,
+        ),
+      );
+      await _insertGraphMessage(database, node);
+      await database.execute(
+        'UPDATE conversations SET active_tip_id=? WHERE id=?',
+        [node.id, node.conversationId],
+      );
+      return;
+    }
+    return database.execute(
+      '''INSERT INTO messages(
              id, conversation_id, position, role, status, content, reasoning,
              provider_transcript_json, documents_json, created_at, updated_at
            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-        <Object?>[
-          message.id,
-          message.conversationId,
-          message.position,
-          message.role.name,
-          message.status.name,
-          message.content,
-          message.reasoning,
-          message.providerTranscriptJson,
-          _encodeDocuments(message.documents),
-          _toEpoch(message.createdAt),
-          _toEpoch(message.updatedAt),
-        ],
-      );
+      <Object?>[
+        message.id,
+        message.conversationId,
+        message.position,
+        message.role.name,
+        message.status.name,
+        message.content,
+        message.reasoning,
+        message.providerTranscriptJson,
+        _encodeDocuments(message.documents),
+        _toEpoch(message.createdAt),
+        _toEpoch(message.updatedAt),
+      ],
+    );
+  }
 
   Future<void> _insertThread(
     SqliteDatabase database,
@@ -1610,9 +2102,38 @@ class ConversationStore {
         conversation.isRenamed ? 1 : 0,
       ],
     );
-    for (final message in thread.messages) {
-      await _insertMessage(database, message);
-      await _replaceMessageParts(database, message);
+    if (_graphEnabled) {
+      String? parent;
+      for (final message in thread.allNodes) {
+        final node = thread.nodes == null
+            ? message.copyWith(parentId: parent, siblingOrder: 0)
+            : message;
+        await _insertGraphMessage(database, node);
+        await _replaceMessageParts(database, node);
+        parent = node.id;
+      }
+      final folderDeleted =
+          conversation.folderId != null &&
+          (await database.query(
+            'SELECT id FROM folders WHERE id=? AND deleted=1',
+            [conversation.folderId],
+          )).isNotEmpty;
+      await database.execute(
+        'UPDATE conversations SET active_tip_id=?,folder_id=?,instruction_source=?,instruction_source_id=?,instruction_source_revision=? WHERE id=?',
+        [
+          conversation.activeTipId ?? thread.messages.lastOrNull?.id,
+          folderDeleted ? null : conversation.folderId,
+          conversation.instructionSource,
+          conversation.instructionSourceId,
+          conversation.instructionSourceRevision,
+          conversation.id,
+        ],
+      );
+    } else {
+      for (final message in thread.messages) {
+        await _insertMessage(database, message);
+        await _replaceMessageParts(database, message);
+      }
     }
   }
 
@@ -1869,7 +2390,7 @@ class ConversationStore {
     }
 
     final incomingDocumentIds = <String>{};
-    for (final message in thread.messages) {
+    for (final message in thread.allNodes) {
       await rejectPartCollision(
         table: 'messages',
         id: message.id,
@@ -1968,15 +2489,18 @@ class ConversationStore {
         throw const FormatException('server profile ID must not be empty');
       }
       conversation.generationOptions.validate();
-      for (var index = 0; index < thread.messages.length; index++) {
-        final message = thread.messages[index];
+      if (thread.nodes != null) {
+        MessageGraph(thread.allNodes).branch(conversation.activeTipId);
+      }
+      for (var index = 0; index < thread.allNodes.length; index++) {
+        final message = thread.allNodes[index];
         _validateMessage(message);
         if (message.conversationId != conversation.id) {
           throw const FormatException(
             'message conversation ID must match its conversation',
           );
         }
-        if (message.position != index) {
+        if (thread.nodes == null && message.position != index) {
           throw const FormatException(
             'message positions must be contiguous and start at zero',
           );
@@ -2093,6 +2617,16 @@ class ConversationStore {
     String Function(String reference) transform,
   ) {
     final result = Map<String, Object?>.from(value);
+    if (result['intakeItems'] case final Map items) {
+      result['intakeItems'] = {
+        for (final entry in items.entries)
+          entry.key: {
+            ...Map<String, Object?>.from(entry.value as Map),
+            if ((entry.value as Map)['reference'] case final String reference)
+              'reference': transform(reference),
+          },
+      };
+    }
     final image = result['image'];
     if (image != null) {
       if (image is! String) {

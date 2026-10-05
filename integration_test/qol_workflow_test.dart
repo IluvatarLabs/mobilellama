@@ -710,6 +710,7 @@ final class _FixtureImageStore implements ImageAttachmentStore {
     required String conversationId,
     required List<int> bytes,
     required String sourceName,
+    String? storageId,
   }) async {
     final directory = await Directory(path.join(root.path, conversationId))
         .create(recursive: true);

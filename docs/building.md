@@ -18,11 +18,16 @@ is available; keep the same `--dart-define` flag.
 
 ## iPhone
 
-Open `ios/Runner.xcworkspace` in Xcode. Select the Runner target, choose your
-Apple team under Signing & Capabilities, and use a bundle identifier registered
-to your team. Connect and trust your phone, and enable Developer Mode.
+Open `ios/Runner.xcworkspace` in Xcode. Configure **both Runner and
+ShareExtension** under Signing & Capabilities with the same Apple team. Each
+target needs its own registered bundle identifier and provisioning profile.
+Assign the same App Group to both targets. The checked-in group is
+`group.app.mobollama.mobollama`; when using another identifier, update both
+entitlements and the matching group strings in `AppDelegate.swift` and
+`ShareViewController.swift`. Connect and trust your phone, and enable Developer
+Mode.
 
-For a local build without iCloud, including a free Personal Team, run:
+For a local build without iCloud, run:
 
 ```sh
 flutter build ios --release --config-only --no-codesign \
@@ -31,10 +36,13 @@ xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner \
   -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
   -derivedDataPath build/ios/local-device -allowProvisioningUpdates \
   CODE_SIGN_STYLE=Automatic \
+  PROVISIONING_PROFILE_SPECIFIER= \
+  CODE_SIGN_IDENTITY="Apple Development" \
   CODE_SIGN_ENTITLEMENTS="$PWD/ios/Runner/Local.entitlements" build
 ```
 
-Install `build/ios/local-device/Build/Products/Release-iphoneos/Runner.app`
+App Group provisioning is still required when iCloud is disabled. Install
+`build/ios/local-device/Build/Products/Release-iphoneos/Runner.app`
 through Xcode's Devices and Simulators window. Keep the same bundle identifier
 when updating an existing installation to retain its data.
 
@@ -52,6 +60,39 @@ for account capabilities and container setup.
 flutter analyze
 flutter test
 ```
+
+Native workflow tests use the existing integration driver, for example:
+
+```sh
+flutter drive --driver=test_driver/integration_test.dart \
+  --target=integration_test/shared_chat_workflow_test.dart \
+  -d <simulator-id> --dart-define=MOBILELLAMA_ICLOUD=false
+```
+
+Opt-in live checks are in `test_driver/live_backend_test.dart`,
+`test_driver/live_webui_test.dart`, and
+`integration_test/live_shared_workflow_test.dart`. Read each file's required
+environment/configuration fields before running. Use a disposable authenticated
+server account; these checks create conversations, folders, and uploaded files.
+Keep credentials outside the repository. Fixture tests, live-server checks, and
+physical-device acceptance are separate evidence.
+
+## Distribution
+
+Runner and ShareExtension must have the same version and build number. Both
+read `FLUTTER_BUILD_NAME` and `FLUTTER_BUILD_NUMBER` from Flutter's generated
+configuration. Increment `pubspec.yaml` or pass `--build-number` consistently.
+The maintained `docs/app-store/ExportOptions.plist` maps both bundle identifiers
+to this project's distribution profiles. Replace its team/certificate/profile
+values for another developer account. Then run:
+
+```sh
+flutter build ipa --release --export-options-plist=docs/app-store/ExportOptions.plist
+```
+
+Check the embedded signatures, profiles, and App Group entitlement on both
+bundles. An exported IPA is a build artifact; it does not establish physical
+device acceptance or App Store review status.
 
 Exercise UI changes in the simulator and include screenshots in your PR.
 Describe the change and how you checked it. For bugs, include the app version,
