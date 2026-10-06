@@ -50,7 +50,7 @@ void main() {
     bridge.changes.add(
       ChatSyncChange(
         token: 'receipt-1',
-        id: 'remote-chat',
+        id: 'chat:remote-chat',
         deleted: false,
         conflict: false,
         json: snapshot,
@@ -98,7 +98,7 @@ void main() {
     await fixture.controller.initialize();
     await fixture.controller.chatSync!.synchronize();
     expect(bridge.puts, hasLength(1));
-    expect(bridge.puts.single['id'], 'local-chat');
+    expect(bridge.puts.single['id'], 'chat:local-chat');
   });
 
   test('a remote deletion waits for a durable pending queue', () async {
@@ -121,7 +121,7 @@ void main() {
     bridge.changes.add(
       const ChatSyncChange(
         token: 'queued-delete',
-        id: 'queued-chat',
+        id: 'chat:queued-chat',
         deleted: true,
         conflict: false,
       ),
@@ -159,7 +159,7 @@ void main() {
       bridge.changes.add(
         const ChatSyncChange(
           token: 'delete-receipt',
-          id: 'draft-chat',
+          id: 'chat:draft-chat',
           deleted: true,
           conflict: false,
         ),

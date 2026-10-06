@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:isolate';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -185,12 +184,16 @@ void main() {
       ),
     );
 
-    final packageLibrary = await Isolate.resolvePackageUri(
-      Uri.parse('package:pdfrx_engine/pdfrx_engine.dart'),
+    final configuration = File('.dart_tool/package_config.json').absolute;
+    final packages = jsonDecode(await configuration.readAsString()) as Map;
+    final engine = (packages['packages'] as List).cast<Map>().singleWhere(
+      (p) => p['name'] == 'pdfrx_engine',
     );
-    expect(packageLibrary, isNotNull);
-    final encryptedFixture = File.fromUri(
-      packageLibrary!.resolve('../test/assets/encrypted.pdf'),
+    final packageRoot = Directory.fromUri(
+      configuration.uri.resolve(engine['rootUri'] as String),
+    );
+    final encryptedFixture = File(
+      '${packageRoot.path}/test/assets/encrypted.pdf',
     );
     expect(await encryptedFixture.exists(), isTrue);
     await expectLater(

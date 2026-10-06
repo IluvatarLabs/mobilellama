@@ -1,10 +1,16 @@
+import '../open_webui/accounts_page.dart';
+
+import 'dart:async';
 import 'dart:math' as math;
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../data/settings_store.dart';
+import '../data/share_intake.dart';
+import '../data/temporary_chat.dart';
 import '../domain/conversation.dart';
 import '../domain/document_attachment.dart';
 import '../ui/design.dart';
@@ -16,20 +22,33 @@ import 'chat_controller.dart';
 import 'composer.dart';
 import 'find_in_chat.dart';
 import 'history.dart';
+import 'folders.dart';
 import 'model_sheet.dart';
+import 'message_versions.dart';
 import 'queue_panel.dart';
 import 'transcript.dart';
 
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key, required this.controller});
+  const ChatScreen({
+    super.key,
+    required this.controller,
+    this.onExitTemporary,
+    this.onSaveTemporary,
+  });
   final ChatController controller;
+  final VoidCallback? onExitTemporary;
+  final VoidCallback? onSaveTemporary;
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
+  List<ShareIntake> _intakes = [];
+  bool _readingIntakes = false;
   final ChatFindController _findController = ChatFindController();
+  late final TextEditingController _composerEditor;
+  final FocusNode _composerFocus = FocusNode();
 
   ChatController get controller => widget.controller;
 
@@ -42,7 +61,10 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    _composerEditor = TextEditingController(text: controller.draftText);
     controller.addListener(_announceChanges);
+    WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _loadIntakes());
   }
 
   @override
@@ -57,8 +79,186 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void dispose() {
     controller.removeListener(_announceChanges);
+    WidgetsBinding.instance.removeObserver(this);
     _findController.dispose();
+    _composerEditor.dispose();
+    _composerFocus.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _loadIntakes();
+    if (controller.isTemporary &&
+        (state == AppLifecycleState.paused ||
+            state == AppLifecycleState.detached)) {
+      unawaited(controller.pauseForBackground());
+    }
+  }
+
+  Future<void> _loadIntakes() async {
+    if (controller.isTemporary || _readingIntakes) return;
+    _readingIntakes = true;
+    try {
+      final intakes = await ShareIntake.pending();
+      if (mounted) setState(() => _intakes = intakes);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Shared content could not be opened: $error')),
+        );
+      }
+    } finally {
+      _readingIntakes = false;
+    }
+  }
+
+  Future<void> _findQuery(String query) async {
+    await controller.prepareFindInChat();
+    if (!mounted) return;
+    _findController.open();
+    _findController.setQuery(query);
+  }
+
+  Future<void> _reviewIntake() async {
+    if (_intakes.isEmpty || !controller.canEditDraft) return;
+    if (!controller.isConfigured) {
+      await _connectServer();
+      if (!mounted || !controller.isConfigured) return;
+    }
+    final intake = _intakes.first;
+    final resuming = controller.sharedIntakeDraftScope(intake.id) != null;
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (context) => KeyboardSafeSheet(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const SheetHandle(),
+            const SheetHeading(
+              title: 'Shared content',
+              closeLabel: 'Close shared content',
+            ),
+            Text(
+              resuming
+                  ? 'Resume the saved draft for this shared content. Already imported items will not be added again.'
+                  : 'Destination: ${controller.conversationDestinationName}. Review the draft before sending.',
+            ),
+            const SizedBox(height: Design.gutter),
+            for (final item in intake.items)
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                title: Text(item.name),
+                subtitle: Text(
+                  item.error ?? item.text ?? item.kind,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, 'new'),
+              child: Text(
+                resuming ? 'Resume saved draft' : 'Open in a new draft',
+              ),
+            ),
+            if (!resuming)
+              OutlinedButton(
+                onPressed: () => Navigator.pop(context, 'merge'),
+                child: const Text('Add to this draft'),
+              ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, 'discard'),
+              child: const Text('Discard shared content'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    if (choice == 'discard') {
+      if (!await _discardIntake(intake)) return;
+    } else {
+      final errors = await controller.importSharedContent(
+        intake,
+        newDraft: choice == 'new',
+      );
+      if (errors.isNotEmpty && mounted) {
+        await showDialog<void>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Some items still need attention'),
+            content: SingleChildScrollView(
+              child: Text(
+                '${errors.join('\n\n')}\n\nImported items are in your draft. The remaining content is saved for retry.',
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Keep for retry'),
+              ),
+              TextButton(
+                onPressed: () async {
+                  if (await _discardIntake(intake) && context.mounted) {
+                    Navigator.pop(context);
+                  }
+                },
+                child: const Text('Discard remaining'),
+              ),
+            ],
+          ),
+        );
+      }
+      _composerFocus.requestFocus();
+    }
+    await _loadIntakes();
+  }
+
+  Future<bool> _discardIntake(ShareIntake intake) async {
+    try {
+      await controller.discardSharedContent(intake);
+      return true;
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Shared content could not be discarded: $error'),
+          ),
+        );
+      }
+      return false;
+    }
+  }
+
+  void _quoteSelection(String text) {
+    if (!controller.canEditDraft) return;
+    final value = _composerEditor.value;
+    final selection = value.selection.isValid
+        ? value.selection
+        : TextSelection.collapsed(offset: value.text.length);
+    final quote =
+        '${selection.start > 0 ? '\n\n' : ''}${text.split('\n').map((line) => '> $line').join('\n')}\n\n';
+    final next = value.text.replaceRange(selection.start, selection.end, quote);
+    if (utf8.encode(next).length > ChatController.maxMessageTextBytes) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'The quote exceeds the 64 KB message limit. Select a shorter excerpt.',
+          ),
+        ),
+      );
+      return;
+    }
+    _composerEditor.value = TextEditingValue(
+      text: next,
+      selection: TextSelection.collapsed(
+        offset: selection.start + quote.length,
+      ),
+    );
+    _composerFocus.requestFocus();
   }
 
   void _announceChanges() {
@@ -88,8 +288,25 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// Opens the connection form directly. Returns true only when Save and
   /// connect succeeded.
-  Future<bool> _openConnectionForm({ServerProfile? profile}) =>
-      showConnectionForm(context, controller, profile: profile);
+  Future<bool> _openConnectionForm({ServerProfile? profile}) async {
+    if (controller.isTemporary) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Exit temporary chat to edit the connection.'),
+        ),
+      );
+      return false;
+    }
+    return showConnectionForm(context, controller, profile: profile);
+  }
+
+  Future<void> _openTemporary() async {
+    if (!controller.isConfigured || !controller.canChangeContext) return;
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(builder: (_) => _TemporaryChatPage(parent: controller)),
+    );
+  }
 
   /// First connection: form, then model selection when no valid model is
   /// configured; the picker returns to the chat with its destination shown.
@@ -135,48 +352,73 @@ class _ChatScreenState extends State<ChatScreen> {
     animation: controller,
     builder: (context, _) {
       final media = MediaQuery.of(context);
+      final wide = !controller.isTemporary && media.size.width >= 900;
       // Compact chrome when the keyboard or landscape leaves little height;
       // grow with the header's two lines so scaled text is never clipped.
       final shortScreen =
           media.size.height - media.viewInsets.bottom - media.padding.top < 480;
+      // AppBar caps title scaling at 1.34. Size its two-line title using that
+      // same scale; excess toolbar space otherwise clips the landscape editor.
+      final titleScaler = media.textScaler.clamp(maxScaleFactor: 1.34);
       final toolbarHeight = math.max(
         shortScreen ? 52.0 : 64.0,
-        media.textScaler.scale(16) * 1.3 +
-            media.textScaler.scale(12) * 1.35 +
+        titleScaler.scale(16) * 1.3 +
+            titleScaler.scale(12) * 1.35 +
             Design.space2,
       );
       return Scaffold(
         drawerScrimColor: Design.ink.withValues(alpha: .54),
-        drawer: _HistoryDrawer(controller: controller, onNewChat: _newChat),
+        drawer: wide || controller.isTemporary
+            ? null
+            : _HistoryDrawer(
+                controller: controller,
+                onNewChat: _newChat,
+                onTemporaryChat: _openTemporary,
+                onFindQuery: _findQuery,
+              ),
         appBar: AppBar(
           automaticallyImplyLeading: false,
-          leadingWidth: Design.gutter + Design.target,
+          leadingWidth: wide ? 0 : Design.gutter + Design.target,
           toolbarHeight: toolbarHeight,
-          leading: Builder(
-            builder: (context) => Padding(
-              padding: const EdgeInsets.only(left: Design.gutter),
-              child: Center(
-                child: RoundAction(
-                  label: 'Open chats',
-                  icon: 'menu',
-                  onPressed: () {
-                    FocusManager.instance.primaryFocus?.unfocus();
-                    Scaffold.of(context).openDrawer();
-                  },
+          leading: controller.isTemporary
+              ? IconButton(
+                  tooltip: 'Exit temporary chat',
+                  icon: const Icon(Icons.close),
+                  onPressed: widget.onExitTemporary,
+                )
+              : wide
+              ? const SizedBox.shrink()
+              : Builder(
+                  builder: (context) => Padding(
+                    padding: const EdgeInsets.only(left: Design.gutter),
+                    child: Center(
+                      child: RoundAction(
+                        label: 'Open chats',
+                        icon: 'menu',
+                        onPressed: () {
+                          FocusManager.instance.primaryFocus?.unfocus();
+                          Scaffold.of(context).openDrawer();
+                        },
+                      ),
+                    ),
+                  ),
                 ),
-              ),
-            ),
-          ),
           titleSpacing: 0,
           centerTitle: true,
           title: _ChatHeaderTitle(controller: controller),
           actions: [
-            RoundAction(
-              label: 'New chat',
-              icon: 'compose',
-              onPressed: () => _newChat(context),
-            ),
-            if (controller.conversation != null) ...[
+            if (controller.isTemporary)
+              TextButton(
+                onPressed: widget.onSaveTemporary,
+                child: const Text('Save'),
+              ),
+            if (!controller.isTemporary)
+              RoundAction(
+                label: 'New chat',
+                icon: 'compose',
+                onPressed: () => _newChat(context),
+              ),
+            if (!controller.isTemporary && controller.conversation != null) ...[
               const SizedBox(width: 6),
               RoundAction(
                 label: 'Chat actions',
@@ -185,19 +427,90 @@ class _ChatScreenState extends State<ChatScreen> {
                   context,
                   controller,
                   controller.conversation!,
-                  onFind: _findController.open,
+                  onFind: () async {
+                    await controller.prepareFindInChat();
+                    if (mounted) _findController.open();
+                  },
                 ),
               ),
             ],
             const SizedBox(width: Design.gutter),
           ],
         ),
-        body: _ChatBody(
-          controller: controller,
-          findController: _findController,
-          onConnectServer: _connectServer,
-          onEditConnection: () =>
-              _openConnectionForm(profile: controller.conversationProfile),
+        body: Row(
+          children: [
+            if (wide) ...[
+              SizedBox(
+                width: 300,
+                child: _HistoryDrawer(
+                  controller: controller,
+                  onNewChat: _newChat,
+                  onTemporaryChat: _openTemporary,
+                  onFindQuery: _findQuery,
+                  persistent: true,
+                ),
+              ),
+              VerticalDivider(width: 1, color: Design.line(context)),
+            ],
+            Expanded(
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 760),
+                  child: _ChatBody(
+                    intakeBanner: controller.isTemporary
+                        ? MaterialBanner(
+                            content: const Text(
+                              'Temporary chat · Not saved in history',
+                            ),
+                            actions: [
+                              IconButton(
+                                tooltip: 'About temporary chat',
+                                icon: const Icon(Icons.info_outline),
+                                onPressed: () => showDialog<void>(
+                                  context: context,
+                                  builder: (context) => AlertDialog(
+                                    title: const Text('Temporary chat'),
+                                    content: const Text(_temporaryExplanation),
+                                    actions: [
+                                      TextButton(
+                                        onPressed: () => Navigator.pop(context),
+                                        child: const Text('OK'),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          )
+                        : _intakes.isEmpty
+                        ? null
+                        : MaterialBanner(
+                            content: Text(
+                              '${_intakes.length} shared ${_intakes.length == 1 ? 'item' : 'items'} ready to review',
+                            ),
+                            actions: [
+                              TextButton(
+                                onPressed: controller.canEditDraft
+                                    ? _reviewIntake
+                                    : null,
+                                child: const Text('Review'),
+                              ),
+                            ],
+                          ),
+                    composerEditor: _composerEditor,
+                    composerFocus: _composerFocus,
+                    onAskSelection: _quoteSelection,
+                    controller: controller,
+                    findController: _findController,
+                    onConnectServer: _connectServer,
+                    onEditConnection: () => _openConnectionForm(
+                      profile: controller.conversationProfile,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
         ),
       );
     },
@@ -273,11 +586,19 @@ class _ChatBody extends StatelessWidget {
     required this.findController,
     required this.onConnectServer,
     required this.onEditConnection,
+    this.intakeBanner,
+    required this.composerEditor,
+    required this.composerFocus,
+    required this.onAskSelection,
   });
   final ChatController controller;
   final ChatFindController findController;
   final Future<void> Function() onConnectServer;
   final Future<bool> Function() onEditConnection;
+  final Widget? intakeBanner;
+  final TextEditingController composerEditor;
+  final FocusNode composerFocus;
+  final ValueChanged<String> onAskSelection;
 
   /// Body height below which queue and attachment previews collapse to
   /// summaries and the composer uses compact padding.
@@ -302,20 +623,20 @@ class _ChatBody extends StatelessWidget {
       controller.conversationConnectionStatus == ConnectionStatus.checking;
 
   /// Why Send/Queue is unavailable, or null when it is available.
-  String? get _submitUnavailableReason =>
-      switch (controller.submitAvailability) {
-        SubmitAvailability.noConnection => 'Connect a server to send',
-        SubmitAvailability.unavailable =>
-          '${controller.conversationDestinationName} is unavailable',
-        SubmitAvailability.noModel => 'Choose a model to send',
-        SubmitAvailability.localMutation => 'Saving…',
-        SubmitAvailability.streaming ||
-        SubmitAvailability.queuePaused ||
-        SubmitAvailability.ready =>
-          _imagesUnsupported
-              ? 'This model can’t read images. Remove them or choose another model.'
-              : null,
-      };
+  String? get _submitUnavailableReason => switch (controller
+      .submitAvailability) {
+    SubmitAvailability.noConnection => 'Connect a server to send',
+    SubmitAvailability.unavailable =>
+      '${controller.conversationDestinationName} is unavailable',
+    SubmitAvailability.noModel => 'Choose a model to send',
+    SubmitAvailability.localMutation => 'Saving…',
+    SubmitAvailability.streaming ||
+    SubmitAvailability.queuePaused ||
+    SubmitAvailability.ready =>
+      _imagesUnsupported
+          ? 'This model can’t read images. Remove them or choose another model.'
+          : null,
+  };
 
   /// The chat's request failure, when it belongs to a visible message.
   bool _failureOnMessage(ChatFailure failure) =>
@@ -423,7 +744,11 @@ class _ChatBody extends StatelessWidget {
   List<TranscriptMessageView> get _transcriptMessages {
     final messages = controller.transcriptMessages;
     final id = controller.conversation?.id;
-    if (id == null || !controller.hasRecoveryCheckpoint(id)) return messages;
+    if (controller.versionsEnabled ||
+        id == null ||
+        !controller.hasRecoveryCheckpoint(id)) {
+      return messages;
+    }
     final latest = messages.lastIndexWhere(
       (message) => message.role == TranscriptRole.assistant,
     );
@@ -652,6 +977,7 @@ class _ChatBody extends StatelessWidget {
       animation: findController,
       builder: (context, _) => Column(
         children: [
+          if (intakeBanner != null) intakeBanner!,
           for (final banner in _banners(context))
             Padding(
               padding: const EdgeInsets.fromLTRB(
@@ -670,8 +996,16 @@ class _ChatBody extends StatelessWidget {
                 final short = height < _shortHeight;
                 return Column(
                   children: [
+                    if (controller.draftNeedsBranchChoice)
+                      DraftBranchNotice(controller: controller),
+                    if (controller.viewingAlternative)
+                      VersionPreviewNotice(controller: controller),
                     Expanded(
                       child: ChatTranscript(
+                        hasOlder: controller.hasOlderMessages,
+                        loadingOlder: controller.loadingOlderMessages,
+                        onLoadOlder: controller.loadOlderMessages,
+                        onAskSelection: onAskSelection,
                         key: PageStorageKey(
                           'transcript-${controller.conversation?.id ?? 'new'}',
                         ),
@@ -694,18 +1028,26 @@ class _ChatBody extends StatelessWidget {
                           controller.conversation!.id,
                         ),
                         canMutate: () => controller.canSend,
-                        messageFooter: (message) =>
-                            chatFailure != null &&
-                                chatFailure.messageId == message.id
-                            ? _failureNotice(
+                        messageFooter: (message) => Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (controller.versionsEnabled)
+                              MessageVersions(
+                                controller: controller,
+                                messageId: message.id,
+                              ),
+                            if (chatFailure != null &&
+                                chatFailure.messageId == message.id)
+                              _failureNotice(
                                 context,
                                 chatFailure,
                                 nearMessage: true,
                                 onDismiss: () => controller.dismissFailure(
                                   controller.conversation!.id,
                                 ),
-                              )
-                            : null,
+                              ),
+                          ],
+                        ),
                         emptyState: _Welcome(
                           setup:
                               controller.submitAvailability ==
@@ -753,6 +1095,10 @@ class _ChatBody extends StatelessWidget {
                           ],
                           Flexible(
                             child: ChatComposer(
+                              controller: composerEditor,
+                              focusNode: composerFocus,
+                              onPasteImage: (bytes) =>
+                                  controller.pickImage(imageBytes: bytes),
                               compact: short,
                               draftScopeRevision: controller.draftScopeRevision,
                               draftText: controller.draftText,
@@ -1061,19 +1407,35 @@ class _Welcome extends StatelessWidget {
 }
 
 class _HistoryDrawer extends StatelessWidget {
-  const _HistoryDrawer({required this.controller, required this.onNewChat});
+  const _HistoryDrawer({
+    required this.controller,
+    required this.onNewChat,
+    required this.onTemporaryChat,
+    required this.onFindQuery,
+    this.persistent = false,
+  });
+  final bool persistent;
+  final Future<void> Function() onTemporaryChat;
+  final Future<void> Function(String) onFindQuery;
   final ChatController controller;
   final Future<bool> Function(BuildContext context) onNewChat;
   @override
   Widget build(BuildContext context) => Padding(
-    padding: EdgeInsets.only(top: MediaQuery.paddingOf(context).top),
+    padding: EdgeInsets.only(
+      top: persistent ? 0 : MediaQuery.paddingOf(context).top,
+    ),
     child: Drawer(
-      width: (MediaQuery.sizeOf(context).width * .82).clamp(0, 420),
+      width: persistent
+          ? 300
+          : (MediaQuery.sizeOf(context).width * .82).clamp(0, 420),
+      elevation: persistent ? 0 : null,
       semanticLabel: 'Chats',
       backgroundColor: Design.panel(context),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.horizontal(right: Radius.circular(24)),
-      ),
+      shape: persistent
+          ? const RoundedRectangleBorder()
+          : const RoundedRectangleBorder(
+              borderRadius: BorderRadius.horizontal(right: Radius.circular(24)),
+            ),
       child: SafeArea(
         top: false,
         child: Padding(
@@ -1106,15 +1468,16 @@ class _HistoryDrawer extends StatelessWidget {
                         label: 'Search chats',
                         icon: 'search',
                         onPressed: () async {
-                          final opened = await Navigator.push<bool>(
+                          final opened = await Navigator.push<String>(
                             context,
                             MaterialPageRoute(
                               builder: (_) =>
                                   ChatHistoryPage(controller: controller),
                             ),
                           );
-                          if (opened == true && context.mounted) {
-                            Navigator.pop(context);
+                          if (opened != null && context.mounted) {
+                            if (!persistent) Navigator.pop(context);
+                            if (opened.isNotEmpty) await onFindQuery(opened);
                           }
                         },
                       ),
@@ -1124,6 +1487,19 @@ class _HistoryDrawer extends StatelessWidget {
                     child: ListView(
                       padding: const EdgeInsets.only(top: 14, bottom: 14),
                       children: [
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(Icons.chat_bubble_outline),
+                          title: const Text('Temporary chat'),
+                          onTap:
+                              controller.isConfigured &&
+                                  controller.canChangeContext
+                              ? () async {
+                                  if (!persistent) Navigator.pop(context);
+                                  await onTemporaryChat();
+                                }
+                              : null,
+                        ),
                         ListTile(
                           contentPadding: EdgeInsets.zero,
                           leading: const DesignIcon('servers'),
@@ -1140,6 +1516,40 @@ class _HistoryDrawer extends StatelessWidget {
                             ),
                           ),
                         ),
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(Icons.cloud_outlined),
+                          title: const Text('Shared chats'),
+                          subtitle: const Text('Open WebUI'),
+                          onTap: () => Navigator.push<void>(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => WebUiAccountsPage(
+                                accounts: controller.webUiAccounts,
+                              ),
+                            ),
+                          ),
+                        ),
+                        if (controller.versionsEnabled)
+                          ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: const Icon(Icons.folder_outlined),
+                            title: const Text('Folders'),
+                            onTap: () async {
+                              final opened = await Navigator.push<bool>(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) =>
+                                      FoldersPage(controller: controller),
+                                ),
+                              );
+                              if (opened == true &&
+                                  context.mounted &&
+                                  !persistent) {
+                                Navigator.pop(context);
+                              }
+                            },
+                          ),
                         if (chats.isEmpty)
                           const Padding(
                             padding: EdgeInsets.symmetric(vertical: 24),
@@ -1176,7 +1586,7 @@ class _HistoryDrawer extends StatelessWidget {
                                   await controller.openConversation(chat.id);
                                   if (context.mounted &&
                                       controller.conversation?.id == chat.id) {
-                                    Navigator.pop(context);
+                                    if (!persistent) Navigator.pop(context);
                                   }
                                 },
                               ),
@@ -1210,7 +1620,7 @@ class _HistoryDrawer extends StatelessWidget {
                             onPressed: () async {
                               final opened = await onNewChat(context);
                               if (opened && context.mounted) {
-                                Navigator.pop(context);
+                                if (!persistent) Navigator.pop(context);
                               }
                             },
                             icon: const DesignIcon('compose', size: 19),
@@ -1222,15 +1632,16 @@ class _HistoryDrawer extends StatelessWidget {
                         label: 'Settings',
                         icon: 'settings',
                         onPressed: () async {
-                          final opened = await Navigator.push<bool>(
+                          final opened = await Navigator.push<String>(
                             context,
                             MaterialPageRoute(
                               builder: (_) =>
                                   SettingsPage(controller: controller),
                             ),
                           );
-                          if (opened == true && context.mounted) {
-                            Navigator.pop(context);
+                          if (opened != null && context.mounted) {
+                            if (!persistent) Navigator.pop(context);
+                            if (opened.isNotEmpty) await onFindQuery(opened);
                           }
                         },
                       ),
@@ -1307,4 +1718,126 @@ class _PendingDocuments extends StatelessWidget {
       ),
     );
   }
+}
+
+const _temporaryExplanation =
+    'This conversation stays out of history, search, backups, and iCloud unless you save it. The selected server still processes requests and may retain logs. Backgrounding keeps this session open; closing the app ends it.';
+
+class _TemporaryChatPage extends StatefulWidget {
+  const _TemporaryChatPage({required this.parent});
+  final ChatController parent;
+  @override
+  State<_TemporaryChatPage> createState() => _TemporaryChatPageState();
+}
+
+class _TemporaryChatPageState extends State<_TemporaryChatPage> {
+  late final Future<TemporaryChatSession> _opening = TemporaryChatSession.open(
+    widget.parent,
+  );
+  TemporaryChatSession? _session;
+  bool _busy = false;
+  bool _canPop = false;
+
+  @override
+  void dispose() {
+    unawaited(
+      _opening.then((session) => session.close(), onError: (Object _) {}),
+    );
+    super.dispose();
+  }
+
+  Future<void> _exit({bool save = false}) async {
+    if (_busy) return;
+    final session = _session;
+    if (session == null) return;
+    if (!save) {
+      final choice = await showDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Close temporary chat?'),
+          content: const Text(
+            'Discard removes this session and its attachments. Save keeps it as an ordinary chat, including your unsent draft.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Keep editing'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, 'discard'),
+              child: const Text('Discard'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, 'save'),
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      );
+      if (choice == null || !mounted) return;
+      save = choice == 'save';
+    }
+    setState(() => _busy = true);
+    try {
+      if (save) await session.controller.saveTemporaryTo(widget.parent);
+      // Remove listeners with the route before disposing its controller.
+      if (!mounted) return;
+      setState(() => _canPop = true);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) Navigator.pop(context);
+      });
+    } catch (error) {
+      if (mounted) {
+        setState(() => _busy = false);
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('$error')));
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => PopScope(
+    canPop: _canPop,
+    onPopInvokedWithResult: (didPop, _) {
+      if (!didPop) unawaited(_exit());
+    },
+    child: FutureBuilder<TemporaryChatSession>(
+      future: _opening,
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return Scaffold(
+            appBar: AppBar(
+              title: const Text('Temporary chat'),
+              leading: BackButton(
+                onPressed: () {
+                  setState(() => _canPop = true);
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (mounted) Navigator.pop(context);
+                  });
+                },
+              ),
+            ),
+            body: Center(
+              child: Text('Could not open temporary chat: ${snapshot.error}'),
+            ),
+          );
+        }
+        final session = snapshot.data;
+        if (session == null) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+        _session = session;
+        return AbsorbPointer(
+          absorbing: _busy,
+          child: ChatScreen(
+            controller: session.controller,
+            onExitTemporary: () => _exit(),
+            onSaveTemporary: () => _exit(save: true),
+          ),
+        );
+      },
+    ),
+  );
 }

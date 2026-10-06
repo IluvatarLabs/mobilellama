@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 
 import '../ui/design.dart';
 import 'speech_actions.dart';
@@ -26,9 +28,11 @@ class ChatComposer extends StatefulWidget {
     this.onPickImage,
     this.onTakePhoto,
     this.onPickDocument,
+    this.onPasteImage,
     this.imagesEnabled = true,
     this.dictationEngine,
     this.controller,
+    this.focusNode,
     this.isStreaming = false,
     this.isQueueing = false,
     this.editable = true,
@@ -47,9 +51,11 @@ class ChatComposer extends StatefulWidget {
   final VoidCallback? onPickImage;
   final VoidCallback? onTakePhoto;
   final VoidCallback? onPickDocument;
+  final Future<void> Function(List<int> bytes)? onPasteImage;
   final bool imagesEnabled;
   final DictationEngine? dictationEngine;
   final TextEditingController? controller;
+  final FocusNode? focusNode;
   final bool isStreaming;
   final bool isQueueing;
   final bool editable;
@@ -407,6 +413,52 @@ class _ChatComposerState extends State<ChatComposer>
     }
   }
 
+  Future<void> _paste() async {
+    final scope = widget.draftScopeRevision;
+    final before = _controller.value;
+    try {
+      if (defaultTargetPlatform == TargetPlatform.iOS &&
+          widget.onPasteImage != null) {
+        final bytes = await const MethodChannel('app.mobollama/intake')
+            .invokeMethod<Uint8List>('pasteImage');
+        if (!mounted || scope != widget.draftScopeRevision) return;
+        if (bytes != null) {
+          await widget.onPasteImage!(bytes);
+          return;
+        }
+      }
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      if (!mounted ||
+          scope != widget.draftScopeRevision ||
+          before != _controller.value ||
+          data?.text == null) {
+        return;
+      }
+      final selection = before.selection.isValid
+          ? before.selection
+          : TextSelection.collapsed(offset: before.text.length);
+      final next = before.text.replaceRange(
+        selection.start,
+        selection.end,
+        data!.text!,
+      );
+      if (utf8.encode(next).length > _maxMessageBytes) {
+        throw const FormatException('A message can be at most 64 KB.');
+      }
+      _controller.value = TextEditingValue(
+        text: next,
+        selection: TextSelection.collapsed(
+          offset: selection.start + data.text!.length,
+        ),
+      );
+    } on Object catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Could not paste: $error')));
+      }
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -535,6 +587,24 @@ class _ChatComposerState extends State<ChatComposer>
         Expanded(
           child: TextField(
             controller: _controller,
+            focusNode: widget.focusNode,
+            contextMenuBuilder: (context, state) =>
+                AdaptiveTextSelectionToolbar.buttonItems(
+                  anchors: state.contextMenuAnchors,
+                  buttonItems: [
+                    ...state.contextMenuButtonItems.where(
+                      (item) => item.type != ContextMenuButtonType.paste,
+                    ),
+                    if (widget.editable)
+                      ContextMenuButtonItem(
+                        type: ContextMenuButtonType.paste,
+                        onPressed: () {
+                          state.hideToolbar();
+                          unawaited(_paste());
+                        },
+                      ),
+                  ],
+                ),
             // Read-only rather than disabled keeps focus, selection, and
             // copying available during a brief local mutation.
             readOnly: !widget.editable,
@@ -603,7 +673,13 @@ class _ChatComposerState extends State<ChatComposer>
               ),
               onPressed: _send,
               style: _primaryActionStyle(colors),
-              icon: const DesignIcon('send', size: 20),
+              icon: DesignIcon(
+                'send',
+                size: 20,
+                color: _canSend
+                    ? colors.surface
+                    : colors.onSurface.withValues(alpha: .38),
+              ),
             ),
           ],
         ] else
@@ -615,7 +691,13 @@ class _ChatComposerState extends State<ChatComposer>
             ),
             onPressed: _canSend ? _send : null,
             style: _primaryActionStyle(colors),
-            icon: const DesignIcon('send', size: 20),
+            icon: DesignIcon(
+              'send',
+              size: 20,
+              color: _canSend
+                  ? colors.surface
+                  : colors.onSurface.withValues(alpha: .38),
+            ),
           ),
       ],
     );
@@ -624,10 +706,10 @@ class _ChatComposerState extends State<ChatComposer>
   ButtonStyle _primaryActionStyle(ColorScheme colors) => IconButton.styleFrom(
     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
     padding: EdgeInsets.zero,
-    backgroundColor: colors.primary,
-    foregroundColor: colors.onPrimary,
-    disabledBackgroundColor: colors.primary.withValues(alpha: .45),
-    disabledForegroundColor: colors.onPrimary,
+    backgroundColor: colors.onSurface,
+    foregroundColor: colors.surface,
+    disabledBackgroundColor: colors.onSurface.withValues(alpha: .12),
+    disabledForegroundColor: colors.onSurface.withValues(alpha: .38),
   );
 }
 

@@ -48,6 +48,7 @@ final class OpenConversationDatabase {
 Future<OpenConversationDatabase> openConversationDatabase({
   required String legacyServerProfileId,
   String? databasePath,
+  int schemaVersion = ConversationStore.schemaVersion,
   AttachmentReferenceCodec referenceCodec =
       const IdentityAttachmentReferenceCodec(),
 }) async {
@@ -56,6 +57,7 @@ Future<OpenConversationDatabase> openConversationDatabase({
       path.join(await sqflite.getDatabasesPath(), 'mobollama.db');
   final database = await sqflite.openDatabase(
     resolvedPath,
+    singleInstance: resolvedPath != sqflite.inMemoryDatabasePath,
     onConfigure: (database) => database.execute('PRAGMA foreign_keys = ON'),
   );
   final adapter = SqfliteDatabaseAdapter(database);
@@ -67,6 +69,7 @@ Future<OpenConversationDatabase> openConversationDatabase({
     final fromVersion = versionValue is num ? versionValue.toInt() : 0;
     await store.migrate(
       fromVersion: fromVersion,
+      toVersion: schemaVersion,
       legacyServerProfileId: legacyServerProfileId,
     );
     return OpenConversationDatabase._(store, database);

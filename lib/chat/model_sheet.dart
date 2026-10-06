@@ -150,29 +150,30 @@ Future<void> showModelSheet(
                       ),
                       onTap: ready && !busy ? () => choose(model.name) : null,
                     ),
-                  _ModelRow(
-                    title: existingChat
-                        ? 'New chat on another server'
-                        : 'Choose server for new chat',
-                    subtitle: existingChat
-                        ? 'This chat and its history stay on ${profile.name}.'
-                        : '${controller.profiles.length} saved servers',
-                    trailing: const DesignIcon('chevron'),
-                    onTap: busy
-                        ? null
-                        : () async {
-                            await Navigator.push<void>(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) => SettingsSheet(
-                                  controller: controller,
-                                  section: SettingsSection.servers,
+                  if (!controller.isTemporary)
+                    _ModelRow(
+                      title: existingChat
+                          ? 'New chat on another server'
+                          : 'Choose server for new chat',
+                      subtitle: existingChat
+                          ? 'This chat and its history stay on ${profile.name}.'
+                          : '${controller.profiles.length} saved servers',
+                      trailing: const DesignIcon('chevron'),
+                      onTap: busy
+                          ? null
+                          : () async {
+                              await Navigator.push<void>(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => SettingsSheet(
+                                    controller: controller,
+                                    section: SettingsSection.servers,
+                                  ),
                                 ),
-                              ),
-                            );
-                            unawaited(controller.loadModelCapabilities());
-                          },
-                  ),
+                              );
+                              unawaited(controller.loadModelCapabilities());
+                            },
+                    ),
                 ],
               ),
             ),
@@ -298,7 +299,8 @@ class _NoModels extends StatelessWidget {
                   controller.refreshModelList(profileId: profileId),
               child: const Text('Refresh'),
             ),
-            if (controller.canManageModelsForProfile(profileId))
+            if (!controller.isTemporary &&
+                controller.canManageModelsForProfile(profileId))
               TextButton(
                 style: TextButton.styleFrom(
                   minimumSize: const Size(Design.target, Design.target),

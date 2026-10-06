@@ -6,6 +6,8 @@ import UIKit
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var chatCloudSyncBridge: ChatCloudSyncBridge?
   private var chatBackgroundExecutionBridge: ChatBackgroundExecutionBridge?
+  private var rendererChannel: FlutterMethodChannel?
+  private var intakeChannel: FlutterMethodChannel?
   private var localNetworkChannel: FlutterMethodChannel?
   private var localNetworkProbe: LocalNetworkProbe?
 
@@ -20,6 +22,61 @@ import UIKit
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
 
     let messenger = engineBridge.applicationRegistrar.messenger()
+    let renderer = FlutterMethodChannel(name: "app.mobollama/renderer", binaryMessenger: messenger)
+    renderer.setMethodCallHandler { call, result in
+      guard call.method == "supported" else { result(FlutterMethodNotImplemented); return }
+      if #available(iOS 17.4, *) { result(true) } else { result(false) }
+    }
+    rendererChannel = renderer
+    let intake = FlutterMethodChannel(name: "app.mobollama/intake", binaryMessenger: messenger)
+    intake.setMethodCallHandler { call, result in
+      if call.method == "pending" || call.method == "remove" {
+        do {
+          guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.app.mobollama.mobollama") else {
+            result(FlutterError(code: "intake_unavailable", message: "Shared storage is unavailable.", details: nil)); return
+          }
+          let root = container.appendingPathComponent("Intake", isDirectory: true)
+          if call.method == "remove" {
+            guard let args = call.arguments as? [String: String], let id = args["id"], UUID(uuidString: id) != nil else {
+              result(FlutterError(code: "invalid_intake", message: "Invalid shared item.", details: nil)); return
+            }
+            let path = root.appendingPathComponent(id, isDirectory: true)
+            if FileManager.default.fileExists(atPath: path.path) { try FileManager.default.removeItem(at: path) }
+            result(nil); return
+          }
+          guard FileManager.default.fileExists(atPath: root.path) else { result([]); return }
+          var manifests: [[String: Any]] = []
+          for directory in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey]).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            guard UUID(uuidString: directory.lastPathComponent) != nil else { continue }
+            let file = directory.appendingPathComponent("manifest.json")
+            guard FileManager.default.fileExists(atPath: file.path) else {
+              // An active extension can still be preparing providers. Retain
+              // recent work, reclaim only abandoned unpublished staging.
+              let modified = try directory.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+              if let modified, Date().timeIntervalSince(modified) > 24 * 60 * 60 {
+                try FileManager.default.removeItem(at: directory)
+              }
+              continue
+            }
+            let data = try Data(contentsOf: file)
+            guard var manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any], manifest["id"] as? String == directory.lastPathComponent else { continue }
+            manifest["root"] = directory.path
+            manifests.append(manifest)
+          }
+          result(manifests)
+        } catch { result(FlutterError(code: "intake_failed", message: error.localizedDescription, details: nil)) }
+        return
+      }
+      guard call.method == "pasteImage" else { result(FlutterMethodNotImplemented); return }
+      // Clipboard content is read only after the user selects Paste.
+      guard let image = UIPasteboard.general.image, let data = image.pngData() else { result(nil); return }
+      guard data.count <= 8 * 1024 * 1024 else {
+        result(FlutterError(code: "image_too_large", message: "An image can be at most 8 MB.", details: nil)); return
+      }
+      result(FlutterStandardTypedData(bytes: data))
+    }
+    intakeChannel = intake
+
     chatCloudSyncBridge = ChatCloudSyncBridge(
       application: UIApplication.shared,
       messenger: messenger

@@ -5,7 +5,11 @@ import '../domain/prompt_preset.dart';
 
 enum ThemePreference { system, light, dark }
 
-enum ServerProtocol { ollama, openAiCompatible }
+enum ServerProtocol { ollama, openAiCompatible, openWebUi }
+
+enum CompatibleApi { chatCompletions, responses }
+
+enum ServerAuthentication { none, bearer, apiKey }
 
 abstract interface class PreferencesDriver {
   String? getString(String key);
@@ -22,6 +26,11 @@ final class ServerProfile {
     required String baseUrl,
     String? acknowledgedInsecureOrigin,
     bool configured = true,
+    CompatibleApi compatibleApi = CompatibleApi.chatCompletions,
+    ServerAuthentication authentication = ServerAuthentication.bearer,
+    String apiVersion = '',
+    List<String> headerNames = const [],
+    List<String> manualModels = const [],
   }) {
     final normalizedId = id.trim();
     final normalizedName = name.trim();
@@ -44,6 +53,18 @@ final class ServerProfile {
       acknowledgedInsecureOrigin:
           uri.scheme == 'http' && acknowledgedOrigin == origin ? origin : null,
       configured: configured,
+      compatibleApi: compatibleApi,
+      authentication: authentication,
+      apiVersion: apiVersion.trim(),
+      headerNames: List.unmodifiable(
+        headerNames.map((name) => name.trim().toLowerCase()).toSet(),
+      ),
+      manualModels: List.unmodifiable(
+        manualModels
+            .map((id) => id.trim())
+            .where((id) => id.isNotEmpty)
+            .toSet(),
+      ),
     );
   }
 
@@ -54,6 +75,11 @@ final class ServerProfile {
     required this.baseUrl,
     required this.acknowledgedInsecureOrigin,
     required this.configured,
+    required this.compatibleApi,
+    required this.authentication,
+    required this.apiVersion,
+    required this.headerNames,
+    required this.manualModels,
   });
 
   final String id;
@@ -61,6 +87,11 @@ final class ServerProfile {
   final ServerProtocol protocol;
   final String baseUrl;
   final String? acknowledgedInsecureOrigin;
+  final CompatibleApi compatibleApi;
+  final ServerAuthentication authentication;
+  final String apiVersion;
+  final List<String> headerNames;
+  final List<String> manualModels;
 
   /// False only for the synthesized bootstrap profile of a fresh install that
   /// the user has not saved through the connection form.
@@ -76,6 +107,11 @@ final class ServerProfile {
     String? baseUrl,
     Object? acknowledgedInsecureOrigin = _notProvided,
     bool? configured,
+    CompatibleApi? compatibleApi,
+    ServerAuthentication? authentication,
+    String? apiVersion,
+    List<String>? headerNames,
+    List<String>? manualModels,
   }) => ServerProfile(
     id: id,
     name: name ?? this.name,
@@ -86,6 +122,11 @@ final class ServerProfile {
         ? this.acknowledgedInsecureOrigin
         : acknowledgedInsecureOrigin as String?,
     configured: configured ?? this.configured,
+    compatibleApi: compatibleApi ?? this.compatibleApi,
+    authentication: authentication ?? this.authentication,
+    apiVersion: apiVersion ?? this.apiVersion,
+    headerNames: headerNames ?? this.headerNames,
+    manualModels: manualModels ?? this.manualModels,
   );
 
   Map<String, Object?> toJson() => <String, Object?>{
@@ -93,6 +134,11 @@ final class ServerProfile {
     'name': name,
     'protocol': protocol.name,
     'baseUrl': baseUrl,
+    'compatibleApi': compatibleApi.name,
+    'authentication': authentication.name,
+    if (apiVersion.isNotEmpty) 'apiVersion': apiVersion,
+    if (headerNames.isNotEmpty) 'headerNames': headerNames,
+    if (manualModels.isNotEmpty) 'manualModels': manualModels,
     if (acknowledgedInsecureOrigin != null)
       'acknowledgedInsecureOrigin': acknowledgedInsecureOrigin,
     // Absent means configured, so every pre-existing stored profile keeps it.
@@ -106,6 +152,15 @@ final class ServerProfile {
     baseUrl: json['baseUrl']! as String,
     acknowledgedInsecureOrigin: json['acknowledgedInsecureOrigin'] as String?,
     configured: json['configured'] != false,
+    compatibleApi: CompatibleApi.values.byName(
+      json['compatibleApi'] as String? ?? 'chatCompletions',
+    ),
+    authentication: ServerAuthentication.values.byName(
+      json['authentication'] as String? ?? 'bearer',
+    ),
+    apiVersion: json['apiVersion'] as String? ?? '',
+    headerNames: (json['headerNames'] as List? ?? const []).cast<String>(),
+    manualModels: (json['manualModels'] as List? ?? const []).cast<String>(),
   );
 
   static const Object _notProvided = Object();
@@ -172,6 +227,16 @@ class SettingsStore {
 
   Future<void> saveSyncBaseline(Map<String, String> value) =>
       _preferences.setString('chat_sync_baseline_v1', jsonEncode(value));
+
+  Map<String, String> get syncBaselineV2 {
+    final value = _preferences.getString('chat_sync_baseline_v2');
+    return value == null
+        ? {}
+        : Map<String, String>.from(jsonDecode(value) as Map);
+  }
+
+  Future<void> saveSyncBaselineV2(Map<String, String> value) =>
+      _preferences.setString('chat_sync_baseline_v2', jsonEncode(value));
 
   List<PromptPreset> get promptPresets {
     final stored = _preferences.getString('prompt_presets_v1');
@@ -276,10 +341,16 @@ class SettingsStore {
     final document = _readProfileDocument() ?? _legacyDocument();
     final activeId = document.activeProfileId;
     if (activeId != null &&
-        document.profiles.any((profile) => profile.id == activeId)) {
+        document.profiles.any(
+          (profile) =>
+              profile.id == activeId &&
+              profile.protocol != ServerProtocol.openWebUi,
+        )) {
       return activeId;
     }
-    return document.profiles.first.id;
+    return document.profiles
+        .firstWhere((profile) => profile.protocol != ServerProtocol.openWebUi)
+        .id;
   }
 
   ServerProfile get activeProfile {
@@ -332,7 +403,10 @@ class SettingsStore {
 
   Future<void> setActiveProfile(String id) async {
     final document = _readProfileDocument() ?? _legacyDocument();
-    if (!document.profiles.any((profile) => profile.id == id)) {
+    if (!document.profiles.any(
+      (profile) =>
+          profile.id == id && profile.protocol != ServerProtocol.openWebUi,
+    )) {
       throw ArgumentError.value(id, 'id', 'unknown server profile');
     }
     await _writeProfileDocument(

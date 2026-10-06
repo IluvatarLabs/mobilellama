@@ -1,19 +1,16 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
-import 'package:image_picker/image_picker.dart';
-import 'package:path/path.dart' as path;
-import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 
 import 'chat/chat_controller.dart';
 import 'chat/background_execution.dart';
 import 'chat/chat_screen.dart';
-import 'data/attachment_reference_codec.dart';
+import 'data/local_image_store.dart';
+import 'data/temporary_chat.dart';
 import 'data/shared_preferences_driver.dart';
 import 'data/sqflite_database.dart';
 import 'data/settings_store.dart';
@@ -125,27 +122,27 @@ class _MobOllamaAppState extends State<MobOllamaApp>
           : const Color(0xFFE0E7FF),
       onPrimaryContainer: isDark
           ? const Color(0xFFFFFFFF)
-          : const Color(0xFF2A2E3A),
-      surface: isDark ? const Color(0xFF2A2E3A) : Colors.white,
-      surfaceContainerLowest: isDark ? const Color(0xFF2A2E3A) : Colors.white,
+          : const Color(0xFF171717),
+      surface: isDark ? const Color(0xFF171717) : Colors.white,
+      surfaceContainerLowest: isDark ? const Color(0xFF171717) : Colors.white,
       surfaceContainerLow: isDark
-          ? const Color(0xFF373B47)
-          : const Color(0xFFF7F8FA),
-      surfaceContainer: isDark ? const Color(0xFF424651) : Colors.white,
+          ? const Color(0xFF202020)
+          : const Color(0xFFF7F7F7),
+      surfaceContainer: isDark ? const Color(0xFF262626) : Colors.white,
       surfaceContainerHigh: isDark
-          ? const Color(0xFF50545F)
-          : const Color(0xFFE8EBF2),
+          ? const Color(0xFF333333)
+          : const Color(0xFFEBEBEB),
       surfaceContainerHighest: isDark
-          ? const Color(0xFF494D58)
-          : const Color(0xFFDDE2EB),
-      onSurface: isDark ? const Color(0xFFFFFFFF) : const Color(0xFF2A2E3A),
+          ? const Color(0xFF303030)
+          : const Color(0xFFE1E1E1),
+      onSurface: isDark ? const Color(0xFFFFFFFF) : const Color(0xFF171717),
       onSurfaceVariant: isDark
-          ? const Color(0xFFAEB0B5)
-          : const Color(0xFF687080),
-      outline: isDark ? const Color(0xFF747B89) : const Color(0xFF8F97A6),
+          ? const Color(0xFFB5B5B5)
+          : const Color(0xFF686868),
+      outline: isDark ? const Color(0xFF777777) : const Color(0xFF929292),
       outlineVariant: isDark
-          ? const Color(0xFF373B46)
-          : const Color(0xFFD6DAE4),
+          ? const Color(0xFF383838)
+          : const Color(0xFFE4E4E4),
     );
     final base = ThemeData(
       brightness: brightness,
@@ -305,6 +302,10 @@ class _StartupInProgress extends StatelessWidget {
   }
 }
 
+/// Shared by the app shell and native workflow previews.
+ThemeData mobileLlamaTheme(Brightness brightness) =>
+    _MobOllamaAppState._theme(brightness);
+
 class MobOllamaStartupFailure extends StatelessWidget {
   const MobOllamaStartupFailure({super.key, required this.error});
 
@@ -328,10 +329,25 @@ Future<ChatControllerBootstrap> createChatController() async {
   http.Client? client;
   try {
     final settings = await openSettingsStore();
-    final images = await _LocalImageAttachmentStore.create();
+    await TemporaryChatSession.clearAbandoned();
+    final images = await LocalImageAttachmentStore.create();
     database = await openConversationDatabase(
       legacyServerProfileId: settings.activeProfileId,
       referenceCodec: images.referenceCodec,
+    );
+    final savedDrafts = await database.store.loadDrafts();
+    final draftFiles = <String>{
+      for (final draft in savedDrafts.values) ...[
+        ...List<String>.from(draft['images'] as List? ?? const []),
+        if (draft['image'] case final String image) image,
+        for (final document in draft['documents'] as List? ?? const [])
+          (document as Map)['reference'] as String,
+      ],
+    };
+    await images.reclaimAbandonedIntakeFiles(
+      (reference) async =>
+          draftFiles.contains(reference) ||
+          await database!.store.isAttachmentReferenceInUse(reference),
     );
     client = http.Client();
     const uuid = Uuid();
@@ -409,121 +425,6 @@ final class _PlatformSecretStore implements SecretStore {
   @override
   Future<void> write(String key, String value) =>
       _storage.write(key: key, value: value);
-}
-
-final class _LocalImageAttachmentStore implements ImageAttachmentStore {
-  const _LocalImageAttachmentStore(this._root, this._picker);
-
-  final Directory _root;
-  final ImagePicker _picker;
-  AttachmentReferenceCodec get referenceCodec =>
-      RootedAttachmentReferenceCodec(_root.path);
-
-  static Future<_LocalImageAttachmentStore> create() async {
-    final documents = await getApplicationDocumentsDirectory();
-    final root = Directory(path.join(documents.path, 'chat-images'));
-    await root.create(recursive: true);
-    return _LocalImageAttachmentStore(root, ImagePicker());
-  }
-
-  @override
-  Future<String?> pickAndCopy({
-    required String conversationId,
-    bool camera = false,
-  }) async {
-    final picked = await _picker.pickImage(
-      source: camera ? ImageSource.camera : ImageSource.gallery,
-      maxWidth: 2048,
-      maxHeight: 2048,
-      imageQuality: 88,
-    );
-    if (picked == null) return null;
-    final directory = _conversationDirectory(conversationId);
-    await directory.create(recursive: true);
-    final rawExtension = path.extension(picked.name).toLowerCase();
-    final extension = RegExp(r'^\.[a-z0-9]{1,8}$').hasMatch(rawExtension)
-        ? rawExtension
-        : '.img';
-    final target = File(
-      path.join(directory.path, '${const Uuid().v4()}$extension'),
-    );
-    await File(picked.path).copy(target.path);
-    if (await target.length() > ChatController.maxImageBytes) {
-      await target.delete();
-      throw const ChatRequestLimitException(
-        'The selected image is larger than 8 MB after resizing.',
-      );
-    }
-    return target.path;
-  }
-
-  @override
-  Future<String> readAsBase64(String reference) async {
-    final file = _validatedFile(reference);
-    return base64Encode(await file.readAsBytes());
-  }
-
-  @override
-  Future<String> writeBytes({
-    required String conversationId,
-    required List<int> bytes,
-    required String sourceName,
-  }) async {
-    if (bytes.isEmpty || bytes.length > ChatController.maxImageBytes) {
-      throw const FormatException('Backup image is empty or exceeds 8 MB.');
-    }
-    final directory = _conversationDirectory(conversationId);
-    await directory.create(recursive: true);
-    final extension = path.extension(sourceName).toLowerCase();
-    final suffix = RegExp(r'^\.[a-z0-9]{1,8}$').hasMatch(extension)
-        ? extension
-        : '.img';
-    final file = File(path.join(directory.path, '${const Uuid().v4()}$suffix'));
-    try {
-      await file.writeAsBytes(bytes, flush: true);
-      return file.path;
-    } on Object {
-      if (await file.exists()) await file.delete();
-      rethrow;
-    }
-  }
-
-  @override
-  Future<int> sizeInBytes(String reference) async {
-    final stat = await _validatedFile(reference).stat();
-    if (stat.type != FileSystemEntityType.file) {
-      throw FileSystemException('Image file is missing.', reference);
-    }
-    return stat.size;
-  }
-
-  @override
-  Future<void> deleteReference(String reference) async {
-    final file = _validatedFile(reference);
-    if (await file.exists()) await file.delete();
-  }
-
-  @override
-  Future<void> deleteConversation(String conversationId) async {
-    final directory = _conversationDirectory(conversationId);
-    if (await directory.exists()) await directory.delete(recursive: true);
-  }
-
-  Directory _conversationDirectory(String conversationId) {
-    final segment = base64Url
-        .encode(utf8.encode(conversationId))
-        .replaceAll('=', '');
-    return Directory(path.join(_root.path, segment));
-  }
-
-  File _validatedFile(String reference) {
-    final normalizedRoot = path.normalize(path.absolute(_root.path));
-    final normalizedReference = path.normalize(path.absolute(reference));
-    if (!path.isWithin(normalizedRoot, normalizedReference)) {
-      throw ArgumentError('Image reference is outside app storage.');
-    }
-    return File(normalizedReference);
-  }
 }
 
 class _StartupFailure extends StatelessWidget {

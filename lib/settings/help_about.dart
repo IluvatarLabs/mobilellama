@@ -99,7 +99,7 @@ class ConnectionHelpPage extends StatelessWidget {
         'Ollama: connects to an Ollama server, usually on port 11434, for '
             'example http://192.168.1.20:11434.\n\n'
             'OpenAI-compatible: connects to a server that provides the OpenAI '
-            'chat API. Its URL includes /v1, for example '
+            'chat API. Enter its exact API root, for example '
             'https://example.com/v1.',
       ),
       (
