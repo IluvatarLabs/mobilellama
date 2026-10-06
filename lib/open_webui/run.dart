@@ -29,7 +29,13 @@ final class WebUiRun extends ChangeNotifier {
   WebUiRun._(this.session, this.store, this.socket, this.data) {
     _events = socket?.events.listen(_event);
     _connections = socket?.connections.listen((online) {
-      if (online && !terminal) unawaited(reconcile());
+      // Dispatch owns the fresh handoff until it receives an acknowledgment.
+      // A connection alone is not evidence that this intent reached the server.
+      if (online &&
+          {WebUiRunState.uncertain, WebUiRunState.running, WebUiRunState.approval}
+              .contains(state)) {
+        unawaited(reconcile());
+      }
     });
   }
   final WebUiSession session;

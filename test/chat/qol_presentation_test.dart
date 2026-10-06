@@ -7,6 +7,7 @@ import 'package:flutter_math_fork/flutter_math.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:mobollama/chat/attachment_strip.dart';
+import 'package:mobollama/app.dart';
 import 'package:mobollama/chat/chat_screen.dart';
 import 'package:mobollama/chat/composer.dart';
 import 'package:mobollama/chat/find_in_chat.dart';
@@ -17,6 +18,41 @@ import 'package:mobollama/domain/queued_prompt.dart';
 import '../support/chat_fixture.dart';
 
 void main() {
+  testWidgets('actual chat keeps an enlarged draft line visible above the landscape keyboard', (tester) async {
+    tester.view.physicalSize = const Size(874, 402);
+    tester.view.devicePixelRatio = 1;
+    tester.view.viewInsets = const FakeViewPadding(bottom: 209);
+    addTearDown(tester.view.reset);
+    final fixture = ChatFixture();
+    await tester.runAsync(() async {
+      await fixture.open();
+      await fixture.controller.initialize();
+    });
+    await tester.pumpWidget(MaterialApp(
+      theme: mobileLlamaTheme(Brightness.light),
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context).copyWith(textScaler: const TextScaler.linear(3.1)),
+        child: child!,
+      ),
+      home: ChatScreen(controller: fixture.controller),
+    ));
+    await tester.enterText(find.byType(TextField), 'Accessible landscape');
+    await tester.pumpAndSettle();
+    final editor = tester.state<EditableTextState>(find.byType(EditableText)).renderEditable;
+    expect(editor.size.height, greaterThanOrEqualTo(editor.preferredLineHeight));
+    expect(find.byTooltip('Send').hitTestable(), findsOneWidget);
+    expect(fixture.controller.draftText, 'Accessible landscape');
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+    var closed = false;
+    unawaited(fixture.close().whenComplete(() => closed = true));
+    for (var i = 0; i < 50 && !closed; i++) {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 10)));
+      await tester.pump();
+    }
+    expect(closed, isTrue);
+  });
+
   testWidgets(
     'header names each chat destination and a failed revision restores from its answer',
     (tester) async {

@@ -60,6 +60,7 @@ class TranscriptMessageView {
     this.status = TranscriptStatus.completed,
     this.canRetry = false,
     this.canEdit = false,
+    this.retainsVersions = false,
     this.editRemovesLaterMessages = false,
     this.canRegenerate = false,
     this.regenerateRemovesLaterMessages = false,
@@ -77,6 +78,7 @@ class TranscriptMessageView {
   final TranscriptStatus status;
   final bool canRetry;
   final bool canEdit;
+  final bool retainsVersions;
   final bool editRemovesLaterMessages;
   final bool canRegenerate;
   final bool regenerateRemovesLaterMessages;
@@ -98,6 +100,7 @@ class TranscriptMessageView {
         status: status,
         canRetry: canRetry,
         canEdit: canEdit,
+        retainsVersions: retainsVersions,
         editRemovesLaterMessages: editRemovesLaterMessages,
         canRegenerate: canRegenerate,
         regenerateRemovesLaterMessages: regenerateRemovesLaterMessages,
@@ -1531,10 +1534,12 @@ class _EditMessageSheetState extends State<_EditMessageSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final warning =
-        '${widget.message.editRemovesLaterMessages ? 'This replaces this message and every reply after it.' : 'This replaces this message and the replies after it.'} '
-        'You can restore the previous conversation until you send or revise '
-        'another message.';
+    final warning = widget.message.retainsVersions
+        ? 'This creates a new version and generates new replies. '
+              'Use the version arrows to return to the original conversation.'
+        : '${widget.message.editRemovesLaterMessages ? 'This replaces this message and every reply after it.' : 'This replaces this message and the replies after it.'} '
+              'You can restore the previous conversation until you send or '
+              'revise another message.';
     return KeyboardSafeSheet(
       child: Column(
         mainAxisSize: MainAxisSize.min,

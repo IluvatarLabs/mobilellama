@@ -60,13 +60,13 @@ upgraded. There is no continuous bridge back to the old format and no supported
 downgrade that flattens branches. iCloud opt-in is preserved. Remote account
 caches and temporary sessions are excluded from direct-chat synchronization.
 
-## Evidence recorded October 5, 2026
+## Evidence recorded October 5–6, 2026
 
 | Layer | Observed outcome | Limits |
 | --- | --- | --- |
-| Dart regression suite | 174 tests pass, including partial-share restart/order/rollback/discard, retained version recovery, and recovered shared-chat draft adoption | Does not establish native extension, physical performance, or CloudKit behavior |
-| Direct live server | Ollama 0.32.14, qwen2.5:3b: native chat, compatible Chat Completions, and Responses each complete two turns and preserve stopped partial output; Responses executes tools and preserves tool-bearing history through export/import and another tool-bearing turn | One real inference server/model; web-result content is a fixed fixture. The deployment/authentication matrix remains unverified |
-| Shared live server | Open WebUI 0.11.4: authenticated identity/socket, saved chat/context, regeneration and continuation from a retained version, drafts, folder move/delete-keeping-chat, file upload/processing/question, knowledge with an authenticated source, selected skill and configured tool execution with retained selections, export/local import, and temporary chat with exactly-once Save pass. Injected pre-dispatch loss causes no generation; lost acknowledgment reconciles with one dispatch; Stop retains partial output and pauses the queue | A disposable isolated instance using one model; image-generation/provider and adversarial live account scenarios remain to be completed |
+| Dart regression suite | 175 tests pass, including partial-share restart/order/rollback/discard, retained version recovery, and recovered shared-chat draft adoption | Does not establish native extension, physical performance, or CloudKit behavior |
+| Direct live server | Ollama 0.32.14, qwen2.5:3b: native chat, compatible Chat Completions, and Responses each complete two turns and preserve stopped partial output; Responses executes tools and preserves tool-bearing history through export/import and another tool-bearing turn | One real inference server/model; web-result content is a fixed fixture. Additional live gateway checks pass for bearer auth at a prefixed root, `api-key` plus API version/custom header, and a manual model with discovery unavailable |
+| Shared live server | Open WebUI 0.11.4: authenticated identity/socket, saved chat/context, regeneration and continuation from a retained version, drafts, folder move/delete-keeping-chat, file upload/processing/question, knowledge with an authenticated source, selected skill and configured tool execution with retained selections, export/local import, and temporary chat with exactly-once Save pass. Injected pre-dispatch loss causes no generation; lost acknowledgment reconciles with one dispatch; Stop retains partial output and pauses the queue | A disposable isolated instance using one model; configured image generation was unavailable; server image-output parsing/rendering has fixture coverage |
 | Native simulator workflows | iPhone and iPad app UI exercises shared sign-in/chat, retained versions, folders, temporary sessions, and supported diagrams; real desktop-to-native continuity and parameterized prompt insertion pass; actual-app light/dark/large-text screenshots captured | The live prompt test uses Flutter synthetic keyboard input. No physical share-sheet or performance claim |
 | Distribution | Signed 1.4.0 (7) archive and App Store IPA generated; host and extension signatures match their registered App Group | Final native installation/device checks remain pending; no upload or review submission |
 
@@ -90,25 +90,62 @@ now change ownership in one SQLite transaction. The exact crash cut is supported
 by transaction structure and recovery fixtures; it has not been force-killed on
 a physical device.
 
+## Additional acceptance completed October 6
+
+- Installed the actual 1.4.0 (6) app, created a conversation, stopped answer,
+  paused queue, unsent draft, and document using the app, then installed (7)
+  over it. Schema 9 upgraded to 13 without changing any existing conversation,
+  message, queue, or draft field. The migrated attachment reached a real model;
+  retained answer versions, a folder, and the draft survived another restart.
+- Force-terminated an active real Ollama stream: its exact partial answer and
+  unsent draft survived. A controlled stream with a queued follow-up also
+  recovered with the queue paused. Server request counts stayed unchanged until
+  explicit Resume, which dispatched the queued message once.
+- Exercised actual iOS simulator Safari and Photos share sheets, extension
+  cancellation, cold launch, destination review, existing-draft merge, PDF
+  extraction/question answering, native image paste, and explicit image Send.
+  Import did not send a request. Temporary image files were present before
+  force-termination and absent after relaunch, with no new saved conversation.
+- Ran real Open WebUI accounts through password and API-key authentication at a
+  prefixed root, 401 lock/recovery, account/cache/draft/queue/file isolation,
+  denied-inventory retention, concurrent branches, explicit continuation,
+  confirmed deletion, and sign-out. Sign-out purged populated local data while
+  retaining server history and leaving the other account usable. The disposable
+  server's roles, permissions, and model settings were restored afterward.
+- Used the system's maximum accessibility text size in portrait and landscape,
+  including the software keyboard. Ordinary and temporary Send delivered the
+  complete draft; temporary Save preserved the result in ordinary history.
+  Restored simulator text size, orientation, and clipboard synchronization.
+
+These flows found and fixed three defects: a new shared request could be
+reconciled before its first dispatch; Safari PDF shares did not offer the
+extension when the source supplied mixed representations; and the chat header
+reserved uncapped text height despite Flutter capping the actual title, clipping
+large composer text above the landscape keyboard. Both timing and layout
+regressions fail against the old implementation and pass with their corrections.
+The edit-message sheet now describes retained versions accurately.
+
+The final regression suite reports 175 passes. Static analysis has no errors or
+warnings and 80 informational findings. The live account run was independently
+reviewed against its source and recorded build/log hashes. Native screenshots,
+SQLite snapshots, request logs, and signed-artifact verification are retained
+with the release evidence; simulator results remain distinct from physical
+hardware acceptance.
+
 ## Remaining acceptance before calling the update shipped
 
-- Physical iPhone/iPad: actual Safari/Photos/Files share sheets, foreground and
-  cold launch, paste/selection, native cleanup, narrow landscape and split view,
-  VoiceOver, system accessibility settings, and background expiration.
-- Compare deterministic short/long mixed-content streaming on the same physical
-  device in profile/release mode while typing and scrolling. Record frame
-  timings, final content, Stop behavior, and detached scroll anchors.
-- Complete the deployment/authentication matrix; exercise live Open WebUI
-  concurrent edits, delete/account isolation, configured image output, and
-  permission changes. Existing fixtures cover those protocol/state boundaries,
-  but do not establish the full live deployment matrix.
-- Run the old 1.4.0 (6) and new app on two real iCloud devices: divergent offline
-  edits, upgrade/restart/repeat migration, known deletion, folders and branches,
-  with no new-format payload in the old zone. Verify direct iCloud while an
-  Open WebUI account is in use.
-- Verify final signed installation and screenshots, then complete App Store
-  review materials and distribution. The review's physical-device recording is
-  still required.
+Jarvis and the available iPads were reported unavailable by Xcode's device tools
+on October 6. The following required checks need connected physical devices:
 
-These are explicit acceptance requirements for this update, not additional
-features or claims that source inspection can settle.
+- Final signed iPhone/iPad installation, share/paste, speech and permissions,
+  VoiceOver, reduced motion/transparency, iPad split view, and actual background
+  expiration/relaunch.
+- Short/long mixed-content streaming while typing and scrolling in profile or
+  release mode, with physical frame timings and detached-scroll behavior.
+- Old/new app operation on two iCloud devices: divergent offline edits,
+  upgrade/restart/repeat migration, deletion, folders and branches, and direct
+  iCloud operation while using an Open WebUI account.
+- Final device screenshots and the physical-device recording requested by App
+  Review, followed by the App Store upload and review submission.
+
+No physical-device pass, App Store upload, or review submission is claimed.

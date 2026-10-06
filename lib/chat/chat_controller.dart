@@ -5264,6 +5264,7 @@ class ChatController extends ChangeNotifier {
       status: _transcriptStatus(message.status),
       canRetry: canRetry,
       canEdit: message.role == MessageRole.user,
+      retainsVersions: _conversations.graphEnabled,
       editRemovesLaterMessages:
           !_conversations.graphEnabled &&
           message.position < messages.last.position,

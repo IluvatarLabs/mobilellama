@@ -71,10 +71,13 @@ flutter drive --driver=test_driver/integration_test.dart \
 
 Opt-in live checks are in `test_driver/live_backend_test.dart`,
 `test_driver/live_webui_test.dart`, and
-`integration_test/live_shared_workflow_test.dart`. Read each file's required
+`integration_test/live_shared_workflow_test.dart`, and
+`integration_test/live_account_acceptance_test.dart`. Read each file's required
 environment/configuration fields before running. Use a disposable authenticated
 server account; these checks create conversations, folders, and uploaded files.
-Keep credentials outside the repository. Fixture tests, live-server checks, and
+The live account check requires a disposable Open WebUI instance with separate
+admin and A/B accounts. It exercises roles and permissions and restores them
+afterward. Keep credentials outside the repository. Fixture tests, live-server checks, and
 physical-device acceptance are separate evidence.
 
 ## Distribution

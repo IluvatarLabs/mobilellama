@@ -357,10 +357,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       // grow with the header's two lines so scaled text is never clipped.
       final shortScreen =
           media.size.height - media.viewInsets.bottom - media.padding.top < 480;
+      // AppBar caps title scaling at 1.34. Size its two-line title using that
+      // same scale; excess toolbar space otherwise clips the landscape editor.
+      final titleScaler = media.textScaler.clamp(maxScaleFactor: 1.34);
       final toolbarHeight = math.max(
         shortScreen ? 52.0 : 64.0,
-        media.textScaler.scale(16) * 1.3 +
-            media.textScaler.scale(12) * 1.35 +
+        titleScaler.scale(16) * 1.3 +
+            titleScaler.scale(12) * 1.35 +
             Design.space2,
       );
       return Scaffold(

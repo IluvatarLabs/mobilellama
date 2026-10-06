@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -7,8 +8,25 @@ import 'package:http/testing.dart';
 import 'package:mobollama/ollama/connection_options.dart';
 import 'package:mobollama/open_webui/client.dart';
 import 'package:mobollama/open_webui/run.dart';
+import 'package:mobollama/open_webui/socket.dart';
 
 import '../support/chat_fixture.dart';
+
+class _ReconnectingSocket extends WebUiSocket {
+  _ReconnectingSocket(super.session);
+  final feed = StreamController<bool>.broadcast();
+  @override
+  Stream<bool> get connections => feed.stream;
+  Future<void> reconnect() async {
+    feed.add(true);
+    await Future<void>.delayed(Duration.zero);
+  }
+  @override
+  void dispose() {
+    unawaited(feed.close());
+    super.dispose();
+  }
+}
 
 void main() {
   for (final loseAcknowledgment in [false, true]) {
@@ -20,6 +38,7 @@ void main() {
         addTearDown(fixture.close);
         var completionCount = 0;
         var taskRunning = false;
+        late _ReconnectingSocket socket;
         final nodes = <String, dynamic>{
           'prior': {
             'id': 'prior',
@@ -48,6 +67,8 @@ void main() {
                   'task_ids': taskRunning ? ['task'] : [],
                 };
               case '/team/api/chat/completions':
+                // A socket reconnect can race the first request's handoff.
+                await socket.reconnect();
                 completionCount++;
                 final body = jsonDecode(request.body) as Map;
                 expect(body['parent_id'], 'prior');
@@ -103,9 +124,12 @@ void main() {
         );
         final store = fixture.store.webUi;
         await store.unlock(session.capture());
+        socket = _ReconnectingSocket(session);
+        addTearDown(socket.dispose);
         final run = await WebUiRun.prepare(
           session: session,
           store: store,
+          socket: socket,
           chatId: 'chat',
           expectedParentId: 'prior',
           text: 'Continue',
@@ -115,6 +139,7 @@ void main() {
           (await store.intents(session.capture())).single['state'],
           'prepared',
         );
+        await socket.reconnect();
         await run.dispatch();
         expect(
           run.state,
@@ -130,11 +155,14 @@ void main() {
         final recovered = await WebUiRun.restore(
           session,
           store,
-          null,
+          socket,
           (await store.intents(session.capture())).single,
         );
         addTearDown(recovered.dispose);
-        await recovered.reconcile();
+        await socket.reconnect();
+        for (var attempt = 0; !recovered.terminal && attempt < 100; attempt++) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
         expect(recovered.state, WebUiRunState.completed);
         expect(recovered.partial, 'Authoritative outlet answer');
         expect(completionCount, 1);

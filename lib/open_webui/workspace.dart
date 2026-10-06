@@ -1176,6 +1176,7 @@ final class WebUiWorkspace extends ChangeNotifier {
                 : TranscriptRole.assistant,
             content: webUiMessageText(node),
             canEdit: canRevise && node['role'] == 'user',
+            retainsVersions: true,
             canRegenerate:
                 canRevise &&
                 node['role'] == 'assistant' &&
