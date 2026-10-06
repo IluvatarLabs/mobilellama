@@ -68,7 +68,7 @@ caches and temporary sessions are excluded from direct-chat synchronization.
 | Direct live server | Ollama 0.32.14, qwen2.5:3b: native chat, compatible Chat Completions, and Responses each complete two turns and preserve stopped partial output; Responses executes tools and preserves tool-bearing history through export/import and another tool-bearing turn | One real inference server/model; web-result content is a fixed fixture. Additional live gateway checks pass for bearer auth at a prefixed root, `api-key` plus API version/custom header, and a manual model with discovery unavailable |
 | Shared live server | Open WebUI 0.11.4: authenticated identity/socket, saved chat/context, regeneration and continuation from a retained version, drafts, folder move/delete-keeping-chat, file upload/processing/question, knowledge with an authenticated source, selected skill and configured tool execution with retained selections, export/local import, and temporary chat with exactly-once Save pass. Injected pre-dispatch loss causes no generation; lost acknowledgment reconciles with one dispatch; Stop retains partial output and pauses the queue | A disposable isolated instance using one model; configured image generation was unavailable; server image-output parsing/rendering has fixture coverage |
 | Native simulator workflows | iPhone and iPad app UI exercises shared sign-in/chat, retained versions, folders, temporary sessions, and supported diagrams; real desktop-to-native continuity and parameterized prompt insertion pass; actual-app light/dark/large-text screenshots captured | The live prompt test uses Flutter synthetic keyboard input. No physical share-sheet or performance claim |
-| Distribution | Signed 1.4.0 (7) archive and App Store IPA generated; host and extension signatures match their registered App Group | Final native installation/device checks remain pending; no upload or review submission |
+| Distribution | Signed 1.4.0 (7) archive and App Store IPA generated; host and extension signatures and profiles match their registered App Group. App Store Connect accepted the upload on October 6 and reported processing | Physical installation and review submission remain pending. The existing PDFium dependency lacks a matching dSYM; Apple accepted the upload with a symbolication warning |
 
 Open WebUI is pinned to source commit
 `8bd8b4fac5e059578ac0c74b3c18d11139f88b7d`; the tested official v0.11.4 image
@@ -146,6 +146,8 @@ on October 6. The following required checks need connected physical devices:
   upgrade/restart/repeat migration, deletion, folders and branches, and direct
   iCloud operation while using an Open WebUI account.
 - Final device screenshots and the physical-device recording requested by App
-  Review, followed by the App Store upload and review submission.
+  Review, followed by review submission.
 
-No physical-device pass, App Store upload, or review submission is claimed.
+Build 7 was uploaded successfully on October 6; Xcode reported that the package
+was processing. No completed TestFlight processing, physical-device pass, or
+review submission is claimed.
