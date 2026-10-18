@@ -34,6 +34,7 @@ void main() {
       f.secrets.values.containsKey(ProfileCredentials.legacyKey(a)),
       isFalse,
     );
+    await f.controller.acknowledgeDestination(a);
     final changed = a.copyWith(
       authentication: ServerAuthentication.apiKey,
       apiVersion: '2026-01-01',

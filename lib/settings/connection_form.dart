@@ -6,6 +6,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../chat/chat_controller.dart';
 import '../data/settings_store.dart';
 import '../ui/design.dart';
+import 'ai_data_consent.dart';
 
 /// Shown before chat content is first sent to a server.
 const destinationDisclosure =
@@ -47,35 +48,7 @@ Future<bool> confirmServerDestination(
   ServerProfile profile,
 ) async {
   if (controller.isDestinationAcknowledged(profile)) return true;
-  final accepted = await showDialog<bool>(
-    context: context,
-    builder: (dialogContext) => AlertDialog(
-      title: Text('Connect to “${profile.name}”?'),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          const Text(destinationDisclosure),
-          const SizedBox(height: Design.space3),
-          SelectableText(
-            profile.baseUrl,
-            style: const TextStyle(fontWeight: FontWeight.w600),
-          ),
-        ],
-      ),
-      actions: <Widget>[
-        TextButton(
-          onPressed: () => Navigator.pop(dialogContext, false),
-          child: const Text('Cancel'),
-        ),
-        FilledButton(
-          onPressed: () => Navigator.pop(dialogContext, true),
-          child: const Text('Connect'),
-        ),
-      ],
-    ),
-  );
-  if (accepted != true) return false;
+  if (!await showAiDataConsent(context, profile)) return false;
   return controller.acknowledgeDestination(profile);
 }
 
@@ -251,6 +224,7 @@ class _ConnectionFormPageState extends State<ConnectionFormPage> {
     required bool connect,
     bool confirmAddressChange = false,
   }) async {
+    if (_busy != null) return;
     FocusManager.instance.primaryFocus?.unfocus();
     final profile = _buildProfile();
     if (profile == null) return;
@@ -258,6 +232,12 @@ class _ConnectionFormPageState extends State<ConnectionFormPage> {
       _busy = connect ? _Busy.connect : _Busy.save;
       _notice = null;
     });
+    if (connect &&
+        !await confirmServerDestination(context, _controller, profile)) {
+      if (mounted) setState(() => _busy = null);
+      return;
+    }
+    if (!mounted) return;
     ProfileSaveResult result;
     try {
       result = connect
@@ -334,6 +314,7 @@ class _ConnectionFormPageState extends State<ConnectionFormPage> {
   }
 
   Future<void> _test() async {
+    if (_busy != null) return;
     FocusManager.instance.primaryFocus?.unfocus();
     final profile = _buildProfile();
     if (profile == null) return;
@@ -341,6 +322,11 @@ class _ConnectionFormPageState extends State<ConnectionFormPage> {
       _busy = _Busy.test;
       _notice = null;
     });
+    if (!await confirmServerDestination(context, _controller, profile)) {
+      if (mounted) setState(() => _busy = null);
+      return;
+    }
+    if (!mounted) return;
     final result = await _controller.testConnection(
       profile,
       serverApiKey: _enteredKey,

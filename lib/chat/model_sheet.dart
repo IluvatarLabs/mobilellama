@@ -107,6 +107,12 @@ Future<void> showModelSheet(
                       onTap: busy
                           ? null
                           : () async {
+                              if (!await confirmServerDestination(
+                                context,
+                                controller,
+                                profile,
+                              ))
+                                return;
                               if (await controller.connectConversation()) {
                                 unawaited(
                                   controller.loadModelCapabilities(

@@ -326,6 +326,10 @@ void main() {
     () async {
       final f = ChatFixture();
       await f.open();
+      await f.settings.acknowledgeDestination(
+        ServerProtocol.openAiCompatible,
+        'https://compatible.test/v1',
+      );
       addTearDown(f.close);
       await f.controller.initialize();
       expect(
@@ -688,6 +692,7 @@ void main() {
         protocol: ServerProtocol.openAiCompatible,
         baseUrl: 'https://a.test/v1',
       );
+      await f.controller.acknowledgeDestination(a);
       await f.controller.saveAndConnectServerProfile(a, serverApiKey: 'key-a');
       expect(await f.controller.send('On A'), isTrue);
       final chatId = f.controller.conversation!.id;

@@ -212,7 +212,8 @@ class SettingsStore {
   static const _legacyServerProtocolKey = 'server_protocol';
   static const _legacyInsecureLanAcknowledgedOriginKey =
       'insecure_lan_acknowledged_origin';
-  static const _acknowledgedDestinationsKey = 'acknowledged_destinations_v1';
+  // v1 recorded a passive disclosure. It is not explicit AI-sharing consent.
+  static const _acknowledgedDestinationsKey = 'ai_data_sharing_consent_v2';
   static const _themeKey = 'theme';
   static const _webAgentEnabledKey = 'web_agent_enabled';
 
@@ -302,6 +303,15 @@ class SettingsStore {
   Future<void> acknowledgeDestination(ServerProtocol protocol, String baseUrl) {
     final values = _acknowledgedDestinations
       ..add(_destinationKey(protocol, baseUrl));
+    return _preferences.setString(
+      _acknowledgedDestinationsKey,
+      jsonEncode(values.toList()..sort()),
+    );
+  }
+
+  Future<void> revokeDestination(ServerProtocol protocol, String baseUrl) {
+    final values = _acknowledgedDestinations
+      ..remove(_destinationKey(protocol, baseUrl));
     return _preferences.setString(
       _acknowledgedDestinationsKey,
       jsonEncode(values.toList()..sort()),

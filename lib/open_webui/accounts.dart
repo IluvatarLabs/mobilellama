@@ -32,6 +32,14 @@ final class WebUiAccounts {
     if (profile.protocol != ServerProtocol.openWebUi) {
       throw ArgumentError('Shared account profile required.');
     }
+    if (!settings.isDestinationAcknowledged(
+      profile.protocol,
+      profile.baseUrl,
+    )) {
+      throw const WebUiException(
+        'Allow AI data sharing before connecting to this server.',
+      );
+    }
     await prepareConnection?.call(profile);
     final previous = settings
         .listProfiles()
@@ -68,7 +76,6 @@ final class WebUiAccounts {
       await store.unlock(session.capture());
       await credentials.write(profile, client.options);
       await settings.upsertProfile(profile);
-      await settings.acknowledgeDestination(profile.protocol, profile.baseUrl);
       await (await WebUiFiles.create()).reclaimAbandoned(
         session.capture(),
         await store.stagedReferences(session.capture()),
@@ -87,6 +94,13 @@ final class WebUiAccounts {
   }
 
   Future<void> forgetStoredAccount(String profileId) async {
+    final profile = settings
+        .listProfiles()
+        .where((value) => value.id == profileId)
+        .firstOrNull;
+    if (profile != null) {
+      await settings.revokeDestination(profile.protocol, profile.baseUrl);
+    }
     final binding = await store.binding(profileId);
     for (final id in await store.boundProfiles(profileId)) {
       await credentials.store.delete(ProfileCredentials.key(id));

@@ -3,6 +3,7 @@ import 'package:uuid/uuid.dart';
 
 import '../chat/chat_controller.dart' show insecureHttpHostAllowed;
 import '../data/settings_store.dart';
+import '../settings/ai_data_consent.dart';
 import '../ui/design.dart';
 import 'accounts.dart';
 import 'client.dart';
@@ -57,6 +58,31 @@ class _WebUiAccountsPageState extends State<WebUiAccountsPage> {
         _opening = profile.id;
         _error = null;
       });
+      if (!widget.accounts.settings.isDestinationAcknowledged(
+        profile.protocol,
+        profile.baseUrl,
+      )) {
+        try {
+          final allowed = await showAiDataConsent(context, profile);
+          if (!mounted) return;
+          if (!allowed) {
+            setState(() => _opening = null);
+            return;
+          }
+          await widget.accounts.settings.acknowledgeDestination(
+            profile.protocol,
+            profile.baseUrl,
+          );
+        } on Object {
+          if (mounted) {
+            setState(() {
+              _opening = null;
+              _error = 'Data-sharing permission could not be saved. Try again.';
+            });
+          }
+          return;
+        }
+      }
       try {
         session = await widget.accounts.open(profile);
       } on Object {
@@ -234,6 +260,17 @@ class _WebUiSignInPageState extends State<WebUiSignInPage> {
         headerNames: headers.keys.toList(),
         acknowledgedInsecureOrigin: _httpAcknowledged ? root.origin : null,
       );
+      if (!widget.accounts.settings.isDestinationAcknowledged(
+        profile.protocol,
+        profile.baseUrl,
+      )) {
+        final allowed = await showAiDataConsent(context, profile);
+        if (!mounted || !allowed) return;
+        await widget.accounts.settings.acknowledgeDestination(
+          profile.protocol,
+          profile.baseUrl,
+        );
+      }
       final session = await widget.accounts.open(
         profile,
         email: _keyMode ? null : _email.text,

@@ -1,7 +1,7 @@
 name: mobollama
 description: A focused mobile agent client for Ollama.
 publish_to: none
-version: 1.4.0+7
+version: 1.4.0+8
 
 environment:
   sdk: ^3.13.2

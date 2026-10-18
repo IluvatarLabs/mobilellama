@@ -29,6 +29,7 @@ class ChatFixture {
   /// Holds unary requests to a host until the completer completes.
   final holds = <String, Completer<void>>{};
   final requests = <Map<String, dynamic>>[];
+  final networkRequests = <Uri>[];
   List<String> Function(Map<String, dynamic>)? compatibleFrames;
   final models = ['qwen3:4b', 'gemma3:4b'];
   bool holdResponse = false;
@@ -69,6 +70,10 @@ class ChatFixture {
       ),
     );
     await settings.setActiveProfile('home');
+    // Existing workflow fixtures represent connections the user has allowed.
+    for (final profile in settings.listProfiles()) {
+      await settings.acknowledgeDestination(profile.protocol, profile.baseUrl);
+    }
     createController();
   }
 
@@ -85,6 +90,7 @@ class ChatFixture {
       ollamaClientFactory: (url) => OllamaClient(
         baseUrl: url,
         client: MockClient((request) async {
+          networkRequests.add(request.url);
           await holds[request.url.host]?.future;
           if (failedHosts.contains(request.url.host)) {
             throw http.ClientException('Server unavailable');
@@ -126,8 +132,9 @@ class ChatFixture {
       openAiCompatibleClientFactory: (url, key) => OpenAiCompatibleClient(
         baseUrl: url,
         apiKey: key,
-        client: MockClient(
-          (request) async => http.Response(
+        client: MockClient((request) async {
+          networkRequests.add(request.url);
+          return http.Response(
             jsonEncode({
               'data': [
                 {
@@ -137,8 +144,8 @@ class ChatFixture {
               ],
             }),
             200,
-          ),
-        ),
+          );
+        }),
         streamingClientFactory: () => _CompatibleResponseClient(this),
       ),
     );
@@ -190,6 +197,7 @@ class _ResponseClient extends http.BaseClient {
   final _events = StreamController<List<int>>();
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    fixture.networkRequests.add(request.url);
     final body = jsonDecode(
       await request.finalize().bytesToString(),
     ) as Map<String, dynamic>;
@@ -256,6 +264,7 @@ class _CompatibleResponseClient extends http.BaseClient {
   final ChatFixture fixture;
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    fixture.networkRequests.add(request.url);
     final body = jsonDecode(
       await request.finalize().bytesToString(),
     ) as Map<String, dynamic>;

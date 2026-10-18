@@ -828,6 +828,14 @@ class ChatController extends ChangeNotifier {
     }
   }
 
+  void _requireDestinationConsent(ServerProfile profile) {
+    if (!isDestinationAcknowledged(profile)) {
+      throw const FormatException(
+        'Allow AI data sharing for this server before connecting.',
+      );
+    }
+  }
+
   /// Records that the user accepted sending chat content to this exact
   /// protocol and canonical endpoint. A changed destination needs it again.
   Future<bool> acknowledgeDestination(ServerProfile profile) async {
@@ -845,6 +853,24 @@ class ChatController extends ChangeNotifier {
     } finally {
       notifyListeners();
     }
+  }
+
+  Future<void> revokeDestination(ServerProfile profile) async {
+    await _settingsStore.revokeDestination(profile.protocol, profile.baseUrl);
+    final affected = profiles
+        .where(
+          (p) => p.protocol == profile.protocol && p.baseUrl == profile.baseUrl,
+        )
+        .toList();
+    for (final item in affected) {
+      _invalidateEndpoint(item.id, preserveModels: true);
+    }
+    for (final run in _runs.values.toList()) {
+      if (affected.any((p) => p.id == run.configuration.profile.id)) {
+        await _stopRun(run);
+      }
+    }
+    notifyListeners();
   }
 
   int _generationOf(String profileId) => _endpointGenerations[profileId] ?? 0;
@@ -1758,8 +1784,8 @@ class ChatController extends ChangeNotifier {
     }
   }
 
-  /// Save and connect: saves locally, records acknowledgement of this
-  /// destination, optionally makes it the new-chat destination, then checks
+  /// Save and connect: saves locally, optionally makes it the new-chat
+  /// destination, then checks
   /// the connection. A failed connection never rolls back the saved profile.
   Future<ProfileSaveResult> saveAndConnectServerProfile(
     ServerProfile profile, {
@@ -1777,7 +1803,6 @@ class ChatController extends ChangeNotifier {
     );
     if (!save.saved) return save;
     final saved = _profileById(profile.id)!;
-    await acknowledgeDestination(saved);
     if (makeActive &&
         saved.id != activeProfileId &&
         !await _activateProfileLocally(
@@ -2014,6 +2039,7 @@ class ChatController extends ChangeNotifier {
   }) async {
     final profile = _profileById(profileId);
     if (profile == null || !profile.configured) return false;
+    if (!isDestinationAcknowledged(profile)) return false;
     final probe = await _checkProfile(profile);
     if (probe == null) return false;
     if (stillWanted != null && !stillWanted()) return true;
@@ -2115,6 +2141,7 @@ class ChatController extends ChangeNotifier {
     final normalized = profile.copyWith(
       baseUrl: _canonicalServerBaseUrl(profile.protocol, profile.baseUrl),
     );
+    _requireDestinationConsent(normalized);
     final uri = Uri.parse(normalized.baseUrl);
     if (uri.scheme == 'http') {
       _validateTransport(normalized);
@@ -2127,6 +2154,7 @@ class ChatController extends ChangeNotifier {
     final options = await ProfileCredentials(
       _secrets,
     ).options(normalized, apiKey: serverApiKey, customHeaders: customHeaders);
+    _requireDestinationConsent(normalized);
     switch (normalized.protocol) {
       case ServerProtocol.openWebUi:
         throw const WebUiException('Open this connection from Shared chats.');
@@ -2134,6 +2162,7 @@ class ChatController extends ChangeNotifier {
         final client = _ollamaClientFactory(normalized.baseUrl)
             .withConnectionOptions(options);
         final version = await client.getVersion();
+        _requireDestinationConsent(normalized);
         final models = await client.listModels();
         return _ServerProbe(
           profile: normalized,
@@ -4372,6 +4401,11 @@ class ChatController extends ChangeNotifier {
       return;
     }
     try {
+      if (!isDestinationAcknowledged(config.profile)) {
+        throw const FormatException(
+          'AI data sharing is not allowed for this server. Connect again to review permission.',
+        );
+      }
       await _backgroundExecution.begin(
         run.id,
         onExpiration: () => _stopRun(

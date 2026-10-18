@@ -575,6 +575,25 @@ class _SettingsSheetState extends State<SettingsSheet> {
                       icon: const Icon(Icons.delete_outline),
                       label: const Text('Delete'),
                     ),
+                    if (controller.isDestinationAcknowledged(selected))
+                      TextButton.icon(
+                        onPressed: _serverBusy
+                            ? null
+                            : () async {
+                                try {
+                                  await controller.revokeDestination(selected);
+                                  _showMessage(
+                                    'AI data sharing withdrawn. Saved chats are still on this device.',
+                                  );
+                                } on Object {
+                                  _showMessage(
+                                    'Permission could not be withdrawn. Try again.',
+                                  );
+                                }
+                              },
+                        icon: const Icon(Icons.privacy_tip_outlined),
+                        label: const Text('Withdraw AI data sharing'),
+                      ),
                   ],
                 ),
               ],

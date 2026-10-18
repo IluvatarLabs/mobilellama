@@ -75,6 +75,7 @@ void main() {
     restored.compatibleFrames = frames;
     for (final fixture in [source, restored]) {
       await fixture.controller.initialize();
+      await fixture.controller.acknowledgeDestination(profile);
       expect(
         (await fixture.controller.saveAndConnectServerProfile(profile))
             .connection!

@@ -656,7 +656,15 @@ class _ChatBody extends StatelessWidget {
     return failure;
   }
 
-  Future<void> _connect() => controller.connectConversation();
+  Future<void> _connect(BuildContext context) async {
+    if (await confirmServerDestination(
+      context,
+      controller,
+      controller.conversationProfile,
+    )) {
+      await controller.connectConversation();
+    }
+  }
 
   Future<void> _runAction(
     BuildContext context,
@@ -665,7 +673,7 @@ class _ChatBody extends StatelessWidget {
   ) async {
     switch (action) {
       case ChatRecoveryAction.retryConnection:
-        await controller.connectConversation();
+        await _connect(context);
       case ChatRecoveryAction.editConnection:
         await onEditConnection();
       case ChatRecoveryAction.openSystemSettings:
@@ -874,7 +882,7 @@ class _ChatBody extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: Design.gutter),
           child: TextButton(
             onPressed: controller.canChangeContext && !_checking
-                ? _connect
+                ? () => _connect(context)
                 : null,
             child: Text(
               _checking
