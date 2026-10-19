@@ -57,7 +57,7 @@ void main() {
     await f.store.migrate(fromVersion: 3, legacyServerProfileId: 'home');
     expect(
       (await f.database.rawQuery('SELECT * FROM messages ORDER BY id'))
-          .map((row) => {...row}..remove('documents_json'))
+          .map((row) => {for (final key in before.first.keys) key: row[key]})
           .toList(),
       before,
     );
@@ -435,39 +435,42 @@ void main() {
     },
   );
 
-  test('streaming allows navigation and Stop retains a retryable partial response', () async {
-    final f = ChatFixture();
-    await f.open();
-    addTearDown(f.close);
-    await f.controller.initialize();
-    f.holdResponse = true;
-    final sent = f.controller.send('A long answer');
-    for (var i = 0; i < 200 && !f.controller.isStreaming; i++) {
-      await Future<void>.delayed(const Duration(milliseconds: 5));
-    }
-    expect(f.controller.isStreaming, isTrue);
-    final id = f.controller.conversation!.id;
-    expect(await f.controller.selectModel('gemma3:4b'), isFalse);
-    expect(await f.controller.switchServerProfile('lab'), isTrue);
-    await f.controller.newConversation();
-    expect(f.controller.conversation, isNull);
-    expect(f.controller.isConversationRunning(id), isTrue);
-    await f.controller.openConversation(id);
-    expect(f.controller.conversation!.id, id);
-    await f.controller.stop();
-    expect(f.controller.canChangeContext, isTrue);
-    expect(await sent, isTrue);
-    expect(f.controller.messages.last.status, MessageStatus.interrupted);
-    expect(f.controller.messages.last.content, isNotEmpty);
-    final failedId = f.controller.messages.last.id;
-    f.holdResponse = false;
-    await f.controller.retryAssistant(failedId);
-    expect(f.controller.messages, hasLength(2));
-    expect(f.controller.messages.last.status, MessageStatus.complete);
-    final count = f.requests.length;
-    await f.controller.retryAssistant(f.controller.messages.last.id);
-    expect(f.requests, hasLength(count));
-  });
+  test(
+    'streaming allows navigation and Stop retains a retryable partial response',
+    () async {
+      final f = ChatFixture();
+      await f.open();
+      addTearDown(f.close);
+      await f.controller.initialize();
+      f.holdResponse = true;
+      final sent = f.controller.send('A long answer');
+      for (var i = 0; i < 200 && !f.controller.isStreaming; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(f.controller.isStreaming, isTrue);
+      final id = f.controller.conversation!.id;
+      expect(await f.controller.selectModel('gemma3:4b'), isFalse);
+      expect(await f.controller.switchServerProfile('lab'), isTrue);
+      await f.controller.newConversation();
+      expect(f.controller.conversation, isNull);
+      expect(f.controller.isConversationRunning(id), isTrue);
+      await f.controller.openConversation(id);
+      expect(f.controller.conversation!.id, id);
+      await f.controller.stop();
+      expect(f.controller.canChangeContext, isTrue);
+      expect(await sent, isTrue);
+      expect(f.controller.messages.last.status, MessageStatus.interrupted);
+      expect(f.controller.messages.last.content, isNotEmpty);
+      final failedId = f.controller.messages.last.id;
+      f.holdResponse = false;
+      await f.controller.retryAssistant(failedId);
+      expect(f.controller.messages, hasLength(2));
+      expect(f.controller.messages.last.status, MessageStatus.complete);
+      final count = f.requests.length;
+      await f.controller.retryAssistant(f.controller.messages.last.id);
+      expect(f.requests, hasLength(count));
+    },
+  );
 
   test('Web Agent preference survives an incompatible model and only runs when effective', () async {
     final f = ChatFixture();
@@ -579,7 +582,7 @@ void main() {
         id: 'retry-assistant',
         conversationId: 'retry-chat',
         role: MessageRole.assistant,
-        status: MessageStatus.interrupted,
+        status: MessageStatus.streaming,
         content: 'Saved partial',
         reasoning: 'Saved thinking',
         toolCalls: const <ToolCall>[
@@ -595,6 +598,7 @@ void main() {
       );
       await f.store.updateMessage(
         partial.copyWith(
+          status: MessageStatus.interrupted,
           providerTranscriptJson:
               '[{"role":"assistant","content":"Saved partial"}]',
         ),

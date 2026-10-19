@@ -95,6 +95,38 @@ class _SettingsPageState extends State<SettingsPage> {
         showChatError(context, controller);
         return;
       }
+      final inspection = controller.inspectBackup(json);
+      String? localDestination;
+      if (inspection.requiresLocalDestination) {
+        localDestination = await showModalBottomSheet<String>(
+          context: context,
+          useSafeArea: true,
+          builder: (context) => ListView(
+            shrinkWrap: true,
+            children: [
+              const ListTile(
+                title: Text('Local copy destination'),
+                subtitle: Text(
+                  'Choose the direct connection used if you continue this snapshot. Import does not send anything or create a server chat. Private sources remain unavailable.',
+                ),
+              ),
+              for (final profile in controller.profiles)
+                ListTile(
+                  title: Text(profile.name),
+                  subtitle: Text(profile.baseUrl),
+                  onTap: () => Navigator.pop(context, profile.id),
+                ),
+              if (controller.profiles.isEmpty)
+                const ListTile(
+                  title: Text(
+                    'Add a direct connection before importing this snapshot.',
+                  ),
+                ),
+            ],
+          ),
+        );
+        if (localDestination == null || !context.mounted) return;
+      }
       final confirmed = await showDialog<bool>(
         context: context,
         builder: (context) => AlertDialog(
@@ -120,7 +152,10 @@ class _SettingsPageState extends State<SettingsPage> {
         return;
       }
       setState(() => _dataAction = 'Importing chats…');
-      final count = await controller.importBackup(json);
+      final count = await controller.importBackup(
+        json,
+        localDestinationId: localDestination,
+      );
       if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(

@@ -11,13 +11,21 @@ final class ChatSyncState {
     this.pending = 0,
     this.lastSync,
     this.error,
+    this.migrationPending = false,
+    this.inventoryReady = false,
+    this.accountScope = '',
   });
+  final String accountScope;
+  final bool migrationPending, inventoryReady;
   final bool supported;
   final bool enabled;
   final int pending;
   final String? lastSync;
   final String? error;
   factory ChatSyncState.fromMap(Map<Object?, Object?> value) => ChatSyncState(
+    accountScope: value['accountScope'] as String? ?? '',
+    migrationPending: value['migrationPending'] == true,
+    inventoryReady: value['inventoryReady'] == true,
     supported: value['supported'] == true,
     enabled: value['enabled'] == true,
     pending: value['pending'] as int? ?? 0,
@@ -33,13 +41,18 @@ final class ChatSyncChange {
     required this.deleted,
     required this.conflict,
     this.json,
+    this.source = 'current',
+    this.accountScope = '',
   });
+  final String source, accountScope;
   final String token;
   final String id;
   final String? json;
   final bool deleted;
   final bool conflict;
   factory ChatSyncChange.fromMap(Map<Object?, Object?> value) => ChatSyncChange(
+    source: value['source'] as String? ?? 'current',
+    accountScope: value['accountScope'] as String? ?? '',
     token: value['token']! as String,
     id: value['id']! as String,
     json: value['json'] as String?,
@@ -77,6 +90,8 @@ class ChatSyncBridge {
   Future<ChatSyncState> enable() => _state('enable');
   Future<ChatSyncState> disable() => _state('disable');
   Future<ChatSyncState> sync() => _state('sync');
+  Future<ChatSyncState> collectMigration() => _state('collectMigration');
+  Future<ChatSyncState> finishMigration() => _state('finishMigration');
   Future<void> put(String id, {String? json, bool deleted = false}) => _channel
       .invokeMethod<void>('put', {'id': id, 'json': json, 'deleted': deleted});
   Future<ChatSyncChange?> nextChange() async {
@@ -109,6 +124,7 @@ final class ChatSyncService extends ChangeNotifier {
     required this.hasReceipt,
     required this.loadBaseline,
     required this.saveBaseline,
+    this.adoptMigration,
   }) {
     source.addListener(_sourceChanged);
     bridge.onChanged = () => _schedule(force: true);
@@ -119,8 +135,9 @@ final class ChatSyncService extends ChangeNotifier {
   final String Function() revision;
   final void Function(bool) setContextBusy;
   final Future<Map<String, String>> Function() localVersions;
-  final Future<String> Function(String) exportChat;
+  final Future<String?> Function(String) exportChat;
   final Future<void> Function(ChatSyncChange) applyChange;
+  final Future<void> Function(ChatSyncChange)? adoptMigration;
   final Future<bool> Function(String) hasReceipt;
   final Map<String, String> Function() loadBaseline;
   final Future<void> Function(Map<String, String>) saveBaseline;
@@ -208,14 +225,40 @@ final class ChatSyncService extends ChangeNotifier {
     try {
       state = await bridge.status();
       if (!state.enabled) return;
+      while (state.migrationPending) {
+        if (adoptMigration == null) {
+          throw StateError('The history format upgrade is not ready.');
+        }
+        state = await bridge.collectMigration();
+        if (!state.inventoryReady) {
+          throw StateError(
+            'The complete iCloud inventory is not available yet.',
+          );
+        }
+        setContextBusy(true);
+        try {
+          while (true) {
+            final change = await bridge.nextChange();
+            if (change == null) break;
+            if (!await hasReceipt(change.token)) await adoptMigration!(change);
+            await bridge.acknowledge(change.token);
+          }
+          state = await bridge.finishMigration();
+          _baseline = {};
+          await saveBaseline({});
+        } finally {
+          setContextBusy(false);
+        }
+      }
       await _transferLocal();
       if (_networkRequested) {
         _networkRequested = false;
         state = await bridge.sync();
-        if (canRun())
+        if (canRun()) {
           await _transferLocal();
-        else
+        } else {
           _nativePending = true;
+        }
       }
       state = await bridge.status();
       error = state.error;
@@ -250,7 +293,8 @@ final class ChatSyncService extends ChangeNotifier {
       // copy if a newer incoming version has not yet been applied to SQLite.
       for (final entry in versions.entries) {
         if (_baseline[entry.key] == entry.value) continue;
-        await bridge.put(entry.key, json: await exportChat(entry.key));
+        final json = await exportChat(entry.key);
+        await bridge.put(entry.key, json: json, deleted: json == null);
         _baseline[entry.key] = entry.value;
       }
       for (final id in _baseline.keys.toList()) {
@@ -276,14 +320,16 @@ final class ChatSyncService extends ChangeNotifier {
   }
 
   Future<void> _recordApplied(ChatSyncChange change) async {
-    if (change.conflict)
+    if (change.conflict) {
       return; // A conflict copy is a new local chat to publish.
+    }
     final versions = await localVersions();
     final value = versions[change.id];
-    if (value == null)
+    if (value == null) {
       _baseline.remove(change.id);
-    else
+    } else {
       _baseline[change.id] = value;
+    }
     await saveBaseline(Map.of(_baseline));
   }
 

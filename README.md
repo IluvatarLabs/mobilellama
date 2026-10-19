@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Your models, from your phone.</strong><br />
-  A free, open-source chat client for Ollama and OpenAI-compatible servers.
+  A free, open-source chat client for Ollama, OpenAI-compatible servers, and Open WebUI.
 </p>
 
 <p align="center">
@@ -36,17 +36,20 @@ contributions are welcome.
 
 ## Features
 
-- Multiple servers and models, with separate settings for each chat
-- Streaming replies, edit and regenerate, and editable follow-up queues
-- Saved drafts and offline history with search, pinned chats, and archives
-- Images, PDF and text attachments, dictation, and read-aloud
-- Markdown, highlighted code, math, sharing, and chat backups
+- Multiple servers and models, flexible API roots and authentication, and Chat Completions or Responses
+- Streaming replies, retained answer versions, and editable follow-up queues
+- Saved drafts and offline history with search, pins, archives, and folders
+- Images, PDF and text attachments, iOS share intake, image paste, dictation, and read-aloud
+- Markdown, highlighted code, math, supported Mermaid diagrams, and portable backups
+- Optional Open WebUI accounts with shared history, server files, knowledge, prompts, skills, and configured tools
+- Separate temporary chats with an explicit Save action
 - Custom instructions, reusable presets, and light and dark themes
 
 ## Get started
 
-You'll need a reachable Ollama or OpenAI-compatible server. Models run on that
-server; MobileLlama is the client.
+You'll need a reachable Ollama, OpenAI-compatible, or Open WebUI server. Models
+run on that server; MobileLlama is the client. Direct connections do not require
+an Open WebUI account.
 
 To run from source, install Flutter with Dart 3.13.2 or later, Xcode, and
 CocoaPods on a Mac. Start an iOS simulator, then run:
@@ -63,8 +66,19 @@ For iPhone signing and other build options, see [Building](docs/building.md).
 In the app, tap **Connect a server**, choose the connection type, enter its URL
 and any required API key, tap **Save and connect**, then choose a model.
 Settings › Help & About has the same guidance offline. Ollama URLs usually look like `http://192.168.1.10:11434`;
-OpenAI-compatible URLs include `/v1`. Use your server's LAN address when
+OpenAI-compatible URLs use the API root provided by your service, often ending
+in `/v1`; deployment prefixes and other API roots are supported. For Open WebUI,
+use the server's root URL and an existing account or a permitted API key.
+Use your server's LAN address when
 connecting from a phone—`localhost` means the phone itself.
+
+Shared content is staged by the iOS extension. Open MobileLlama afterward to
+review its destination and editable draft before sending. Temporary chat omits
+local saved history until you choose Save; the selected server can still log
+requests. Open WebUI temporary sessions are text-only and require live events.
+
+See [update and validation notes](docs/update-validation.md) for tested server
+versions, migration behavior, and the remaining release checks.
 
 ## Contributing
 

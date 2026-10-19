@@ -29,6 +29,8 @@ class ChatFixture {
   /// Holds unary requests to a host until the completer completes.
   final holds = <String, Completer<void>>{};
   final requests = <Map<String, dynamic>>[];
+  final networkRequests = <Uri>[];
+  List<String> Function(Map<String, dynamic>)? compatibleFrames;
   final models = ['qwen3:4b', 'gemma3:4b'];
   bool holdResponse = false;
   int failNextResponses = 0;
@@ -68,6 +70,10 @@ class ChatFixture {
       ),
     );
     await settings.setActiveProfile('home');
+    // Existing workflow fixtures represent connections the user has allowed.
+    for (final profile in settings.listProfiles()) {
+      await settings.acknowledgeDestination(profile.protocol, profile.baseUrl);
+    }
     createController();
   }
 
@@ -84,6 +90,7 @@ class ChatFixture {
       ollamaClientFactory: (url) => OllamaClient(
         baseUrl: url,
         client: MockClient((request) async {
+          networkRequests.add(request.url);
           await holds[request.url.host]?.future;
           if (failedHosts.contains(request.url.host)) {
             throw http.ClientException('Server unavailable');
@@ -125,8 +132,9 @@ class ChatFixture {
       openAiCompatibleClientFactory: (url, key) => OpenAiCompatibleClient(
         baseUrl: url,
         apiKey: key,
-        client: MockClient(
-          (request) async => http.Response(
+        client: MockClient((request) async {
+          networkRequests.add(request.url);
+          return http.Response(
             jsonEncode({
               'data': [
                 {
@@ -136,8 +144,8 @@ class ChatFixture {
               ],
             }),
             200,
-          ),
-        ),
+          );
+        }),
         streamingClientFactory: () => _CompatibleResponseClient(this),
       ),
     );
@@ -189,6 +197,7 @@ class _ResponseClient extends http.BaseClient {
   final _events = StreamController<List<int>>();
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    fixture.networkRequests.add(request.url);
     final body = jsonDecode(
       await request.finalize().bytesToString(),
     ) as Map<String, dynamic>;
@@ -255,17 +264,20 @@ class _CompatibleResponseClient extends http.BaseClient {
   final ChatFixture fixture;
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    fixture.networkRequests.add(request.url);
     final body = jsonDecode(
       await request.finalize().bytesToString(),
     ) as Map<String, dynamic>;
     fixture.requests.add({...body, 'headers': request.headers});
-    final frames = [
-      'event: hermes.tool.progress\ndata: {"toolCallId":"remote-1","tool":"browser","label":"Read the page","status":"completed"}\n\n',
-      'data: {"choices":[{"index":0,"delta":{"reasoning_content":"Considered the image."},"finish_reason":null}]}\n\n',
-      'data: {"choices":[{"index":0,"delta":{"content":"An image answer."},"finish_reason":null}]}\n\n',
-      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
-      'data: [DONE]\n\n',
-    ];
+    final frames =
+        fixture.compatibleFrames?.call(body) ??
+        [
+          'event: hermes.tool.progress\ndata: {"toolCallId":"remote-1","tool":"browser","label":"Read the page","status":"completed"}\n\n',
+          'data: {"choices":[{"index":0,"delta":{"reasoning_content":"Considered the image."},"finish_reason":null}]}\n\n',
+          'data: {"choices":[{"index":0,"delta":{"content":"An image answer."},"finish_reason":null}]}\n\n',
+          'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+          'data: [DONE]\n\n',
+        ];
     return http.StreamedResponse(
       Stream.fromIterable(frames.map(utf8.encode)),
       200,
@@ -317,8 +329,10 @@ class TestImages implements ImageAttachmentStore {
     required String conversationId,
     required List<int> bytes,
     required String sourceName,
+    String? storageId,
   }) async {
-    final reference = 'image:$conversationId:${++_copies}:$sourceName';
+    final reference =
+        'image:$conversationId:${storageId ?? ++_copies}:$sourceName';
     bytesByReference[reference] = List.of(bytes);
     return reference;
   }
@@ -339,6 +353,7 @@ class TestImages implements ImageAttachmentStore {
   @override
   Future<void> deleteReference(String reference) async {
     deleted.add(reference);
+    bytesByReference.remove(reference);
   }
 
   @override

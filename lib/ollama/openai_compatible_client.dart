@@ -1,3 +1,5 @@
+import 'sse.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
@@ -5,10 +7,11 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 import 'ollama_client.dart';
+import 'connection_options.dart';
+import 'responses_codec.dart';
+import '../data/settings_store.dart' show CompatibleApi;
 
-/// Minimal OpenAI-compatible transport for servers whose API root ends in
-/// `/v1`. Authentication is optional because many local compatible servers do
-/// not require an API key.
+/// OpenAI-compatible transport rooted at the user's exact API deployment path.
 ///
 /// The injected unary client remains caller-owned. Every streaming client is
 /// request-scoped, must be fresh, and is closed by its [OllamaChatStream].
@@ -19,6 +22,7 @@ final class OpenAiCompatibleClient {
     required String baseUrl,
     required String apiKey,
     required http.Client client,
+    ConnectionOptions? connectionOptions,
     HttpClientFactory? streamingClientFactory,
     this.requestTimeout = const Duration(seconds: 15),
     this.streamIdleTimeout = const Duration(minutes: 2),
@@ -27,7 +31,8 @@ final class OpenAiCompatibleClient {
     this.maxSseLineBytes = 1024 * 1024,
     this.maxSseEventBytes = 1024 * 1024,
   }) : baseUri = normalizeBaseUrl(baseUrl),
-       _apiKey = apiKey.trim(),
+       connectionOptions =
+           connectionOptions ?? ConnectionOptions(apiKey: apiKey.trim()),
        _client = client,
        _streamingClientFactory = streamingClientFactory ?? http.Client.new {
     if (maxResponseBodyBytes < 1 ||
@@ -39,7 +44,22 @@ final class OpenAiCompatibleClient {
   }
 
   final Uri baseUri;
-  final String _apiKey;
+  final ConnectionOptions connectionOptions;
+
+  OpenAiCompatibleClient withConnectionOptions(ConnectionOptions options) =>
+      OpenAiCompatibleClient(
+        baseUrl: baseUri.toString(),
+        apiKey: options.apiKey,
+        client: _client,
+        connectionOptions: options,
+        streamingClientFactory: _streamingClientFactory,
+        requestTimeout: requestTimeout,
+        streamIdleTimeout: streamIdleTimeout,
+        maxResponseBodyBytes: maxResponseBodyBytes,
+        maxErrorBodyBytes: maxErrorBodyBytes,
+        maxSseLineBytes: maxSseLineBytes,
+        maxSseEventBytes: maxSseEventBytes,
+      );
   final http.Client _client;
   final HttpClientFactory _streamingClientFactory;
   final Duration requestTimeout;
@@ -73,13 +93,33 @@ final class OpenAiCompatibleClient {
     final segments = uri.pathSegments
         .where((segment) => segment.isNotEmpty)
         .toList(growable: false);
-    if (segments.isEmpty || segments.last != 'v1') {
+    if (uri.path.endsWith('/chat/completions') ||
+        uri.path.endsWith('/responses')) {
       throw FormatException(
-        'OpenAI-compatible base URL must end in /v1',
+        'Enter the API root, removing /chat/completions or /responses',
         value,
       );
     }
     return uri.replace(pathSegments: segments);
+  }
+
+  /// Verifies reachability without generating content or requiring discovery.
+  /// A missing root route still establishes reachability, not model support.
+  Future<void> probeReachability() async {
+    final request = http.Request('HEAD', _endpoint(''))
+      ..followRedirects = false
+      ..headers.addAll(_headers);
+    final response = await _client.send(request).timeout(requestTimeout);
+    await response.stream.drain<void>().timeout(requestTimeout);
+    if (!((response.statusCode >= 200 && response.statusCode < 300) ||
+        response.statusCode == 404 ||
+        response.statusCode == 405)) {
+      throw OllamaHttpException(
+        endpoint: request.url,
+        statusCode: response.statusCode,
+        body: 'Server reachability check failed.',
+      );
+    }
   }
 
   Future<List<String>> listModels() async {
@@ -170,23 +210,34 @@ final class OpenAiCompatibleClient {
     OllamaChatRequest chatRequest,
     _OpenAiCancellation cancellation,
   ) async* {
-    final endpoint = _endpoint('chat/completions');
+    final responses =
+        connectionOptions.compatibleApi == CompatibleApi.responses;
+    final endpoint = _endpoint(responses ? 'responses' : 'chat/completions');
     final options = chatRequest.validatedOptions;
     final request = http.Request('POST', endpoint)
+      ..followRedirects = false
       ..headers.addAll(_headers)
-      ..body = jsonEncode({
-        'model': chatRequest.model,
-        'messages': chatRequest.messages.map(_messageJson).toList(),
-        'stream': true,
-        if (chatRequest.tools.isNotEmpty)
-          'tools': chatRequest.tools.map((tool) => tool.toJson()).toList(),
-        if (chatRequest.think case final think?)
-          'reasoning_effort': think ? 'high' : 'none',
-        if (options['temperature'] case final value?) 'temperature': value,
-        if (options['seed'] case final value?) 'seed': value,
-        if (options['num_predict'] case final value?) 'max_tokens': value,
-        if (options['top_p'] case final value?) 'top_p': value,
-      });
+      ..body = jsonEncode(
+        responses
+            ? ResponsesCodec.request(chatRequest, _imageDataUrl)
+            : {
+                'model': chatRequest.model,
+                'messages': chatRequest.messages.map(_messageJson).toList(),
+                'stream': true,
+                if (chatRequest.tools.isNotEmpty)
+                  'tools': chatRequest.tools
+                      .map((tool) => tool.toJson())
+                      .toList(),
+                if (chatRequest.think case final think?)
+                  'reasoning_effort': think ? 'high' : 'none',
+                if (options['temperature'] case final value?)
+                  'temperature': value,
+                if (options['seed'] case final value?) 'seed': value,
+                if (options['num_predict'] case final value?)
+                  'max_tokens': value,
+                if (options['top_p'] case final value?) 'top_p': value,
+              },
+      );
 
     try {
       final response = await cancellation.client
@@ -210,11 +261,24 @@ final class OpenAiCompatibleClient {
       final events = response.stream
           .timeout(streamIdleTimeout)
           .transform(
-            _SseDataDecoder(
+            SseDataDecoder(
               maxLineBytes: maxSseLineBytes,
               maxEventBytes: maxSseEventBytes,
             ),
           );
+      if (responses) {
+        final codec = ResponsesCodec(chatRequest.model);
+        await for (final event in events) {
+          if (cancellation.isCancelled) throw const OllamaCancelledException();
+          if (event.data == '[DONE]') continue;
+          final chunk = codec.accept(
+            _object(jsonDecode(event.data), 'Responses event'),
+          );
+          if (chunk != null) yield chunk;
+        }
+        yield codec.finish();
+        return;
+      }
       OllamaChatChunk? terminalChunk;
       var sawDoneMarker = false;
       final toolCalls = _OpenAiToolCallCollector(
@@ -355,7 +419,7 @@ final class OpenAiCompatibleClient {
       yield terminalChunk;
     } on OllamaException {
       rethrow;
-    } on _SseLimitException catch (error) {
+    } on SseLimitException catch (error) {
       throw OllamaResponseTooLargeException(
         endpoint: endpoint,
         maxBytes: error.maxBytes,
@@ -391,6 +455,7 @@ final class OpenAiCompatibleClient {
   }
 
   Future<Map<String, dynamic>> _sendUnary(http.Request request) async {
+    request.followRedirects = false;
     final response = await _client.send(request).timeout(requestTimeout);
     final successful = response.statusCode >= 200 && response.statusCode < 300;
     final body = await _readBoundedBody(
@@ -469,10 +534,7 @@ final class OpenAiCompatibleClient {
     }
   }
 
-  Map<String, String> get _headers => {
-    if (_apiKey.isNotEmpty) 'Authorization': 'Bearer $_apiKey',
-    'Content-Type': 'application/json',
-  };
+  Map<String, String> get _headers => connectionOptions.headers;
 
   Map<String, dynamic> _messageJson(OllamaChatMessage message) {
     if (message.role == OllamaRole.tool) {
@@ -536,20 +598,11 @@ final class OpenAiCompatibleClient {
   }
 
   Uri _endpoint(String path) {
-    final pathSegments = path.split('/').where((part) => part.isNotEmpty);
-    return baseUri.replace(
-      pathSegments: [...baseUri.pathSegments, ...pathSegments],
-    );
+    return connectionOptions.endpoint(baseUri, path);
   }
 
   String _redactErrorBody(String raw) {
-    final withoutKey = _apiKey.isEmpty
-        ? raw
-        : raw.replaceAll(_apiKey, '[redacted]');
-    return withoutKey.replaceAll(
-      RegExp(r'bearer\s+\S+', caseSensitive: false),
-      'Bearer [redacted]',
-    );
+    return connectionOptions.redact(raw);
   }
 
   static String _reasoningDelta(Map<String, dynamic> delta) {
@@ -787,7 +840,7 @@ final class _OpenAiToolCallBuilder {
     if (rawArguments is String && rawArguments.isNotEmpty) {
       final bytes = utf8.encode(rawArguments).length;
       if (_argumentsBytes + bytes > maxArgumentsBytes) {
-        throw _SseLimitException('tool call arguments', maxArgumentsBytes);
+        throw SseLimitException('tool call arguments', maxArgumentsBytes);
       }
       _argumentsBytes += bytes;
       _arguments.write(rawArguments);
@@ -852,108 +905,6 @@ final class _OpenAiCancellation {
     _closed = true;
     client.close();
   }
-}
-
-final class _SseDataDecoder
-    extends StreamTransformerBase<List<int>, _SseDataEvent> {
-  const _SseDataDecoder({
-    required this.maxLineBytes,
-    required this.maxEventBytes,
-  });
-
-  final int maxLineBytes;
-  final int maxEventBytes;
-
-  @override
-  Stream<_SseDataEvent> bind(Stream<List<int>> stream) => _decode(stream);
-
-  Stream<_SseDataEvent> _decode(Stream<List<int>> stream) async* {
-    final lineBytes = <int>[];
-    final dataLines = <String>[];
-    var eventType = '';
-    var eventBytes = 0;
-
-    _SseDataEvent? consumeLine(List<int> bytes) {
-      final line = utf8.decode(bytes);
-      if (line.isEmpty) {
-        final event = dataLines.isEmpty
-            ? null
-            : _SseDataEvent(
-                type: eventType.isEmpty ? 'message' : eventType,
-                data: dataLines.join('\n'),
-              );
-        dataLines.clear();
-        eventType = '';
-        eventBytes = 0;
-        return event;
-      }
-      if (line.startsWith(':')) return null;
-
-      final colon = line.indexOf(':');
-      final field = colon < 0 ? line : line.substring(0, colon);
-      var value = colon < 0 ? '' : line.substring(colon + 1);
-      if (value.startsWith(' ')) value = value.substring(1);
-      if (field == 'event') {
-        eventType = value;
-        return null;
-      }
-      if (field != 'data') return null;
-      final addedBytes =
-          utf8.encode(value).length + (dataLines.isEmpty ? 0 : 1);
-      if (eventBytes + addedBytes > maxEventBytes) {
-        throw _SseLimitException('SSE event', maxEventBytes);
-      }
-      dataLines.add(value);
-      eventBytes += addedBytes;
-      return null;
-    }
-
-    await for (final chunk in stream) {
-      for (final byte in chunk) {
-        if (byte == 0x0a) {
-          final bytes = lineBytes.isNotEmpty && lineBytes.last == 0x0d
-              ? lineBytes.sublist(0, lineBytes.length - 1)
-              : List<int>.of(lineBytes);
-          lineBytes.clear();
-          final event = consumeLine(bytes);
-          if (event != null) yield event;
-          continue;
-        }
-        if (lineBytes.length >= maxLineBytes) {
-          throw _SseLimitException('SSE line', maxLineBytes);
-        }
-        lineBytes.add(byte);
-      }
-    }
-
-    if (lineBytes.isNotEmpty) {
-      final bytes = lineBytes.last == 0x0d
-          ? lineBytes.sublist(0, lineBytes.length - 1)
-          : List<int>.of(lineBytes);
-      final event = consumeLine(bytes);
-      if (event != null) yield event;
-    }
-    if (dataLines.isNotEmpty) {
-      yield _SseDataEvent(
-        type: eventType.isEmpty ? 'message' : eventType,
-        data: dataLines.join('\n'),
-      );
-    }
-  }
-}
-
-final class _SseDataEvent {
-  const _SseDataEvent({required this.type, required this.data});
-
-  final String type;
-  final String data;
-}
-
-final class _SseLimitException implements Exception {
-  const _SseLimitException(this.kind, this.maxBytes);
-
-  final String kind;
-  final int maxBytes;
 }
 
 Future<_OpenAiBoundedBody> _readBoundedBody(

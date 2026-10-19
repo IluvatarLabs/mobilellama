@@ -1,0 +1,29 @@
+MobileLlama 1.4.0 (8) — Review information
+
+PRIVACY CORRECTION (5.1.1 / 5.1.2)
+Build 8 adds explicit “Allow AI data sharing?” permission before any connection test, AI request, or Open WebUI sign-in. It identifies the connection name, service type, exact server URL and operator hostname; lists transmitted data and its purpose; explains operator/downstream processing; and links the privacy policy. “Don’t allow” sends nothing and retains entered details. Existing connections must consent again. Changed destinations require new permission. Direct users can withdraw in Settings > Connections > Withdraw AI data sharing; Shared chats users can sign out. Optional web search retains its separate permission.
+
+1. RECORDING AND ACCOUNTS
+The physical iPhone recording attached October 2 begins on the Home Screen, launches the app, connects, starts a chat, streams a reply, and sends a follow-up. It demonstrates the core flow; build 8 adds the permission step above. No MobileLlama account is created. Optional Open WebUI signs into an existing external account; its operator controls account creation/deletion. Sign Out removes local credentials and cached account data, not the external account/history. No public feed, user-to-user messaging, paid content, subscription, IAP, or advertising.
+
+2. PURPOSE / AUDIENCE
+A free, open-source iPhone/iPad client for the general public who use Ollama, OpenAI-compatible APIs, or Open WebUI. Streaming chat, searchable history, offline drafts, attachments, queues, share intake, dictation/read-aloud and optional private iCloud sync bring an existing model server to a phone. No model weights or hosted AI subscription are included.
+
+3. REVIEW SETUP
+Private review server (do not publish):
+Type: Ollama
+Server URL: [PRIVATE REVIEW URL — ENTERED ONLY IN APP STORE CONNECT]
+Model: qwen2.5:3b
+No username, password, or API key.
+Launch > Connect a server > name it Review > Ollama > paste the full URL > Save and connect. Inspect the disclosure; tap Don’t allow to verify the form remains. Tap Save and connect again > Allow data sharing > choose qwen2.5:3b. Send “Explain how a dictionary groups tasks by project, with a short Python example.” Test streaming, Stop, edit, regenerate and a queued follow-up. Reopen history offline. Withdraw permission in Settings > Connections, then Connect to see the disclosure again. No sample files required. The review model is text-only. Optional Open WebUI is not required for this core flow.
+
+4. SERVICES / PRIVACY
+Users choose the AI server and its operator; no hosted AI backend is bundled. Direct requests go to that address. Open WebUI may use downstream models/tools chosen by its administrator. The policy describes transmitted data, local storage, purpose, retention/deletion controls and independent operators; the app does not assume arbitrary operators have identical practices. Optional web search uses Ollama cloud with the user's key; optional sync uses private Apple CloudKit; dictation uses Apple Speech, read-aloud iOS voices; credentials use Keychain. No telemetry/advertising SDK. The review-only endpoint uses local Ollama/qwen2.5:3b behind Caddy and Cloudflare Tunnel, with no access logging. It was verified for discovery and a complete reply on October 18.
+
+5. REGIONS
+Availability is United States only. No regional feature switches. Results depend on the selected server/model and available speech languages/services.
+
+6. REGULATED / THIRD-PARTY MATERIAL
+General productivity client, not a regulated service. No bundled model weights or media catalog. Users supply servers, prompts and files. Dependency notices: Settings > Help & About > Open-source licenses.
+
+Privacy: https://github.com/IluvatarLabs/mobilellama/blob/main/PRIVACY.md

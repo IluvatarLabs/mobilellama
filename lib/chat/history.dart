@@ -180,11 +180,12 @@ class _ChatHistoryPageState extends State<ChatHistoryPage> {
     }
   }
 
-  Future<void> _open(Conversation chat) async {
+  Future<void> _open(Conversation chat, {String? messageId}) async {
     await widget.controller.openConversation(chat.id);
+    if (messageId != null) await widget.controller.viewVersion(messageId);
     if (!mounted) return;
     if (widget.controller.conversation?.id == chat.id) {
-      Navigator.pop(context, true);
+      Navigator.pop(context, _query.text.trim());
     } else {
       showChatError(context, widget.controller);
     }
@@ -356,7 +357,7 @@ class _ChatHistoryPageState extends State<ChatHistoryPage> {
                           chat: chat,
                           onPressed: () => _showActions(chat),
                         ),
-                        onTap: () => _open(chat),
+                        onTap: () => _open(chat, messageId: result.messageId),
                         onLongPress: () => _showActions(chat),
                       );
                     },

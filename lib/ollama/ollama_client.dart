@@ -1,3 +1,5 @@
+import '../domain/source_reference.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
@@ -5,6 +7,7 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 import 'ndjson_decoder.dart';
+import 'connection_options.dart';
 
 typedef HttpClientFactory = http.Client Function();
 typedef OllamaChatStarter = OllamaChatStream Function(
@@ -17,6 +20,7 @@ final class OllamaClient {
   OllamaClient({
     required String baseUrl,
     required http.Client client,
+    ConnectionOptions? connectionOptions,
     HttpClientFactory? streamingClientFactory,
     this.requestTimeout = const Duration(seconds: 15),
     this.streamIdleTimeout = const Duration(minutes: 2),
@@ -24,6 +28,7 @@ final class OllamaClient {
     this.maxErrorBodyBytes = 16 * 1024,
     this.maxNdjsonLineBytes = 1024 * 1024,
   }) : baseUri = normalizeBaseUrl(baseUrl),
+       connectionOptions = connectionOptions ?? ConnectionOptions(),
        _client = client,
        _streamingClientFactory = streamingClientFactory ?? http.Client.new {
     if (maxResponseBodyBytes < 1 ||
@@ -34,6 +39,19 @@ final class OllamaClient {
   }
 
   final Uri baseUri;
+  final ConnectionOptions connectionOptions;
+
+  OllamaClient withConnectionOptions(ConnectionOptions options) => OllamaClient(
+    baseUrl: baseUri.toString(),
+    client: _client,
+    connectionOptions: options,
+    streamingClientFactory: _streamingClientFactory,
+    requestTimeout: requestTimeout,
+    streamIdleTimeout: streamIdleTimeout,
+    maxResponseBodyBytes: maxResponseBodyBytes,
+    maxErrorBodyBytes: maxErrorBodyBytes,
+    maxNdjsonLineBytes: maxNdjsonLineBytes,
+  );
   final http.Client _client;
   final HttpClientFactory _streamingClientFactory;
   final Duration requestTimeout;
@@ -160,6 +178,8 @@ final class OllamaClient {
   ) async* {
     final endpoint = _endpoint('/api/chat');
     final request = http.Request('POST', endpoint)
+      ..followRedirects = false
+      ..headers.addAll(connectionOptions.headers)
       ..headers['Content-Type'] = 'application/json'
       ..body = jsonEncode(chatRequest.toJson()..['stream'] = true);
 
@@ -177,7 +197,7 @@ final class OllamaClient {
         throw OllamaHttpException(
           endpoint: endpoint,
           statusCode: response.statusCode,
-          body: body.text(allowMalformed: true),
+          body: connectionOptions.redact(body.text(allowMalformed: true)),
           bodyTruncated: body.truncated,
         );
       }
@@ -244,6 +264,8 @@ final class OllamaClient {
   ) async* {
     final endpoint = _endpoint('/api/pull');
     final request = http.Request('POST', endpoint)
+      ..followRedirects = false
+      ..headers.addAll(connectionOptions.headers)
       ..headers['Content-Type'] = 'application/json'
       ..body = jsonEncode({'model': model, 'stream': true});
 
@@ -261,7 +283,7 @@ final class OllamaClient {
         throw OllamaHttpException(
           endpoint: endpoint,
           statusCode: response.statusCode,
-          body: body.text(allowMalformed: true),
+          body: connectionOptions.redact(body.text(allowMalformed: true)),
           bodyTruncated: body.truncated,
         );
       }
@@ -359,6 +381,8 @@ final class OllamaClient {
     final endpoint = _endpoint(path);
     try {
       final request = http.Request('POST', endpoint)
+        ..followRedirects = false
+        ..headers.addAll(connectionOptions.headers)
         ..headers['Content-Type'] = 'application/json'
         ..body = jsonEncode(body);
       return await _sendUnary(request);
@@ -382,6 +406,8 @@ final class OllamaClient {
   }
 
   Future<_BoundedBody> _sendBounded(http.Request request) async {
+    request.followRedirects = false;
+    request.headers.addAll(connectionOptions.headers);
     final response = await _client.send(request).timeout(requestTimeout);
     final successful = response.statusCode >= 200 && response.statusCode < 300;
     final body = await _readBoundedBody(
@@ -392,7 +418,7 @@ final class OllamaClient {
       throw OllamaHttpException(
         endpoint: request.url,
         statusCode: response.statusCode,
-        body: body.text(allowMalformed: true),
+        body: connectionOptions.redact(body.text(allowMalformed: true)),
         bodyTruncated: body.truncated,
       );
     }
@@ -407,9 +433,7 @@ final class OllamaClient {
   }
 
   Uri _endpoint(String path) {
-    final baseSegments = baseUri.pathSegments.where((part) => part.isNotEmpty);
-    final pathSegments = path.split('/').where((part) => part.isNotEmpty);
-    return baseUri.replace(pathSegments: [...baseSegments, ...pathSegments]);
+    return connectionOptions.endpoint(baseUri, path);
   }
 
   static String _validatedManagedModelName(String model) {
@@ -547,6 +571,8 @@ final class OllamaChatMessage {
     this.toolCalls = const [],
     this.toolName,
     this.toolCallId,
+    this.providerItems = const [],
+    this.sources = const [],
   });
 
   final OllamaRole role;
@@ -556,6 +582,8 @@ final class OllamaChatMessage {
   final List<OllamaToolCall> toolCalls;
   final String? toolName;
   final String? toolCallId;
+  final List<Map<String, dynamic>> providerItems;
+  final List<SourceReference> sources;
 
   factory OllamaChatMessage.fromJson(Map<String, dynamic> json) {
     final roleName = json['role'] as String? ?? 'assistant';
@@ -572,6 +600,9 @@ final class OllamaChatMessage {
           .toList(growable: false),
       toolName: json['tool_name'] as String?,
       toolCallId: json['tool_call_id'] as String?,
+      providerItems: (json['provider_items'] as List? ?? const [])
+          .map((item) => Map<String, dynamic>.from(item as Map))
+          .toList(),
     );
   }
 
@@ -584,6 +615,9 @@ final class OllamaChatMessage {
       'tool_calls': toolCalls.map((call) => call.toJson()).toList(),
     if (toolName != null) 'tool_name': toolName,
     if (toolCallId != null) 'tool_call_id': toolCallId,
+    if (providerItems.isNotEmpty) 'provider_items': providerItems,
+    if (sources.isNotEmpty)
+      'source_references': sources.map((source) => source.toJson()).toList(),
   };
 }
 
@@ -667,7 +701,13 @@ final class OllamaChatRequest {
 
   Map<String, dynamic> toJson() => {
     'model': model,
-    'messages': messages.map((message) => message.toJson()).toList(),
+    'messages': messages
+        .map(
+          (message) => message.toJson()
+            ..remove('provider_items')
+            ..remove('source_references'),
+        )
+        .toList(),
     if (tools.isNotEmpty) 'tools': tools.map((tool) => tool.toJson()).toList(),
     if (think != null) 'think': think,
     if (validatedOptions.isNotEmpty) 'options': validatedOptions,
@@ -757,6 +797,7 @@ final class OllamaChatChunk {
     this.promptEvalCount,
     this.evalCount,
     this.toolProgress,
+    this.authoritativeContent,
   });
 
   final String model;
@@ -767,6 +808,7 @@ final class OllamaChatChunk {
   final int? promptEvalCount;
   final int? evalCount;
   final OllamaToolProgress? toolProgress;
+  final String? authoritativeContent;
 
   factory OllamaChatChunk.fromJson(Map<String, dynamic> json) {
     final createdAt = json['created_at'] as String?;

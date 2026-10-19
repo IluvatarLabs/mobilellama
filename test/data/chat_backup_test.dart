@@ -76,7 +76,7 @@ void main() {
       expect(encodedDocument, isNot(contains('reference')));
 
       final inspection = backup.inspectJson(json);
-      expect(inspection.version, 1);
+      expect(inspection.version, 2);
       expect(inspection.profiles.single.id, 'source-profile');
       expect(inspection.conversationCount, 1);
       expect(inspection.messageCount, 2);
@@ -445,6 +445,10 @@ void main() {
       final writesAfterApply = writes;
       final restartedStore = ConversationStore(
         SqfliteDatabaseAdapter(destination.database),
+      );
+      await restartedStore.migrate(
+        fromVersion: ConversationStore.schemaVersion,
+        legacyServerProfileId: 'destination-profile',
       );
       final repeated = await ChatBackup(restartedStore).applySyncedJson(
         json: json,
@@ -1102,7 +1106,7 @@ Future<void> _seedPopulatedConversation(
     id: 'source-assistant',
     conversationId: 'source-conversation',
     role: MessageRole.assistant,
-    status: MessageStatus.complete,
+    status: MessageStatus.streaming,
     content: 'Here is the evidence.',
     reasoning: 'Checked the stored evidence.',
     toolCalls: const <ToolCall>[
@@ -1127,6 +1131,7 @@ Future<void> _seedPopulatedConversation(
   ))!.messages.last;
   await store.updateMessage(
     assistant.copyWith(
+      status: MessageStatus.complete,
       providerTranscriptJson: jsonEncode(<Object?>[
         <String, Object?>{'role': 'assistant', 'content': 'Answer'},
       ]),

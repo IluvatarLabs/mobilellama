@@ -260,7 +260,8 @@ void main() {
       await tester.enterText(url, 'https://studio.test');
       await tester.pump();
       await tester.tap(find.text('Save and connect'));
-      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.tap(find.text('Allow data sharing'));
       await settle();
 
       expect(connected, isNull);

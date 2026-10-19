@@ -1,6 +1,8 @@
 import 'dart:convert';
 
 import '../domain/conversation.dart';
+import '../domain/chat_folder.dart';
+import '../domain/message_graph.dart';
 import '../domain/document_attachment.dart';
 import '../domain/generation_options.dart';
 import '../domain/message.dart';
@@ -39,18 +41,21 @@ final class BackupServerProfile {
     required this.name,
     required this.protocol,
     required this.baseUrl,
+    this.compatibleApi = 'chatCompletions',
   });
 
   final String id;
   final String name;
   final String protocol;
   final String baseUrl;
+  final String compatibleApi;
 
   Map<String, Object?> toJson() => <String, Object?>{
     'id': id,
     'name': name,
     'protocol': protocol,
     'baseUrl': baseUrl,
+    'compatibleApi': compatibleApi,
   };
 }
 
@@ -76,6 +81,8 @@ final class ChatBackupInspection {
   final int conversationCount;
   final int messageCount;
   final int attachmentCount;
+  bool get requiresLocalDestination =>
+      profiles.any((profile) => profile.protocol == 'localSnapshot');
 }
 
 final class ChatBackupImportResult {
@@ -110,7 +117,7 @@ final class ChatBackup {
   const ChatBackup(this._store, {this.limits = const ChatBackupLimits()});
 
   static const format = 'mobilellama-chat-backup';
-  static const version = 1;
+  static const version = 2;
 
   final ConversationStore _store;
   final ChatBackupLimits limits;
@@ -118,7 +125,7 @@ final class ChatBackup {
   ChatBackupInspection inspectJson(String source) {
     final parsed = _parse(source);
     return ChatBackupInspection(
-      version: version,
+      version: parsed.version,
       profiles: List<BackupServerProfile>.unmodifiable(parsed.profiles),
       conversationCount: parsed.conversations.length,
       messageCount: parsed.messageCount,
@@ -130,6 +137,7 @@ final class ChatBackup {
     required List<BackupServerProfile> serverProfiles,
     required BackupAttachmentReader readAttachment,
     Set<String>? conversationIds,
+    bool includeFolders = true,
   }) async {
     _validateLimits();
     final profiles = List<BackupServerProfile>.of(serverProfiles);
@@ -190,19 +198,20 @@ final class ChatBackup {
       final thread = await _store.openConversation(
         serverProfileId: conversation.serverProfileId,
         id: conversation.id,
+        allBranches: _store.graphEnabled,
       );
       if (thread == null) {
         throw StateError(
           'Conversation ${conversation.id} disappeared during export.',
         );
       }
-      messageCount += thread.messages.length;
+      messageCount += thread.allNodes.length;
       if (messageCount > limits.maxMessages) {
         throw StateError('Too many messages to export.');
       }
 
       final messages = <Map<String, Object?>>[];
-      for (final message in thread.messages) {
+      for (final message in thread.allNodes) {
         final providerTranscript = message.providerTranscriptJson;
         if (providerTranscript != null) {
           _validateProviderTranscript(
@@ -262,6 +271,10 @@ final class ChatBackup {
         messages.add(<String, Object?>{
           'id': message.id,
           'position': message.position,
+          if (_store.graphEnabled) ...{
+            'parentId': message.parentId,
+            'siblingOrder': message.siblingOrder,
+          },
           'role': message.role.name,
           'status': message.status.name,
           'content': message.content,
@@ -287,6 +300,13 @@ final class ChatBackup {
         'isRenamed': conversation.isRenamed,
         'selectedModel': conversation.selectedModel,
         'systemPrompt': conversation.systemPrompt,
+        if (_store.graphEnabled) ...{
+          'activeTipId': conversation.activeTipId,
+          'folderId': conversation.folderId,
+          'instructionSource': conversation.instructionSource,
+          'instructionSourceId': conversation.instructionSourceId,
+          'instructionSourceRevision': conversation.instructionSourceRevision,
+        },
         'generationOptions': conversation.generationOptions.toOllamaJson(),
         'createdAt': conversation.createdAt.toUtc().toIso8601String(),
         'updatedAt': conversation.updatedAt.toUtc().toIso8601String(),
@@ -296,7 +316,14 @@ final class ChatBackup {
 
     final source = const JsonEncoder.withIndent('  ').convert(<String, Object?>{
       'format': format,
-      'version': version,
+      'version': _store.graphEnabled ? version : 1,
+      if (_store.graphEnabled)
+        'folders':
+            (includeFolders
+                    ? await _store.folders(includeDeleted: true)
+                    : <ChatFolder>[])
+                .map((folder) => folder.toJson())
+                .toList(),
       'exportedAt': DateTime.now().toUtc().toIso8601String(),
       'serverProfiles': profiles.map((profile) => profile.toJson()).toList(),
       'conversations': encodedConversations,
@@ -315,6 +342,11 @@ final class ChatBackup {
     required BackupIdAllocator allocateId,
     required BackupAttachmentWriter writeAttachment,
     required BackupAttachmentCleanup deleteAttachment,
+    Future<Map<String, Map<String, Object?>>> Function(
+      Map<String, String> conversationIds,
+      Map<String, String> messageIds,
+    )?
+    prepareDrafts,
   }) async {
     final parsed = _parse(json);
     _validateServerProfileMappings(parsed, serverProfileMappings);
@@ -331,6 +363,23 @@ final class ChatBackup {
       return id;
     }
 
+    if (parsed.version >= 2 && !_store.graphEnabled) {
+      throw const FormatException(
+        'Complete the history format upgrade before importing version 2.',
+      );
+    }
+    final folderIds = <String, String>{
+      for (final folder in parsed.folders) folder.id: nextId('folder'),
+    };
+    for (final chat in parsed.conversations) {
+      for (final id in [
+        chat.conversation.folderId,
+        if (chat.conversation.instructionSource == 'folderSnapshot')
+          chat.conversation.instructionSourceId,
+      ]) {
+        if (id != null) folderIds.putIfAbsent(id, () => nextId('folder'));
+      }
+    }
     final conversationIds = <String, String>{};
     final messageIds = <String, String>{};
     final toolCallIds = <String, String>{};
@@ -363,6 +412,7 @@ final class ChatBackup {
         importedThreads.add(
           await _restoreConversation(
             source: source,
+            folderIds: folderIds,
             conversationId: conversationId,
             serverProfileId:
                 serverProfileMappings[originalConversation.serverProfileId]!,
@@ -377,7 +427,21 @@ final class ChatBackup {
         );
       }
 
-      await _store.importThreadsAtomically(importedThreads);
+      await _store.importThreadsAtomically(
+        importedThreads,
+        drafts:
+            await prepareDrafts?.call(conversationIds, messageIds) ?? const {},
+        folders: [
+          for (final folder in parsed.folders)
+            ChatFolder(
+              id: folderIds[folder.id]!,
+              name: folder.name,
+              instructions: folder.instructions,
+              revision: folder.revision,
+              deleted: folder.deleted,
+            ),
+        ],
+      );
       return ChatBackupImportResult(
         conversations: importedThreads.length,
         messages: parsed.messageCount,
@@ -410,6 +474,9 @@ final class ChatBackup {
     required BackupAttachmentCleanup deleteAttachment,
   }) async {
     final parsed = _parse(json);
+    if (parsed.version >= 2 && !_store.graphEnabled) {
+      throw const FormatException('History format upgrade is pending.');
+    }
     if (parsed.conversations.length != 1) {
       throw const FormatException(
         'A synced snapshot must contain exactly one conversation.',
@@ -465,13 +532,14 @@ final class ChatBackup {
       final existingThread = await _store.openConversation(
         serverProfileId: existingTarget.serverProfileId,
         id: existingTarget.id,
+        allBranches: _store.graphEnabled,
       );
       if (existingThread == null) {
         throw StateError(
           'Conversation $targetId disappeared before sync could apply.',
         );
       }
-      for (final message in existingThread.messages) {
+      for (final message in existingThread.allNodes) {
         oldReferences.addAll(message.imageReferences);
         oldReferences.addAll(
           message.documents.map((document) => document.reference),
@@ -617,7 +685,8 @@ final class ChatBackup {
     final output = StringBuffer()
       ..writeln('# ${_escapeHeading(conversation.title)}')
       ..writeln()
-      ..writeln('_Model: ${conversation.selectedModel}_');
+      ..writeln('_Model: ${conversation.selectedModel}_')
+      ..writeln('_Active branch_');
     if (conversation.systemPrompt.trim().isNotEmpty) {
       output
         ..writeln()
@@ -696,7 +765,7 @@ final class ChatBackup {
       throw const FormatException('Unrecognized MobileLlama backup format.');
     }
     final parsedVersion = _integer(root['version'], 'version');
-    if (parsedVersion != version) {
+    if (parsedVersion < 1 || parsedVersion > version) {
       throw FormatException(
         'Unsupported MobileLlama backup version $parsedVersion.',
       );
@@ -715,6 +784,7 @@ final class ChatBackup {
         id: _nonEmptyString(json['id'], 'serverProfiles[$index].id'),
         name: _nonEmptyString(json['name'], 'serverProfiles[$index].name'),
         protocol: _string(json['protocol'], 'serverProfiles[$index].protocol'),
+        compatibleApi: json['compatibleApi'] as String? ?? 'chatCompletions',
         baseUrl: _nonEmptyString(
           json['baseUrl'],
           'serverProfiles[$index].baseUrl',
@@ -722,6 +792,22 @@ final class ChatBackup {
       );
       _validateProfile(profile, profileIds, malformedInput: true);
       profiles.add(profile);
+    }
+
+    final folders = <ChatFolder>[];
+    final folderIds = <String>{};
+    if (parsedVersion >= 2) {
+      final values = _array(root['folders'], 'folders');
+      if (values.length > limits.maxConversations) {
+        throw const FormatException('Too many folders.');
+      }
+      for (final value in values) {
+        final folder = ChatFolder.fromJson(_object(value, 'folder'));
+        if (!folderIds.add(folder.id)) {
+          throw const FormatException('Duplicate folder ID.');
+        }
+        folders.add(folder);
+      }
     }
 
     final rawConversations = _array(root['conversations'], 'conversations');
@@ -767,6 +853,28 @@ final class ChatBackup {
         title: _nonEmptyString(json['title'], '$path.title'),
         selectedModel: _string(json['selectedModel'], '$path.selectedModel'),
         systemPrompt: _string(json['systemPrompt'], '$path.systemPrompt'),
+        activeTipId: parsedVersion >= 2
+            ? _nullableString(json['activeTipId'], '$path.activeTipId')
+            : null,
+        folderId: parsedVersion >= 2
+            ? _nullableString(json['folderId'], '$path.folderId')
+            : null,
+        instructionSource: parsedVersion >= 2
+            ? _string(json['instructionSource'], '$path.instructionSource')
+            : 'legacySnapshot',
+        instructionSourceId: parsedVersion >= 2
+            ? _nullableString(
+                json['instructionSourceId'],
+                '$path.instructionSourceId',
+              )
+            : null,
+        instructionSourceRevision:
+            parsedVersion >= 2 && json['instructionSourceRevision'] != null
+            ? _integer(
+                json['instructionSourceRevision'],
+                '$path.instructionSourceRevision',
+              )
+            : null,
         createdAt: _date(json['createdAt'], '$path.createdAt'),
         updatedAt: _date(json['updatedAt'], '$path.updatedAt'),
         generationOptions: generationOptions,
@@ -774,6 +882,14 @@ final class ChatBackup {
         isArchived: _boolean(json['isArchived'], '$path.isArchived'),
         isRenamed: _boolean(json['isRenamed'], '$path.isRenamed'),
       );
+      if (!{
+        'explicit',
+        'folderSnapshot',
+        'profileSnapshot',
+        'legacySnapshot',
+      }.contains(conversation.instructionSource)) {
+        throw const FormatException('Unknown instruction source.');
+      }
       final rawMessages = _array(json['messages'], '$path.messages');
       messageCount += rawMessages.length;
       if (messageCount > limits.maxMessages) {
@@ -797,7 +913,7 @@ final class ChatBackup {
           messageJson['position'],
           '$messagePath.position',
         );
-        if (position != messageIndex) {
+        if (position < 0 || (parsedVersion == 1 && position != messageIndex)) {
           throw FormatException(
             '$messagePath.position must be contiguous and start at zero.',
           );
@@ -950,6 +1066,18 @@ final class ChatBackup {
               id: messageId,
               conversationId: id,
               position: position,
+              parentId: parsedVersion >= 2
+                  ? _nullableString(
+                      messageJson['parentId'],
+                      '$messagePath.parentId',
+                    )
+                  : (messages.isEmpty ? null : messages.last.message.id),
+              siblingOrder: parsedVersion >= 2
+                  ? _integer(
+                      messageJson['siblingOrder'],
+                      '$messagePath.siblingOrder',
+                    )
+                  : 0,
               role: _enumByName(
                 MessageRole.values,
                 _string(messageJson['role'], '$messagePath.role'),
@@ -992,15 +1120,27 @@ final class ChatBackup {
           );
         }
       }
+      final graph = MessageGraph(messages.map((message) => message.message));
+      if (parsedVersion >= 2) {
+        if (messages.isNotEmpty && conversation.activeTipId == null) {
+          throw const FormatException(
+            'A nonempty graph requires an active tip.',
+          );
+        }
+        graph.branch(conversation.activeTipId);
+      }
       conversations.add(
         _ParsedConversation(
           conversation: conversation,
           messages: List<_ParsedMessage>.unmodifiable(messages),
+          graph: parsedVersion >= 2,
         ),
       );
     }
 
     return _ParsedBackup(
+      version: parsedVersion,
+      folders: folders,
       profiles: List<BackupServerProfile>.unmodifiable(profiles),
       conversations: List<_ParsedConversation>.unmodifiable(conversations),
       messageCount: messageCount,
@@ -1087,6 +1227,7 @@ final class ChatBackup {
     required BackupAttachmentWriter writeAttachment,
     required Set<String> uniqueWrittenReferences,
     required List<String> writtenReferences,
+    Map<String, String> folderIds = const {},
     String? title,
     bool? isRenamed,
   }) async {
@@ -1097,6 +1238,21 @@ final class ChatBackup {
       title: title ?? originalConversation.title,
       selectedModel: originalConversation.selectedModel,
       systemPrompt: originalConversation.systemPrompt,
+      activeTipId: originalConversation.activeTipId == null
+          ? (source.messages.isEmpty
+                ? null
+                : messageIds[source.messages.last.message.id])
+          : messageIds[originalConversation.activeTipId],
+      folderId:
+          folderIds[originalConversation.folderId] ??
+          originalConversation.folderId,
+      instructionSource: originalConversation.instructionSource,
+      instructionSourceId:
+          originalConversation.instructionSource == 'folderSnapshot'
+          ? folderIds[originalConversation.instructionSourceId] ??
+                originalConversation.instructionSourceId
+          : originalConversation.instructionSourceId,
+      instructionSourceRevision: originalConversation.instructionSourceRevision,
       createdAt: originalConversation.createdAt,
       updatedAt: originalConversation.updatedAt,
       generationOptions: originalConversation.generationOptions,
@@ -1143,6 +1299,8 @@ final class ChatBackup {
           id: messageIds[original.id]!,
           conversationId: conversationId,
           position: original.position,
+          parentId: messageIds[original.parentId],
+          siblingOrder: original.siblingOrder,
           role: original.role,
           status: original.status,
           content: original.content,
@@ -1176,7 +1334,12 @@ final class ChatBackup {
     }
     return ConversationThread(
       conversation: conversation,
-      messages: List<Message>.unmodifiable(messages),
+      messages: List<Message>.unmodifiable(
+        source.graph
+            ? MessageGraph(messages).branch(conversation.activeTipId)
+            : messages,
+      ),
+      nodes: source.graph ? List.unmodifiable(messages) : null,
     );
   }
 
@@ -1346,8 +1509,15 @@ final class ChatBackup {
     if (profile.name.trim().isEmpty) {
       reject('Server profile names must not be empty.');
     }
+    if (!const {
+      'chatCompletions',
+      'responses',
+    }.contains(profile.compatibleApi)) {
+      reject('Unknown inference API ${profile.compatibleApi}.');
+    }
     if (profile.protocol != 'ollama' &&
-        profile.protocol != 'openAiCompatible') {
+        profile.protocol != 'openAiCompatible' &&
+        profile.protocol != 'localSnapshot') {
       reject('Unknown server protocol ${profile.protocol}.');
     }
     final uri = Uri.tryParse(profile.baseUrl);
@@ -1471,6 +1641,8 @@ final class ChatBackup {
 
 final class _ParsedBackup {
   const _ParsedBackup({
+    required this.version,
+    required this.folders,
     required this.profiles,
     required this.conversations,
     required this.messageCount,
@@ -1478,6 +1650,8 @@ final class _ParsedBackup {
   });
 
   final List<BackupServerProfile> profiles;
+  final int version;
+  final List<ChatFolder> folders;
   final List<_ParsedConversation> conversations;
   final int messageCount;
   final int attachmentCount;
@@ -1485,11 +1659,13 @@ final class _ParsedBackup {
 
 final class _ParsedConversation {
   const _ParsedConversation({
+    this.graph = false,
     required this.conversation,
     required this.messages,
   });
 
   final Conversation conversation;
+  final bool graph;
   final List<_ParsedMessage> messages;
 }
 

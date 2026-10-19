@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 
-/// Native equivalents of the v4 proposal's OKLCH colors and SVG controls.
+/// Shared typography, surfaces, spacing, and touch targets.
 abstract final class Design {
-  static const ink = Color(0xFF2A2E3A);
+  static const ink = Color(0xFF202020);
   static const accent = Color(0xFF3B5BDB);
 
   /// Shared spacing scale for repeated gaps. [gutter] is the content inset.
@@ -24,21 +24,21 @@ abstract final class Design {
   static bool dark(BuildContext context) =>
       Theme.of(context).brightness == Brightness.dark;
   static Color panel(BuildContext context) =>
-      dark(context) ? const Color(0xFF373B47) : const Color(0xFFF7F8FA);
+      dark(context) ? const Color(0xFF202020) : const Color(0xFFF7F7F7);
   static Color sheet(BuildContext context) =>
-      dark(context) ? const Color(0xFF424651) : Colors.white;
+      dark(context) ? const Color(0xFF262626) : Colors.white;
   static Color control(BuildContext context) =>
-      dark(context) ? const Color(0xFF494D58) : const Color(0xFFF7F8FA);
+      dark(context) ? const Color(0xFF303030) : const Color(0xFFF7F7F7);
   static Color composer(BuildContext context) =>
-      dark(context) ? const Color(0xFF454955) : const Color(0xFFF5F6F8);
+      dark(context) ? const Color(0xFF292929) : const Color(0xFFF4F4F4);
   static Color group(BuildContext context) =>
-      dark(context) ? const Color(0xFF50545F) : Colors.white;
+      dark(context) ? const Color(0xFF333333) : Colors.white;
   static Color search(BuildContext context) =>
-      dark(context) ? const Color(0xFF4C505C) : Colors.white;
+      dark(context) ? const Color(0xFF292929) : Colors.white;
   static Color line(BuildContext context, [double opacity = .13]) =>
       dark(context)
       ? Colors.white.withValues(alpha: opacity)
-      : const Color(0xFFD6DAE4);
+      : const Color(0xFFE4E4E4);
 }
 
 class DesignIcon extends StatelessWidget {
@@ -132,7 +132,9 @@ class KeyboardSafeSheet extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => AnimatedPadding(
-    duration: const Duration(milliseconds: 180),
+    duration: MediaQuery.disableAnimationsOf(context)
+        ? Duration.zero
+        : const Duration(milliseconds: 180),
     curve: Curves.easeOut,
     padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
     child: SafeArea(

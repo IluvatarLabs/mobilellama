@@ -4,6 +4,7 @@ import '../domain/conversation.dart';
 import '../ui/design.dart';
 import '../settings/settings_sheet.dart';
 import 'chat_controller.dart';
+import 'folders.dart';
 import 'share_actions.dart';
 
 Future<bool> confirmDelete(
@@ -78,9 +79,7 @@ Future<bool> restorePreviousConversation(
     );
     return false;
   }
-  final restored = await controller.restorePreviousConversation(
-    conversationId,
-  );
+  final restored = await controller.restorePreviousConversation(conversationId);
   if (context.mounted) {
     _showSnack(
       context,
@@ -126,7 +125,8 @@ Future<void> showChatActions(
                 child: Text(
                   [
                     'Server: ${server ?? 'Unavailable'}',
-                    if (chat.selectedModel.isNotEmpty) 'Model: ${chat.selectedModel}',
+                    if (chat.selectedModel.isNotEmpty)
+                      'Model: ${chat.selectedModel}',
                   ].join(' · '),
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
                     color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -136,9 +136,12 @@ Future<void> showChatActions(
             ),
             for (final item in <(String, String)>[
               if (visible && onFind != null) ('find', 'Find in chat'),
-              if (visible && controller.hasRecoveryCheckpoint(chat.id))
+              if (visible &&
+                  !controller.versionsEnabled &&
+                  controller.hasRecoveryCheckpoint(chat.id))
                 ('restore', 'Restore previous conversation'),
               ('rename', 'Rename'),
+              if (controller.versionsEnabled) ('folder', 'Move to folder'),
               ('pin', chat.isPinned ? 'Unpin' : 'Pin'),
               ('archive', chat.isArchived ? 'Unarchive' : 'Archive'),
               if (controller.conversation?.id == chat.id)
@@ -173,6 +176,10 @@ Future<void> showChatActions(
     ),
   );
   if (!context.mounted || action == null) return;
+  if (action == 'folder') {
+    await moveChatToFolder(context, controller, chat.id);
+    return;
+  }
   if (action == 'find') {
     onFind?.call();
     return;

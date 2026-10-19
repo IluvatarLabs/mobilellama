@@ -12,6 +12,12 @@ final class ChatCloudSyncBridge {
       name: "app.mobollama/chat_sync",
       binaryMessenger: messenger
     )
+    accountObserver = NotificationCenter.default.addObserver(forName: .CKAccountChanged, object: nil, queue: nil) { [weak self] _ in
+      Task { @MainActor [weak self] in
+        guard let self, #available(iOS 17.0, *), let store = self.storeObject as? ChatCloudSyncStore else { return }
+        await store.accountMayHaveChanged()
+      }
+    }
     channel.setMethodCallHandler { [weak self] call, result in
       guard let self else {
         result(
@@ -31,10 +37,12 @@ final class ChatCloudSyncBridge {
 
   private let application: UIApplication
   private let channel: FlutterMethodChannel
+  private var accountObserver: NSObjectProtocol?
   private var storeObject: AnyObject?
   private var storeTask: Task<AnyObject, Error>?
 
   deinit {
+    if let accountObserver { NotificationCenter.default.removeObserver(accountObserver) }
     channel.setMethodCallHandler(nil)
   }
 
@@ -78,6 +86,10 @@ final class ChatCloudSyncBridge {
           deleted: arguments.deleted
         )
         result(nil)
+      case "collectMigration":
+        result(try await store.collectMigration().map)
+      case "finishMigration":
+        result(try await store.finishMigration().map)
       case "sync":
         result(try await store.sync().map)
       case "nextChange":
@@ -216,12 +228,18 @@ private struct ChatCloudSyncStatus: Sendable {
   let pending: Int
   let lastSync: Date?
   let error: String?
+  var migrationPending = false
+  var inventoryReady = false
+  var accountScope = ""
 
   var map: [String: Any] {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     return [
       "supported": true,
+      "migrationPending": migrationPending,
+      "accountScope": accountScope,
+      "inventoryReady": inventoryReady,
       "enabled": enabled,
       "pending": pending,
       "lastSync": lastSync.map(formatter.string(from:)) ?? NSNull(),
@@ -233,6 +251,13 @@ private struct ChatCloudSyncStatus: Sendable {
 @available(iOS 17.0, *)
 struct ChatCloudSyncState: Codable {
   var schemaVersion = 1
+  // Optional for reading the preserved v1 state. Only the V2 store writes these.
+  var inventoryReady: Bool?
+  var migrationComplete: Bool?
+  var oldWritesStopped: Bool?
+  var adoptionComplete: Bool?
+  var engineCaughtUp: Bool?
+  var zoneObserved: Bool?
   var enabled = false
   var accountRecordName: String?
   var engineState: CKSyncEngine.State.Serialization?
@@ -263,6 +288,7 @@ struct ChatCloudSyncInboxItem: Codable {
   var deleted: Bool
   var conflict: Bool
   var dedupeKey: String
+  var source: String?
 }
 
 @available(iOS 17.0, *)
@@ -298,6 +324,11 @@ enum ChatCloudSyncStateLogic {
     state.quarantinedInbox.append(contentsOf: state.inbox)
     state.inbox.removeAll()
     state.engineState = nil
+    state.inventoryReady = false
+    state.migrationComplete = false
+    state.adoptionComplete = false
+    state.engineCaughtUp = false
+    state.zoneObserved = false
     state.chats.removeAll()
     state.accountRecordName = accountRecordName
     return true
@@ -343,7 +374,7 @@ enum ChatCloudSyncStateLogic {
     state.inbox.append(
       ChatCloudSyncInboxItem(
         token: token(),
-        id: conflictID(),
+        id: (entry.id.hasPrefix("folder:") ? "folder:" : entry.id.hasPrefix("chat:") ? "chat:" : "") + conflictID(),
         assetFile: entry.assetFile,
         deleted: entry.deleted,
         conflict: true,
@@ -378,7 +409,7 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
   static let container = CKContainer(
     identifier: "iCloud.app.mobollama.mobollama"
   )
-  static let zoneName = "Chats"
+  static let zoneName = "ChatsV2"
   static let recordType: CKRecord.RecordType = "Chat"
   static let maxSnapshotBytes = 128 * 1024 * 1024
   static let maxIDBytes = 512
@@ -396,7 +427,7 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
       )
     }
     let directory = applicationSupport.appendingPathComponent(
-      "ChatCloudSync",
+      "ChatCloudSyncV2",
       isDirectory: true
     )
     let assetsDirectory = directory.appendingPathComponent(
@@ -408,14 +439,23 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
       withIntermediateDirectories: true
     )
     let stateURL = directory.appendingPathComponent("state.json")
-    guard fileManager.fileExists(atPath: stateURL.path) else {
-      return ChatCloudSyncStore(
-        stateURL: stateURL,
-        assetsDirectory: assetsDirectory,
-        state: ChatCloudSyncState(),
-        loadError: nil,
-        notifyChanged: notifyChanged
-      )
+    if !fileManager.fileExists(atPath: stateURL.path) {
+      var initial = ChatCloudSyncState()
+      let legacyURL = applicationSupport.appendingPathComponent("ChatCloudSync/state.json")
+      if fileManager.fileExists(atPath: legacyURL.path) {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let legacy = try decoder.decode(ChatCloudSyncState.self, from: Data(contentsOf: legacyURL))
+        guard legacy.schemaVersion == 1 else {
+          throw ChatCloudSyncError.persistence("The legacy sync state could not be upgraded. Its files were preserved.")
+        }
+        initial.enabled = legacy.enabled
+        initial.accountRecordName = legacy.accountRecordName
+      }
+      initial.oldWritesStopped = true
+      initial.inventoryReady = false
+      initial.migrationComplete = false
+      try write(initial, to: stateURL)
     }
 
     do {
@@ -491,7 +531,10 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
       enabled: state.enabled,
       pending: state.chats.values.filter(\.dirty).count + state.inbox.count,
       lastSync: state.lastSync,
-      error: runtimeError ?? state.error
+      error: runtimeError ?? state.error,
+      migrationPending: state.migrationComplete != true,
+      inventoryReady: state.inventoryReady == true,
+      accountScope: Self.digest(Data((state.accountRecordName ?? "").utf8))
     )
   }
 
@@ -544,6 +587,12 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
   func put(id: String, json: String?, deleted: Bool) async throws {
     try Self.validateID(id)
     var candidate = try requireEnabledState()
+    guard candidate.migrationComplete == true else {
+      throw ChatCloudSyncError.unavailable("iCloud history upgrade is pending. Local chats remain available.")
+    }
+    guard id.hasPrefix("chat:") || id.hasPrefix("folder:") else {
+      throw ChatCloudSyncError.invalidArguments("Expected a versioned chat or folder identifier.")
+    }
     let data: Data?
     let digest: String
     if deleted {
@@ -568,7 +617,9 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
       }
       guard
         let object = try? JSONSerialization.jsonObject(with: value),
-        object is [String: Any]
+        let payload = object as? [String: Any],
+        (payload["version"] as? Int) == 2,
+        (id.hasPrefix("folder:") ? payload["format"] as? String == "mobilellama-folder" : payload["format"] as? String == "mobilellama-chat-backup")
       else {
         throw ChatCloudSyncError.invalidArguments(
           "A chat snapshot must be a JSON object."
@@ -597,7 +648,7 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
         candidate.inbox.append(
           ChatCloudSyncInboxItem(
             token: UUID().uuidString,
-            id: UUID().uuidString,
+            id: (id.hasPrefix("folder:") ? "folder:" : "chat:") + UUID().uuidString,
             assetFile: file,
             deleted: deleted,
             conflict: true,
@@ -638,6 +689,166 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
     await notifyChanged()
   }
 
+  func collectMigration() async throws -> ChatCloudSyncStatus {
+    let initial = try requireEnabledState()
+    try await validateCurrentAccount()
+    if initial.inventoryReady == true || initial.migrationComplete == true { return status() }
+    let account = try await availableAccountRecordID()
+    guard account.recordName == initial.accountRecordName else {
+      throw ChatCloudSyncError.unavailable("The iCloud account changed. Enable sync explicitly for this account.")
+    }
+    // No engine is running and put is fenced while these inventories are read.
+    let modern = try await collectZone(Self.zoneID)
+    let legacy = try await collectZone(CKRecordZone.ID(zoneName: "Chats"))
+    guard (try await availableAccountRecordID()).recordName == account.recordName else {
+      throw ChatCloudSyncError.unavailable("The iCloud account changed during the history upgrade.")
+    }
+    var candidate = try requireEnabledState()
+    guard candidate.accountRecordName == account.recordName else {
+      throw ChatCloudSyncError.unavailable("The iCloud account changed during the history upgrade.")
+    }
+    candidate.chats.removeAll()
+    candidate.inbox.removeAll()
+    for value in modern.values.sorted(by: { $0.id < $1.id }) {
+      let file = try value.data.map(writeAsset)
+      candidate.chats[value.id] = ChatCloudSyncEntry(id: value.id, revision: value.revision,
+        digest: value.digest, deleted: value.deleted, assetFile: file,
+        systemFields: value.systemFields.isEmpty ? nil : value.systemFields, dirty: false)
+      candidate.inbox.append(ChatCloudSyncInboxItem(token: UUID().uuidString, id: value.id,
+        assetFile: file, deleted: value.deleted, conflict: false,
+        dedupeKey: "upgrade:v2:\(value.id):\(value.digest)", source: "v2"))
+    }
+    for value in legacy.values.sorted(by: { $0.id < $1.id }) {
+      let file = try value.data.map(writeAsset)
+      candidate.inbox.append(ChatCloudSyncInboxItem(token: UUID().uuidString, id: "chat:" + value.id,
+        assetFile: file, deleted: value.deleted, conflict: false,
+        dedupeKey: "upgrade:legacy:\(value.id):\(value.digest)", source: "legacy"))
+    }
+    // Pending v1 conflict copies may never have reached SQLite or the server.
+    // Preserve their assets as migration input, without mutating the old store.
+    let legacyDirectory = stateURL.deletingLastPathComponent().deletingLastPathComponent()
+      .appendingPathComponent("ChatCloudSync")
+    let legacyURL = legacyDirectory.appendingPathComponent("state.json")
+    if FileManager.default.fileExists(atPath: legacyURL.path) {
+      let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+      let old = try decoder.decode(ChatCloudSyncState.self, from: Data(contentsOf: legacyURL))
+      if old.accountRecordName == account.recordName {
+        for entry in old.chats.values where entry.dirty && entry.deleted {
+          candidate.inbox.insert(ChatCloudSyncInboxItem(token: UUID().uuidString,
+            id: "chat:" + entry.id, assetFile: nil, deleted: true, conflict: false,
+            dedupeKey: "upgrade:local-deletion:" + entry.id, source: "legacyDeletion"), at: 0)
+        }
+        for item in old.inbox where item.conflict && !item.deleted {
+          guard let file = item.assetFile, Self.validAssetName(file) else {
+            throw ChatCloudSyncError.persistence("A pending legacy snapshot is missing.")
+          }
+          let copied = try writeAsset(Self.readBounded(legacyDirectory.appendingPathComponent("Assets").appendingPathComponent(file)))
+          candidate.inbox.append(ChatCloudSyncInboxItem(token: UUID().uuidString,
+            id: "chat:" + item.id, assetFile: copied, deleted: false, conflict: item.conflict,
+            dedupeKey: "upgrade:legacy-local:" + item.dedupeKey, source: "legacyLocal"))
+        }
+      }
+    }
+    candidate.inventoryReady = true
+    candidate.error = nil
+    try commit(candidate)
+    runtimeError = nil
+    await notifyChanged()
+    return status()
+  }
+
+  private func collectZone(_ zone: CKRecordZone.ID) async throws -> [String: ChatCloudServerValue] {
+    var values: [String: ChatCloudServerValue] = [:]
+    var token: CKServerChangeToken?
+    while true {
+      do {
+        let page = try await Self.container.privateCloudDatabase.recordZoneChanges(
+          inZoneWith: zone, since: token, resultsLimit: 100)
+        for result in page.modificationResultsByID.values {
+          let value = try decode(result.get().record)
+          values[value.id] = value
+        }
+        for deletion in page.deletions {
+          let id = deletion.recordID.recordName
+          if page.modificationResultsByID[deletion.recordID] != nil {
+            do {
+              values[id] = try decode(await Self.container.privateCloudDatabase.record(for: deletion.recordID))
+              continue
+            } catch let error as CKError where error.code == .unknownItem { }
+          }
+          values[id] = ChatCloudServerValue(id: id, revision: "deleted",
+            digest: Self.deletedDigest, deleted: true, data: nil, systemFields: Data())
+        }
+        if zone == Self.zoneID {
+          var observed = try requireEnabledState(); observed.zoneObserved = true; try commit(observed)
+        }
+        token = page.changeToken
+        if !page.moreComing { return values }
+      } catch let error as CKError where error.code == .zoneNotFound {
+        // A zone that has never been created is a complete empty inventory.
+        guard token == nil, values.isEmpty, zone != Self.zoneID || state?.zoneObserved != true else { throw error }
+        return [:]
+      }
+    }
+  }
+
+  func finishMigration() async throws -> ChatCloudSyncStatus {
+    try await validateCurrentAccount()
+    var candidate = try requireEnabledState()
+    guard candidate.inventoryReady == true, candidate.inbox.isEmpty else {
+      throw ChatCloudSyncError.unavailable("Finish adopting the complete iCloud inventory before uploading local history.")
+    }
+    candidate.adoptionComplete = true
+    try commit(candidate)
+    startEngine()
+    if candidate.engineCaughtUp != true {
+      guard let current = engine else { throw ChatCloudSyncError.unavailable("iCloud sync could not start.") }
+      try await current.fetchChanges(.init(scope: .zoneIDs([Self.zoneID])))
+      guard engine === current else { throw ChatCloudSyncError.unavailable("iCloud fetching was interrupted.") }
+      try await validateCurrentAccount()
+      candidate = try requireEnabledState()
+      guard candidate.error == nil else { throw ChatCloudSyncError.cloud(candidate.error!) }
+      candidate.engineCaughtUp = true
+      try commit(candidate)
+    }
+    candidate = try requireEnabledState()
+    // The first engine fetch can add newer snapshots; Dart adopts those before
+    // this second call opens the record-send fence.
+    if !candidate.inbox.isEmpty { return status() }
+    candidate.migrationComplete = true
+    try commit(candidate)
+    await notifyChanged()
+    return status()
+  }
+
+  private func validateCurrentAccount() async throws {
+    let before = try requireEnabledState()
+    let account = try await availableAccountRecordID()
+    guard (try requireEnabledState()).accountRecordName == before.accountRecordName,
+          account.recordName == before.accountRecordName else {
+      var candidate = try requireState()
+      candidate.enabled = false
+      candidate.error = "The iCloud account changed. Local chats were kept. Enable sync explicitly for the current account."
+      candidate.quarantinedInbox.append(contentsOf: candidate.inbox)
+      candidate.inbox.removeAll()
+      candidate.inventoryReady = false
+      candidate.adoptionComplete = false
+      candidate.engineCaughtUp = false
+      candidate.migrationComplete = false
+      try commit(candidate)
+      let previous = engine; engine = nil
+      await previous?.cancelOperations()
+      await notifyChanged()
+      throw ChatCloudSyncError.unavailable(candidate.error!)
+    }
+  }
+
+  func accountMayHaveChanged() async {
+    guard state?.enabled == true else { return }
+    do { try await validateCurrentAccount() }
+    catch { try? await record(error) }
+  }
+
   func sync() async throws -> ChatCloudSyncStatus {
     var candidate = try requireEnabledState()
     candidate.error = nil
@@ -650,7 +861,7 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
           "Chat sync could not start."
         )
       }
-      try await engine.fetchChanges()
+      try await engine.fetchChanges(.init(scope: .zoneIDs([Self.zoneID])))
       try await engine.sendChanges()
       if status().error == nil {
         candidate = try requireEnabledState()
@@ -665,7 +876,8 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
     }
   }
 
-  func nextChange() throws -> [String: Any]? {
+  func nextChange() async throws -> [String: Any]? {
+    if state?.migrationComplete != true { try await validateCurrentAccount() }
     let candidate = try requireEnabledState()
     guard let item = candidate.inbox.first else { return nil }
     let json: Any
@@ -686,6 +898,8 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
       "json": json,
       "deleted": item.deleted,
       "conflict": item.conflict,
+      "source": item.source ?? (candidate.migrationComplete == true ? "current" : "v2"),
+      "accountScope": Self.digest(Data((candidate.accountRecordName ?? "").utf8)),
     ]
   }
 
@@ -713,7 +927,6 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
     do {
       account = try await availableAccountRecordID()
     } catch {
-      candidate.enabled = false
       candidate.error = error.localizedDescription
       try commit(candidate)
       let previousEngine = engine
@@ -759,14 +972,14 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
   }
 
   private func startEngine() {
-    guard engine == nil, let state, state.enabled else { return }
+    guard engine == nil, let state, state.enabled, state.migrationComplete == true || state.adoptionComplete == true else { return }
     var configuration = CKSyncEngine.Configuration(
       database: Self.container.privateCloudDatabase,
       stateSerialization: state.engineState,
       delegate: self
     )
     configuration.automaticallySync = true
-    configuration.subscriptionID = "MobileLlamaChats"
+    configuration.subscriptionID = "MobileLlamaChatsV2"
     let syncEngine = CKSyncEngine(configuration)
     engine = syncEngine
     if state.engineState == nil {
@@ -817,11 +1030,17 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
     }
   }
 
+  func nextFetchChangesOptions(_ context: CKSyncEngine.FetchChangesContext, syncEngine: CKSyncEngine) async -> CKSyncEngine.FetchChangesOptions {
+    var options = context.options
+    options.scope = .zoneIDs([Self.zoneID])
+    return options
+  }
+
   func nextRecordZoneChangeBatch(
     _ context: CKSyncEngine.SendChangesContext,
     syncEngine: CKSyncEngine
   ) async -> CKSyncEngine.RecordZoneChangeBatch? {
-    guard engine === syncEngine else { return nil }
+    guard engine === syncEngine, state?.migrationComplete == true else { return nil }
     let changes = syncEngine.state.pendingRecordZoneChanges.filter {
       context.options.scope.contains($0)
     }
@@ -924,6 +1143,9 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
   private func handleSentDatabaseChanges(
     _ event: CKSyncEngine.Event.SentDatabaseChanges
   ) async throws {
+    if event.savedZones.contains(where: { $0.zoneID == Self.zoneID }) {
+      var observed = try requireState(); observed.zoneObserved = true; observed.error = nil; try commit(observed)
+    }
     guard let failed = event.failedZoneSaves.first(where: {
       $0.zone.zoneID == Self.zoneID
     }) else {
@@ -975,24 +1197,18 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
           )
         }
       case .zoneNotFound:
-        var retry = try requireState()
-        retry.chats[id]?.systemFields = nil
-        retry.chats[id]?.dirty = true
-        try commit(retry)
-        syncEngine.state.add(
-          pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneName: Self.zoneName))]
-        )
-        syncEngine.state.add(
-          pendingRecordZoneChanges: [.saveRecord(failure.record.recordID)]
-        )
+        if state?.zoneObserved == true {
+          var stopped = try requireState(); stopped.enabled = false
+          stopped.error = "The iCloud history zone was removed. Local chats were kept."
+          try commit(stopped); engine = nil; Self.cancelOutsideDelegate(syncEngine)
+        } else {
+          syncEngine.state.add(pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneName: Self.zoneName))])
+          syncEngine.state.add(pendingRecordZoneChanges: [.saveRecord(failure.record.recordID)])
+        }
       case .unknownItem:
-        var retry = try requireState()
-        retry.chats[id]?.systemFields = nil
-        retry.chats[id]?.dirty = true
-        try commit(retry)
-        syncEngine.state.add(
-          pendingRecordZoneChanges: [.saveRecord(failure.record.recordID)]
-        )
+        // A server-deleted existing record must never be recreated under its
+        // deleted identity. acceptPhysicalDeletion retains a dirty local copy.
+        try await acceptPhysicalDeletion(id: id, syncEngine: syncEngine)
       case .networkFailure, .networkUnavailable, .zoneBusy,
            .serviceUnavailable, .notAuthenticated, .operationCancelled:
         var retry = try requireState()
@@ -1132,11 +1348,13 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
   }
 
   private func decode(_ record: CKRecord) throws -> ChatCloudServerValue {
-    guard record.recordType == Self.recordType else {
+    let isLegacy = record.recordID.zoneID.zoneName == "Chats"
+    let expectedType = record.recordID.recordName.hasPrefix("folder:") && !isLegacy ? "Folder" : "Chat"
+    guard record.recordType == expectedType else {
       throw ChatCloudSyncError.cloud("CloudKit returned an unexpected record type.")
     }
     guard
-      let id = record["conversationID"] as? String,
+      let id = record[isLegacy ? "conversationID" : "entityID"] as? String,
       id == record.recordID.recordName
     else {
       throw ChatCloudSyncError.cloud("CloudKit returned an invalid chat identifier.")
@@ -1185,11 +1403,11 @@ private final actor ChatCloudSyncStore: CKSyncEngineDelegate {
       record = try Self.record(from: systemFields)
     } else {
       record = CKRecord(
-        recordType: Self.recordType,
+        recordType: entry.id.hasPrefix("folder:") ? "Folder" : "Chat",
         recordID: Self.recordID(entry.id)
       )
     }
-    record["conversationID"] = entry.id as CKRecordValue
+    record["entityID"] = entry.id as CKRecordValue
     record["revision"] = entry.revision as CKRecordValue
     record["deleted"] = NSNumber(value: entry.deleted)
     if entry.deleted {

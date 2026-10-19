@@ -99,7 +99,7 @@ class ConnectionHelpPage extends StatelessWidget {
         'Ollama: connects to an Ollama server, usually on port 11434, for '
             'example http://192.168.1.20:11434.\n\n'
             'OpenAI-compatible: connects to a server that provides the OpenAI '
-            'chat API. Its URL includes /v1, for example '
+            'chat API. Enter its exact API root, for example '
             'https://example.com/v1.',
       ),
       (
@@ -151,33 +151,76 @@ class PrivacyInfoPage extends StatelessWidget {
         'Chats, drafts, queued follow-ups, earlier versions of edited chats, '
             'and chat settings are stored in the app’s local database. '
             'Attached images and documents are kept in the app’s storage. '
-            'Deleting chats removes them from this phone.',
+            'Shared chats also cache downloaded server history and files. '
+            'Deleting chats removes their local copies from this phone.',
       ),
       (
-        'API keys',
-        'Server API keys and the Ollama cloud API key are stored in the iOS '
-            'Keychain. They are not included in chat backups or iCloud sync.',
+        'Credentials',
+        'Server API keys, access tokens, custom gateway-header values, and the '
+            'Ollama cloud API key are stored in the iOS Keychain. A shared-server '
+            'password is used to sign in and is not retained afterward. '
+            'Credentials are not included in chat backups or iCloud sync.',
       ),
       (
-        'Sent to your server',
-        'When you send a message, the chat’s messages, instructions, '
-            'settings, and attachments are sent to the server selected for '
-            'that chat. That server’s operator controls how it is processed '
-            'and how long it is kept. Checking a connection only asks the '
-            'server for its version, models, and model capabilities.',
+        'Permission for your AI server',
+        'Before first contacting a configured AI destination, MobileLlama '
+            'shows its name, server type, exact address, the data and purpose, '
+            'and asks you to allow sharing. Permission applies only to that '
+            'protocol and address; changing the address requires a new choice. '
+            'Saving without connecting does not contact the server.',
+      ),
+      (
+        'Direct connections',
+        'A connection check can send configured credentials and gateway headers '
+            'and asks only for server, model, and capability information. '
+            'Generating a response can send your current message, selected '
+            'history, instructions, model settings and tool state, attached '
+            'images and document contents, and web-search results included in '
+            'the chat.',
+      ),
+      (
+        'Shared chats',
+        'Signing in sends your email and password, API key, or gateway '
+            'credentials to the Open WebUI server you selected. MobileLlama '
+            'accesses account identity, server chats, titles, folders, and files '
+            'to display and synchronize them. Prompts, selected history, '
+            'instructions, settings, resources, and uploaded attachments are '
+            'sent there to generate and store responses.',
+      ),
+      (
+        'Your server’s operator',
+        'The named operator may be you, your organization, or an independent AI '
+            'service. It controls server-side logging, model training, retention, '
+            'deletion, onward sharing, and any AI providers behind the server. '
+            'MobileLlama does not choose those operators or receive your chats '
+            'and cannot guarantee an arbitrary server’s practices. Allow only '
+            'operators whose privacy policy and terms you accept.',
+      ),
+      (
+        'Withdraw permission',
+        'For a direct connection, use Settings → Connections → Withdraw AI data '
+            'sharing. Saved local chats and drafts remain. For Shared chats, '
+            'sign out to remove that account’s credentials, cached chats and '
+            'files, drafts, queues, and pending requests from this phone. These '
+            'actions stop future requests and require permission again, but do '
+            'not delete data already stored by the server. Use the server’s '
+            'controls or contact its operator for server-side deletion.',
       ),
       (
         'Web search (optional)',
-        'Off unless you turn it on. When a model searches, search terms and '
-            'page addresses are sent to Ollama’s cloud service (ollama.com) '
-            'with your Ollama cloud API key, and the results are added to the '
-            'chat sent to your server.',
+        'Off unless you turn it on and approve its disclosure. Search terms and '
+            'page addresses are sent with your Ollama cloud API key to Ollama’s '
+            'cloud service at ollama.com. Returned results and fetched page '
+            'content can be added to the chat sent to your selected AI server. '
+            'Turn off Web search to stop future web-search requests.',
       ),
       (
         'iCloud sync (optional)',
         'Off unless you turn it on. Chats and attachments are then stored in '
-            'your private iCloud account. API keys and unsent drafts stay on '
-            'this phone.',
+            'your private Apple iCloud account under Apple’s privacy policy. '
+            'API keys and unsent drafts stay on this phone. Turn off iCloud sync '
+            'to stop future synchronization; use Apple’s account and storage '
+            'controls for data already stored there.',
       ),
       (
         'Dictation and read aloud',
@@ -193,9 +236,15 @@ class PrivacyInfoPage extends StatelessWidget {
             'drafts.',
       ),
       (
-        'No accounts or analytics',
-        'MobileLlama has no account system and includes no analytics, '
-            'advertising, or crash-reporting service.',
+        'No MobileLlama service or analytics',
+        'The developers do not operate an account or AI service for MobileLlama '
+            'and do not receive the data sent to a server you choose. The app '
+            'includes no analytics, advertising, or crash-reporting service. '
+            'MobileLlama uses no third-party processor to receive AI data on its '
+            'behalf. Any provider MobileLlama selects in the future must provide '
+            'the same or equal protection described in the privacy policy. '
+            'User-selected servers are independent services with their own '
+            'privacy policies.',
       ),
     ],
   );

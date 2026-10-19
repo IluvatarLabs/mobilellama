@@ -7,6 +7,7 @@ import 'package:flutter_math_fork/flutter_math.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:mobollama/chat/attachment_strip.dart';
+import 'package:mobollama/app.dart';
 import 'package:mobollama/chat/chat_screen.dart';
 import 'package:mobollama/chat/composer.dart';
 import 'package:mobollama/chat/find_in_chat.dart';
@@ -17,6 +18,41 @@ import 'package:mobollama/domain/queued_prompt.dart';
 import '../support/chat_fixture.dart';
 
 void main() {
+  testWidgets('actual chat keeps an enlarged draft line visible above the landscape keyboard', (tester) async {
+    tester.view.physicalSize = const Size(874, 402);
+    tester.view.devicePixelRatio = 1;
+    tester.view.viewInsets = const FakeViewPadding(bottom: 209);
+    addTearDown(tester.view.reset);
+    final fixture = ChatFixture();
+    await tester.runAsync(() async {
+      await fixture.open();
+      await fixture.controller.initialize();
+    });
+    await tester.pumpWidget(MaterialApp(
+      theme: mobileLlamaTheme(Brightness.light),
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context).copyWith(textScaler: const TextScaler.linear(3.1)),
+        child: child!,
+      ),
+      home: ChatScreen(controller: fixture.controller),
+    ));
+    await tester.enterText(find.byType(TextField), 'Accessible landscape');
+    await tester.pumpAndSettle();
+    final editor = tester.state<EditableTextState>(find.byType(EditableText)).renderEditable;
+    expect(editor.size.height, greaterThanOrEqualTo(editor.preferredLineHeight));
+    expect(find.byTooltip('Send').hitTestable(), findsOneWidget);
+    expect(fixture.controller.draftText, 'Accessible landscape');
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+    var closed = false;
+    unawaited(fixture.close().whenComplete(() => closed = true));
+    for (var i = 0; i < 50 && !closed; i++) {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 10)));
+      await tester.pump();
+    }
+    expect(closed, isTrue);
+  });
+
   testWidgets(
     'header names each chat destination and a failed revision restores from its answer',
     (tester) async {
@@ -43,14 +79,14 @@ void main() {
       expect(find.text('Lab · Ready'), findsNothing);
       expect(find.textContaining('Home · '), findsOneWidget);
       expect(find.text('Original answer'), findsNothing);
-      expect(
-        find.text('Available until you send or revise another message.'),
-        findsOneWidget,
-      );
-
-      await tester.tap(
-        find.widgetWithText(TextButton, 'Restore previous conversation'),
-      );
+      for (var i = 0; i < 5; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 20)),
+        );
+        await tester.pump();
+      }
+      await tester.ensureVisible(find.byTooltip('Previous version'));
+      await tester.tap(find.byTooltip('Previous version'));
       // Restore runs real database work; let it finish between frames.
       for (var i = 0; i < 5; i++) {
         await tester.runAsync(
@@ -59,6 +95,14 @@ void main() {
         await tester.pump();
       }
       expect(find.text('Original answer'), findsOneWidget);
+      await tester.tap(find.text('Continue from this version'));
+      for (var i = 0; i < 5; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 20)),
+        );
+        await tester.pump();
+      }
+      expect(fixture.controller.viewingAlternative, isFalse);
       expect(fixture.controller.hasRecoveryCheckpoint('home-chat'), isFalse);
       await tester.pumpWidget(const SizedBox());
       // Shutdown mixes fake-zone draft writes with real database work.

@@ -10,6 +10,11 @@ class Conversation {
     required this.systemPrompt,
     required this.createdAt,
     required this.updatedAt,
+    this.activeTipId,
+    this.folderId,
+    this.instructionSource = 'legacySnapshot',
+    this.instructionSourceId,
+    this.instructionSourceRevision,
     this.generationOptions = const GenerationOptions(),
     this.isPinned = false,
     this.isArchived = false,
@@ -21,6 +26,9 @@ class Conversation {
   final String title;
   final String selectedModel;
   final String systemPrompt;
+  final String? activeTipId, folderId, instructionSourceId;
+  final String instructionSource;
+  final int? instructionSourceRevision;
   final DateTime createdAt;
   final DateTime updatedAt;
   final GenerationOptions generationOptions;
@@ -33,10 +41,13 @@ class ConversationThread {
   const ConversationThread({
     required this.conversation,
     required this.messages,
+    this.nodes,
   });
 
   final Conversation conversation;
   final List<Message> messages;
+  final List<Message>? nodes;
+  List<Message> get allNodes => nodes ?? messages;
 }
 
 String titleFromFirstUserText(String text, {int maximumLength = 60}) {

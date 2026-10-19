@@ -16,9 +16,12 @@ import 'package:scroll_to_index/scroll_to_index.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../domain/document_attachment.dart';
+import '../domain/source_reference.dart';
+import 'sources.dart';
 import '../ui/design.dart';
 import 'activity_disclosure.dart';
 import 'find_in_chat.dart';
+import 'diagram.dart';
 import 'image_viewer.dart';
 import 'share_actions.dart';
 import 'speech_actions.dart';
@@ -57,6 +60,7 @@ class TranscriptMessageView {
     this.status = TranscriptStatus.completed,
     this.canRetry = false,
     this.canEdit = false,
+    this.retainsVersions = false,
     this.editRemovesLaterMessages = false,
     this.canRegenerate = false,
     this.regenerateRemovesLaterMessages = false,
@@ -65,6 +69,7 @@ class TranscriptMessageView {
     this.imageReferences = const <String>[],
     this.documents = const <DocumentAttachment>[],
     this.toolCalls = const <ToolActivityView>[],
+    this.sources = const <SourceReference>[],
   });
 
   final String id;
@@ -73,6 +78,7 @@ class TranscriptMessageView {
   final TranscriptStatus status;
   final bool canRetry;
   final bool canEdit;
+  final bool retainsVersions;
   final bool editRemovesLaterMessages;
   final bool canRegenerate;
   final bool regenerateRemovesLaterMessages;
@@ -84,6 +90,7 @@ class TranscriptMessageView {
   final List<String> imageReferences;
   final List<DocumentAttachment> documents;
   final List<ToolActivityView> toolCalls;
+  final List<SourceReference> sources;
 
   TranscriptMessageView copyWith({bool? canRestorePrevious}) =>
       TranscriptMessageView(
@@ -93,6 +100,7 @@ class TranscriptMessageView {
         status: status,
         canRetry: canRetry,
         canEdit: canEdit,
+        retainsVersions: retainsVersions,
         editRemovesLaterMessages: editRemovesLaterMessages,
         canRegenerate: canRegenerate,
         regenerateRemovesLaterMessages: regenerateRemovesLaterMessages,
@@ -101,6 +109,7 @@ class TranscriptMessageView {
         imageReferences: imageReferences,
         documents: documents,
         toolCalls: toolCalls,
+        sources: sources,
       );
 }
 
@@ -114,6 +123,8 @@ class ChatTranscript extends StatefulWidget {
     this.onRestorePrevious,
     this.canMutate,
     this.onCopy,
+    this.onAskSelection,
+    this.onOpenSourceFile,
     this.answerSpeaker,
     this.scrollController,
     this.findController,
@@ -121,6 +132,9 @@ class ChatTranscript extends StatefulWidget {
     this.emptyState,
     this.messageFooter,
     this.bottomPadding = 24,
+    this.hasOlder = false,
+    this.loadingOlder = false,
+    this.onLoadOlder,
   });
 
   final List<TranscriptMessageView> messages;
@@ -135,6 +149,8 @@ class ChatTranscript extends StatefulWidget {
   final Future<bool> Function(TranscriptMessageView message)? onRestorePrevious;
   final bool Function()? canMutate;
   final ValueChanged<String>? onCopy;
+  final ValueChanged<String>? onAskSelection;
+  final Future<void> Function(SourceReference)? onOpenSourceFile;
   final AnswerSpeaker? answerSpeaker;
   final ScrollController? scrollController;
   final ChatFindController? findController;
@@ -145,6 +161,9 @@ class ChatTranscript extends StatefulWidget {
   /// failure with its recovery actions.
   final Widget? Function(TranscriptMessageView message)? messageFooter;
   final double bottomPadding;
+  final bool hasOlder;
+  final bool loadingOlder;
+  final Future<void> Function()? onLoadOlder;
 
   @override
   State<ChatTranscript> createState() => _ChatTranscriptState();
@@ -156,6 +175,8 @@ class _ChatTranscriptState extends State<ChatTranscript>
 
   late AutoScrollController _scrollController;
   bool _followsLatest = true;
+  bool _restoringAnchor = false;
+  (String, double)? _readingAnchor;
   late int _tailRevision;
   late AnswerSpeaker _answerSpeaker;
   final Map<String, GlobalKey> _findTextKeys = <String, GlobalKey>{};
@@ -255,10 +276,93 @@ class _ChatTranscriptState extends State<ChatTranscript>
   }
 
   void _updateFollowState() {
+    if (_restoringAnchor) return;
     if (_scrollController.hasClients) {
       final follows =
           _scrollController.position.extentAfter <= _nearBottomThreshold;
       if (follows != _followsLatest) setState(() => _followsLatest = follows);
+      if (!follows) _readingAnchor = _captureAnchor();
+    }
+  }
+
+  (String, double)? _captureAnchor() {
+    final viewport = context.findRenderObject();
+    if (viewport is! RenderBox || !viewport.hasSize) return null;
+    final top = viewport.localToGlobal(Offset.zero).dy;
+    final tags = _scrollController.tagMap.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+    for (final entry in tags) {
+      if (entry.key < 0 || entry.key >= widget.messages.length) continue;
+      final box = entry.value.context.findRenderObject();
+      if (box is! RenderBox || !box.attached || !box.hasSize) continue;
+      final y = box.localToGlobal(Offset.zero).dy - top;
+      if (y + box.size.height > 0 && y < viewport.size.height) {
+        return (widget.messages[entry.key].id, y);
+      }
+    }
+    return null;
+  }
+
+  Future<void> _restoreAnchor((String, double) anchor) async {
+    if (!mounted || !_scrollController.hasClients) return;
+    final index = widget.messages.indexWhere(
+      (message) => message.id == anchor.$1,
+    );
+    if (index < 0) return;
+    _restoringAnchor = true;
+    try {
+      if (!_scrollController.tagMap.containsKey(index)) {
+        await _scrollController.scrollToIndex(
+          index,
+          preferPosition: AutoScrollPosition.begin,
+          duration: const Duration(milliseconds: 1),
+        );
+      }
+      if (!mounted || !_scrollController.hasClients) return;
+      final box = _scrollController.tagMap[index]?.context.findRenderObject();
+      final viewport = context.findRenderObject();
+      if (box is! RenderBox ||
+          viewport is! RenderBox ||
+          !box.attached ||
+          !box.hasSize) {
+        return;
+      }
+      final y =
+          box.localToGlobal(Offset.zero).dy -
+          viewport.localToGlobal(Offset.zero).dy;
+      _scrollController.jumpTo(
+        (_scrollController.offset + y - anchor.$2).clamp(
+          _scrollController.position.minScrollExtent,
+          _scrollController.position.maxScrollExtent,
+        ),
+      );
+    } finally {
+      _restoringAnchor = false;
+      _readingAnchor = _captureAnchor();
+    }
+  }
+
+  Future<void> _loadOlder() async {
+    if (widget.loadingOlder || widget.onLoadOlder == null) return;
+    final anchor = _captureAnchor();
+    setState(() => _followsLatest = false);
+    _restoringAnchor = true;
+    await widget.onLoadOlder!();
+    if (!mounted) return;
+    await WidgetsBinding.instance.endOfFrame;
+    _restoringAnchor = false;
+    if (anchor != null) await _restoreAnchor(anchor);
+  }
+
+  @override
+  void didChangeMetrics() {
+    if (_followsLatest) {
+      _scheduleFollow();
+    } else if (_readingAnchor case final anchor?) {
+      _restoringAnchor = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_restoreAnchor(anchor));
+      });
     }
   }
 
@@ -458,8 +562,26 @@ class _ChatTranscriptState extends State<ChatTranscript>
               Design.gutter,
               widget.bottomPadding,
             ),
-            itemCount: widget.messages.length,
-            itemBuilder: (context, index) {
+            itemCount: widget.messages.length + (widget.hasOlder ? 1 : 0),
+            findChildIndexCallback: (key) {
+              if (key is! ValueKey<String>) return null;
+              final index = widget.messages.indexWhere(
+                (message) => message.id == key.value,
+              );
+              return index < 0 ? null : index + (widget.hasOlder ? 1 : 0);
+            },
+            itemBuilder: (context, row) {
+              if (widget.hasOlder && row == 0) {
+                return TextButton(
+                  onPressed: widget.loadingOlder ? null : _loadOlder,
+                  child: Text(
+                    widget.loadingOlder
+                        ? 'Loading older messages…'
+                        : 'Load older messages',
+                  ),
+                );
+              }
+              final index = row - (widget.hasOlder ? 1 : 0);
               final message = widget.messages[index];
               return AutoScrollTag(
                 key: ValueKey<String>(message.id),
@@ -502,18 +624,20 @@ class _ChatTranscriptState extends State<ChatTranscript>
     );
     final footer = widget.messageFooter?.call(message);
     final body = _TranscriptMessage(
-        message: message,
-        messageIndex: index,
-        findTextKey: findTextKey,
-        findController: widget.findController,
-        onRetry: widget.onRetry,
-        onEditAndResend: widget.onEditAndResend,
-        onRegenerate: widget.onRegenerate,
-        onRestorePrevious: widget.onRestorePrevious,
-        canMutate: widget.canMutate,
-        onCopy: widget.onCopy,
-        isSpeaking: _speakingMessageId == message.id,
-        onReadAloud: _toggleReadAloud,
+      onAskSelection: widget.onAskSelection,
+      onOpenSourceFile: widget.onOpenSourceFile,
+      message: message,
+      messageIndex: index,
+      findTextKey: findTextKey,
+      findController: widget.findController,
+      onRetry: widget.onRetry,
+      onEditAndResend: widget.onEditAndResend,
+      onRegenerate: widget.onRegenerate,
+      onRestorePrevious: widget.onRestorePrevious,
+      canMutate: widget.canMutate,
+      onCopy: widget.onCopy,
+      isSpeaking: _speakingMessageId == message.id,
+      onReadAloud: _toggleReadAloud,
     );
     return Padding(
       padding: EdgeInsets.only(
@@ -545,6 +669,8 @@ class _TranscriptMessage extends StatelessWidget {
     required this.onRestorePrevious,
     required this.canMutate,
     required this.onCopy,
+    this.onAskSelection,
+    this.onOpenSourceFile,
     required this.isSpeaking,
     required this.onReadAloud,
   });
@@ -560,6 +686,8 @@ class _TranscriptMessage extends StatelessWidget {
   final Future<bool> Function(TranscriptMessageView message)? onRestorePrevious;
   final bool Function()? canMutate;
   final ValueChanged<String>? onCopy;
+  final ValueChanged<String>? onAskSelection;
+  final Future<void> Function(SourceReference)? onOpenSourceFile;
   final bool isSpeaking;
   final ValueChanged<TranscriptMessageView> onReadAloud;
 
@@ -576,6 +704,8 @@ class _TranscriptMessage extends StatelessWidget {
         onCopy: onCopy,
       ),
       TranscriptRole.assistant => _AssistantMessage(
+        onAskSelection: onAskSelection,
+        onOpenSourceFile: onOpenSourceFile,
         message: message,
         messageIndex: messageIndex,
         findTextKey: findTextKey,
@@ -921,6 +1051,8 @@ class _AssistantMessage extends StatelessWidget {
     required this.onRestorePrevious,
     required this.canMutate,
     required this.onCopy,
+    this.onAskSelection,
+    this.onOpenSourceFile,
     required this.isSpeaking,
     required this.onReadAloud,
   });
@@ -934,6 +1066,8 @@ class _AssistantMessage extends StatelessWidget {
   final Future<bool> Function(TranscriptMessageView message)? onRestorePrevious;
   final bool Function()? canMutate;
   final ValueChanged<String>? onCopy;
+  final ValueChanged<String>? onAskSelection;
+  final Future<void> Function(SourceReference)? onOpenSourceFile;
   final bool isSpeaking;
   final ValueChanged<TranscriptMessageView> onReadAloud;
 
@@ -1095,24 +1229,33 @@ class _AssistantMessage extends StatelessWidget {
             ),
           ),
         if (hasContent && (findController == null || !findController!.isOpen))
-          MarkdownBody(
-            data: message.content,
-            selectable: true,
-            extensionSet: _assistantMarkdownExtensions,
-            onTapLink: (text, href, title) => _openLink(context, href),
-            sizedImageBuilder: (config) =>
-                _BlockedMarkdownImage(alt: config.alt),
-            builders: <String, MarkdownElementBuilder>{
-              'pre': _CodeBlockBuilder(),
-              'latex': _SafeLatexBuilder(textStyle: theme.textTheme.bodyLarge),
-            },
-            styleSheet: MarkdownStyleSheet.fromTheme(theme).copyWith(
-              p: theme.textTheme.bodyLarge,
-              blockSpacing: 16,
-              blockquoteDecoration: BoxDecoration(
-                color: colors.surfaceContainerLow,
-                border: Border(
-                  left: BorderSide(color: colors.outline, width: 3),
+          _AnswerSelection(
+            content: message.content,
+            enabled: message.status != TranscriptStatus.streaming,
+            onAsk: onAskSelection,
+            child: MarkdownBody(
+              data: message.content,
+              selectable: false,
+              extensionSet: _assistantMarkdownExtensions,
+              onTapLink: (text, href, title) => _openLink(context, href),
+              sizedImageBuilder: (config) =>
+                  _BlockedMarkdownImage(alt: config.alt),
+              builders: <String, MarkdownElementBuilder>{
+                'pre': _CodeBlockBuilder(
+                  settled: message.status != TranscriptStatus.streaming,
+                ),
+                'latex': _SafeLatexBuilder(
+                  textStyle: theme.textTheme.bodyLarge,
+                ),
+              },
+              styleSheet: MarkdownStyleSheet.fromTheme(theme).copyWith(
+                p: theme.textTheme.bodyLarge,
+                blockSpacing: 16,
+                blockquoteDecoration: BoxDecoration(
+                  color: colors.surfaceContainerLow,
+                  border: Border(
+                    left: BorderSide(color: colors.outline, width: 3),
+                  ),
                 ),
               ),
             ),
@@ -1125,6 +1268,8 @@ class _AssistantMessage extends StatelessWidget {
             findController: findController,
             style: theme.textTheme.bodyLarge,
           ),
+        if (message.sources.isNotEmpty)
+          AnswerSources(sources: message.sources, onOpenFile: onOpenSourceFile),
         if (showCopy || showMenu || _isIncomplete || isSpeaking)
           Padding(
             padding: const EdgeInsets.only(top: Design.space2),
@@ -1225,8 +1370,64 @@ class _AssistantMessage extends StatelessWidget {
   }
 }
 
-/// Persistent, compact recovery affordance shown under the result of the
-/// latest edit, regenerate, or retry while its checkpoint exists.
+/// Keep settled Markdown elements stable while a different answer streams.
+class _AnswerSelection extends StatefulWidget {
+  const _AnswerSelection({
+    required this.content,
+    required this.enabled,
+    required this.child,
+    this.onAsk,
+  });
+  final String content;
+  final bool enabled;
+  final Widget child;
+  final ValueChanged<String>? onAsk;
+  @override
+  State<_AnswerSelection> createState() => _AnswerSelectionState();
+}
+
+class _AnswerSelectionState extends State<_AnswerSelection> {
+  String _selected = '';
+  Widget? _settledChild;
+  Object? _renderKey;
+  @override
+  Widget build(BuildContext context) {
+    final key = (
+      widget.content,
+      widget.enabled,
+      Theme.of(context),
+      MediaQuery.textScalerOf(context),
+    );
+    if (!widget.enabled || key != _renderKey) {
+      _settledChild = widget.child;
+      _renderKey = key;
+    }
+    return widget.enabled
+        ? SelectionArea(
+            onSelectionChanged: (content) =>
+                _selected = content?.plainText ?? '',
+            contextMenuBuilder: (context, region) =>
+                AdaptiveTextSelectionToolbar.buttonItems(
+                  anchors: region.contextMenuAnchors,
+                  buttonItems: [
+                    ...region.contextMenuButtonItems,
+                    if (widget.onAsk != null && _selected.trim().isNotEmpty)
+                      ContextMenuButtonItem(
+                        label: 'Ask about this',
+                        onPressed: () {
+                          final text = _selected;
+                          region.hideToolbar();
+                          widget.onAsk!(text);
+                        },
+                      ),
+                  ],
+                ),
+            child: _settledChild!,
+          )
+        : SelectionContainer.disabled(child: widget.child);
+  }
+}
+
 class _RecoveryNotice extends StatelessWidget {
   const _RecoveryNotice({required this.onRestore});
   final VoidCallback onRestore;
@@ -1333,10 +1534,12 @@ class _EditMessageSheetState extends State<_EditMessageSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final warning =
-        '${widget.message.editRemovesLaterMessages ? 'This replaces this message and every reply after it.' : 'This replaces this message and the replies after it.'} '
-        'You can restore the previous conversation until you send or revise '
-        'another message.';
+    final warning = widget.message.retainsVersions
+        ? 'This creates a new version and generates new replies. '
+              'Use the version arrows to return to the original conversation.'
+        : '${widget.message.editRemovesLaterMessages ? 'This replaces this message and every reply after it.' : 'This replaces this message and the replies after it.'} '
+              'You can restore the previous conversation until you send or '
+              'revise another message.';
     return KeyboardSafeSheet(
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -1439,6 +1642,8 @@ class _BlockedMarkdownImage extends StatelessWidget {
 }
 
 class _CodeBlockBuilder extends MarkdownElementBuilder {
+  _CodeBlockBuilder({required this.settled});
+  final bool settled;
   String _language = '';
 
   @override
@@ -1462,6 +1667,11 @@ class _CodeBlockBuilder extends MarkdownElementBuilder {
 
   @override
   Widget visitText(markdown.Text text, TextStyle? preferredStyle) {
+    if (settled &&
+        _language.toLowerCase() == 'mermaid' &&
+        AnswerDiagram.supports(text.text)) {
+      return AnswerDiagram(source: text.text);
+    }
     return _CodeBlock(
       code: text.text,
       language: _language,
